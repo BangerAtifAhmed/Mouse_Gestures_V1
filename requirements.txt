@@ -1,0 +1,10 @@
+# Hand-Tracking Cursor Controller — pinned dependencies
+# Compatible with Python 3.8.10 and 3.10.11 on Windows & Ubuntu.
+#
+# MediaPipe is pinned to 0.8.11 to avoid the newer Tasks API which
+# introduces breaking changes (AttributeError / ModuleNotFoundError
+# on mp.solutions.hands).
+
+opencv-python>=4.5,<5.0
+mediapipe==0.8.11
+pynput>=1.7,<2.0
