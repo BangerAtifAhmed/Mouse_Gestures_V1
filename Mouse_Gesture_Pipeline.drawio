@@ -4,7 +4,7 @@
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="2XSHwfQZW7yKpELvY-em-1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;" value="Web Cam]" vertex="1">
+        <mxCell id="2XSHwfQZW7yKpELvY-em-1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;" value="Web Cam&lt;div&gt;&lt;br&gt;&lt;/div&gt;" vertex="1">
           <mxGeometry height="60" width="120" x="295" y="220" as="geometry" />
         </mxCell>
         <mxCell id="2XSHwfQZW7yKpELvY-em-2" parent="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;" value="User&lt;div&gt;&lt;br&gt;&lt;/div&gt;" vertex="1">
@@ -22,7 +22,7 @@
             <mxPoint x="316.96" y="330" as="targetPoint" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="2XSHwfQZW7yKpELvY-em-5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;" value="Media Pipe" vertex="1">
+        <mxCell id="2XSHwfQZW7yKpELvY-em-5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=light-dark(#FFFFFF,#30FF45);" value="Media Pipe" vertex="1">
           <mxGeometry height="60" width="120" x="260" y="330" as="geometry" />
         </mxCell>
         <mxCell id="2XSHwfQZW7yKpELvY-em-6" edge="1" parent="1" source="2XSHwfQZW7yKpELvY-em-1" style="endArrow=classic;html=1;rounded=0;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" value="">
@@ -40,7 +40,7 @@
             <mxPoint x="320" y="450" as="targetPoint" />
           </mxGeometry>
         </mxCell>
-        <mxCell id="2XSHwfQZW7yKpELvY-em-8" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="Curser Movement&amp;nbsp;" vertex="1">
+        <mxCell id="2XSHwfQZW7yKpELvY-em-8" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;strokeColor=light-dark(#000000,#56FFBB);fillColor=light-dark(#FFFFFF,#44FF5D);" value="Curser Movement&amp;nbsp;" vertex="1">
           <mxGeometry height="50" width="120" x="260" y="450" as="geometry" />
         </mxCell>
         <mxCell id="2XSHwfQZW7yKpELvY-em-9" parent="1" style="rounded=1;whiteSpace=wrap;html=1;" value="Yolo Model&amp;nbsp;" vertex="1">
@@ -63,6 +63,15 @@
         </mxCell>
         <mxCell id="2XSHwfQZW7yKpELvY-em-13" parent="1" style="ellipse;whiteSpace=wrap;html=1;shapeInside=1;" value="Mouse Events" vertex="1">
           <mxGeometry height="50" width="120" x="390" y="560" as="geometry" />
+        </mxCell>
+        <mxCell id="2XSHwfQZW7yKpELvY-em-15" edge="1" parent="1" style="endArrow=none;html=1;rounded=0;strokeColor=light-dark(#000000,#38FF45);" value="">
+          <mxGeometry height="50" relative="1" width="50" as="geometry">
+            <mxPoint x="540" y="60" as="sourcePoint" />
+            <mxPoint x="620" y="60" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="2XSHwfQZW7yKpELvY-em-16" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="Done" vertex="1">
+          <mxGeometry height="30" width="60" x="640" y="40" as="geometry" />
         </mxCell>
       </root>
     </mxGraphModel>
