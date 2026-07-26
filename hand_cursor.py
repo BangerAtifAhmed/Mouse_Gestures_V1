@@ -1,12 +1,28 @@
 """
-Hand-Tracking Cursor Controller (v9 — Non-Blocking, Filter-Only)
-================================================================
+Hand-Tracking Cursor Controller (v10 — Hot-Pluggable Displays)
+==============================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
 light smoothing during fast swipes.  Movement only — no click gestures.
 
-v9 removes the sub-frame interpolation "glide" from v8.  That code called
+The active box maps onto the *virtual desktop* (all monitors combined), not
+just the primary display.
+
+v10 makes that mapping survive display changes.  Plugging or unplugging a
+monitor, or rearranging the desktop, resizes the virtual screen underneath a
+running script; every derived constant (aspect ratio, active box, screen
+mapping) silently goes stale.  Rather than hook WM_DISPLAYCHANGE, the main
+loop re-reads GetSystemMetrics every POLL_INTERVAL seconds and rebuilds the
+geometry only when the rectangle actually moves.  The cost is four cheap
+user-mode calls per interval.
+
+All screen-dependent state therefore lives inside ScreenGeometry, so a
+display change is one atomic recompute rather than a dozen scattered globals
+updated in sequence — a half-updated box would map the cursor into a
+rectangle that no longer exists.
+
+v9 removed the sub-frame interpolation "glide" from v8.  That code called
 time.sleep() inside the main loop, which was counter-productive for two
 reasons:
 
@@ -19,12 +35,6 @@ reasons:
      Windows is bounded by the ~15.6 ms system timer tick, so each 6.67 ms
      sleep actually blocked for ~15 ms.  The real cost was closer to 60 ms
      per triggering frame.
-
-The One Euro Filter already produces continuous motion without stalling the
-capture loop, so the correct fix is to let it do its job unimpeded.
-
-The active box maps onto the *virtual desktop* (all monitors combined), not
-just the primary display.
 
 Dependencies:  pip install opencv-python mediapipe==0.8.11
 Platform:      Windows only (uses user32.dll)
@@ -70,11 +80,6 @@ SM_CYVIRTUALSCREEN = 79
 SM_CMONITORS       = 80
 
 _user32 = ctypes.windll.user32
-SCREEN_LEFT = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-SCREEN_TOP  = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-SCREEN_W    = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-SCREEN_H    = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-MONITORS    = _user32.GetSystemMetrics(SM_CMONITORS)
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -83,6 +88,12 @@ CAM_INDEX = 0
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 CAM_FPS = 60
+
+# ── Display hot-plug polling ───────────────────────────────────────────────
+# How often to re-read the virtual desktop rectangle.  GetSystemMetrics is a
+# cheap user-mode read, so this is nearly free, but there is no reason to do
+# it every frame: a human cannot plug a monitor in faster than this.
+POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 
 # ── Dynamic aspect-ratio bounding box (compact, shifted upward) ────────────
 # The box is sized from the *horizontal* constraint first, then the height
@@ -102,35 +113,13 @@ CAM_FPS = 60
 #   BOTTOM_DEADZONE pushes the box upward so the user's hand isn't cut off.
 #   ACTIVE_BOTTOM = CAM_HEIGHT − BOTTOM_DEADZONE
 #   ACTIVE_TOP    = ACTIVE_BOTTOM − active_height  (clamped ≥ MIN_TOP_PAD)
+#
+# Because the ratio comes from the *virtual* desktop, all of this has to be
+# recomputed whenever a display is added or removed — hence ScreenGeometry.
 
 SIDE_DEADZONE   = 60   # px — reserved on each side (controls sensitivity)
 BOTTOM_DEADZONE = 150  # px — reserved dead zone at the bottom of the frame
 MIN_TOP_PAD     = 10   # px — minimum clearance at the top of the frame
-
-_screen_ratio = SCREEN_W / SCREEN_H
-
-# Step 1: width is driven by the side dead zones.
-_box_w = CAM_WIDTH - 2 * SIDE_DEADZONE
-
-# Step 2: height preserves the screen's aspect ratio.
-_box_h = int(_box_w / _screen_ratio)
-_box_w = int(_box_w)
-
-# Step 3: anchor the bottom edge above the dead zone.
-ACTIVE_BOTTOM = CAM_HEIGHT - BOTTOM_DEADZONE
-ACTIVE_TOP    = ACTIVE_BOTTOM - _box_h
-
-# Step 4: if the box is too tall, shrink to fit while keeping the ratio.
-if ACTIVE_TOP < MIN_TOP_PAD:
-    ACTIVE_TOP = MIN_TOP_PAD
-    _box_h = ACTIVE_BOTTOM - ACTIVE_TOP
-    _box_w = int(_box_h * _screen_ratio)
-
-# Horizontally centred.
-ACTIVE_LEFT  = (CAM_WIDTH - _box_w) // 2
-ACTIVE_RIGHT = ACTIVE_LEFT + _box_w
-ACTIVE_W = _box_w
-ACTIVE_H = _box_h
 
 # ── One Euro Filter parameters ─────────────────────────────────────────────
 # The One Euro Filter (Casiez, Roussel & Vogel, CHI 2012) is an adaptive
@@ -170,6 +159,139 @@ D_CUTOFF   = 1.0    # Hz — cutoff for the speed (derivative) filter
 # ─── Win32 cursor function reference ───────────────────────────────────────
 # Cache the function reference to avoid repeated attribute lookups in the loop.
 _set_cursor_pos = _user32.SetCursorPos
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    """Restrict *value* to the closed interval [lo, hi]."""
+    return max(lo, min(hi, value))
+
+
+# ─── Screen geometry (hot-pluggable) ───────────────────────────────────────
+
+class ScreenGeometry:
+    """Virtual desktop metrics plus the active box derived from them.
+
+    Every screen-dependent value lives here so that a display change is a
+    single atomic swap.  Updating a dozen module-level globals in sequence
+    would leave a window in which the main loop maps the cursor using a
+    half-rebuilt rectangle.
+
+    Attributes
+    ----------
+    left, top       Origin of the virtual desktop (may be negative).
+    width, height   Size of the virtual desktop, all monitors combined.
+    ratio           width / height — drives the active box aspect lock.
+    box_*           The active rectangle inside the webcam frame.
+    """
+
+    def __init__(self, poll_interval: float = POLL_INTERVAL):
+        self._poll_interval = poll_interval
+        self._next_poll = 0.0
+        self.monitors = 0
+        # Seed with whatever the desktop looks like right now.
+        self._apply(self._read_metrics())
+
+    # ── Metric acquisition ─────────────────────────────────────────────
+    @staticmethod
+    def _read_metrics() -> tuple[int, int, int, int]:
+        """Snapshot the virtual desktop rectangle as (left, top, w, h)."""
+        return (
+            _user32.GetSystemMetrics(SM_XVIRTUALSCREEN),
+            _user32.GetSystemMetrics(SM_YVIRTUALSCREEN),
+            _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+
+    # ── Derived geometry ───────────────────────────────────────────────
+    def _apply(self, metrics: tuple[int, int, int, int]) -> None:
+        """Adopt *metrics* and rebuild the active box from them."""
+        self.left, self.top, self.width, self.height = metrics
+        self.monitors = _user32.GetSystemMetrics(SM_CMONITORS)
+        self.ratio = self.width / self.height
+
+        # Step 1: width is driven by the side dead zones.
+        box_w = CAM_WIDTH - 2 * SIDE_DEADZONE
+
+        # Step 2: height preserves the desktop's aspect ratio.
+        box_h = int(box_w / self.ratio)
+        box_w = int(box_w)
+
+        # Step 3: anchor the bottom edge above the dead zone.
+        bottom = CAM_HEIGHT - BOTTOM_DEADZONE
+        top = bottom - box_h
+
+        # Step 4: if the box is too tall, shrink to fit while keeping the ratio.
+        if top < MIN_TOP_PAD:
+            top = MIN_TOP_PAD
+            box_h = bottom - top
+            box_w = int(box_h * self.ratio)
+
+        # An extreme desktop ratio (very wide or very tall) can round a
+        # dimension down to zero, which would divide by zero in to_screen().
+        box_w = max(1, box_w)
+        box_h = max(1, box_h)
+
+        # Horizontally centred.
+        self.box_left   = (CAM_WIDTH - box_w) // 2
+        self.box_right  = self.box_left + box_w
+        self.box_top    = top
+        self.box_bottom = bottom
+        self.box_w      = box_w
+        self.box_h      = box_h
+
+    # ── Polling ────────────────────────────────────────────────────────
+    def poll(self, now: float) -> bool:
+        """Re-read the desktop rectangle at most every *poll_interval* sec.
+
+        Returns True only when the geometry actually changed and was
+        rebuilt, so the caller can react (reset filters, log, …).
+        """
+        if now < self._next_poll:
+            return False
+        self._next_poll = now + self._poll_interval
+
+        metrics = self._read_metrics()
+
+        # Mid-hotplug the API can transiently report a degenerate rectangle
+        # while the driver reconfigures.  Ignore it and keep the last known
+        # good geometry; the next poll will pick up the settled values.
+        if metrics[2] <= 0 or metrics[3] <= 0:
+            return False
+
+        if metrics == (self.left, self.top, self.width, self.height):
+            return False
+
+        self._apply(metrics)
+        return True
+
+    # ── Mapping ────────────────────────────────────────────────────────
+    def to_screen(self, cam_x: float, cam_y: float) -> tuple[float, float]:
+        """Map webcam pixel coords → virtual desktop coords.
+
+        The hand is first clamped into the active box, so positions outside
+        it pin the cursor to a desktop edge rather than overshooting.  The
+        result is offset by the desktop origin, which is what makes monitors
+        left of / above the primary (negative coords) reachable.
+        """
+        cx = clamp(cam_x, self.box_left, self.box_right)
+        cy = clamp(cam_y, self.box_top,  self.box_bottom)
+        return (
+            self.left + ((cx - self.box_left) / self.box_w) * self.width,
+            self.top  + ((cy - self.box_top)  / self.box_h) * self.height,
+        )
+
+    @property
+    def center(self) -> tuple[float, float]:
+        """Centre of the virtual desktop (origin-aware)."""
+        return (self.left + self.width / 2.0, self.top + self.height / 2.0)
+
+    def describe(self) -> str:
+        """One-line summary for the console banner / change notices."""
+        return (f"{self.width}×{self.height} px  origin ({self.left}, {self.top})  "
+                f"ratio {self.ratio:.3f}  monitors {self.monitors}  "
+                f"box {self.box_w}×{self.box_h}")
+
 
 # ─── MediaPipe setup ────────────────────────────────────────────────────────
 
@@ -371,42 +493,36 @@ class OneEuroFilter:
 
 # ─── State variables ────────────────────────────────────────────────────────
 
+screen = ScreenGeometry(POLL_INTERVAL)
+
 # Create separate One Euro Filters for X and Y axes.
 _oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
 _oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
 
 # Tracks whether a hand was visible on the *previous* frame.  A False → True
 # transition means the hand just re-entered the frame, which is when the
-# filters must be reset (see the main loop).
+# filters must be reset.  A display change also lowers this flag, reusing the
+# same snap-to-target path (see the main loop).
 hand_present = False
 
 # Last smoothed position — retained only for the on-screen jump readout.
-# Seeded at the centre of the virtual desktop (origin-aware).
-prev_x = SCREEN_LEFT + SCREEN_W / 2.0
-prev_y = SCREEN_TOP  + SCREEN_H / 2.0
+prev_x, prev_y = screen.center
 
 # perf_counter() is monotonic and sub-microsecond.  time.time() on Windows
 # is backed by GetSystemTimeAsFileTime, whose ~15.6 ms granularity would
 # badly quantise the dt estimate the 1€ filter depends on at 60 FPS.
 prev_time = time.perf_counter()
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    """Restrict *value* to the closed interval [lo, hi]."""
-    return max(lo, min(hi, value))
-
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
-print(f"Virtual desk: {SCREEN_W} × {SCREEN_H} px  origin ({SCREEN_LEFT}, {SCREEN_TOP})  "
-      f"ratio {_screen_ratio:.3f}")
-print(f"Monitors    : {MONITORS}")
+print(f"Virtual desk: {screen.describe()}")
 print(f"Webcam      : {CAM_WIDTH} × {CAM_HEIGHT} @ {CAM_FPS} FPS")
-print(f"Active box  : {ACTIVE_W} × {ACTIVE_H} px  "
-      f"x[{ACTIVE_LEFT}–{ACTIVE_RIGHT}]  y[{ACTIVE_TOP}–{ACTIVE_BOTTOM}]")
+print(f"Active box  : x[{screen.box_left}–{screen.box_right}]  "
+      f"y[{screen.box_top}–{screen.box_bottom}]")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
 print(f"Smoothing   : filter-only (no blocking interpolation)")
 print(f"Camera      : threaded (background capture)")
+print(f"Display poll: every {POLL_INTERVAL}s (hot-plug aware)")
 print("Press 'q' in the preview window to quit.\n")
 
 try:
@@ -414,6 +530,19 @@ try:
         success, frame = stream.read()
         if not success:
             continue
+
+        # One timestamp per iteration, shared by the display poll, the 1€
+        # filter and the FPS counter so they cannot disagree about "now".
+        now_ts = time.perf_counter()
+
+        # ── Display hot-plug polling ────────────────────────────────────
+        # Cheap rate-limited check; returns True only on a real change.
+        # Lowering hand_present routes the next frame through the existing
+        # re-entry reset, so the filters snap into the new coordinate space
+        # instead of gliding from a position that may no longer exist.
+        if screen.poll(now_ts):
+            print(f"[display] geometry changed → {screen.describe()}")
+            hand_present = False
 
         # Mirror the frame so it feels natural (like looking in a mirror).
         frame = cv2.flip(frame, 1)
@@ -437,29 +566,15 @@ try:
             raw_x = tip.x * CAM_WIDTH
             raw_y = tip.y * CAM_HEIGHT
 
-            # Clamp into the active bounding box so we never exceed screen edges.
-            clamped_x = clamp(raw_x, ACTIVE_LEFT, ACTIVE_RIGHT)
-            clamped_y = clamp(raw_y, ACTIVE_TOP,  ACTIVE_BOTTOM)
+            # Clamp into the active box and map onto the virtual desktop.
+            target_x, target_y = screen.to_screen(raw_x, raw_y)
 
-            # ── Virtual desktop mapping ─────────────────────────────────
-            # Linear interpolation from active-area coords → virtual-screen
-            # coords, offset by the desktop origin so monitors positioned
-            # left of / above the primary (negative origin) are reachable:
-            #
-            #   screen_x = SCREEN_LEFT
-            #            + (clamped_x − ACTIVE_LEFT) / ACTIVE_W × SCREEN_W
-            #
-            # The active-area edges therefore map to the outer corners of
-            # the whole multi-monitor desktop, not just display 1.
-            target_x = SCREEN_LEFT + ((clamped_x - ACTIVE_LEFT) / ACTIVE_W) * SCREEN_W
-            target_y = SCREEN_TOP  + ((clamped_y - ACTIVE_TOP)  / ACTIVE_H) * SCREEN_H
-
-            # ── Re-entry reset ───────────────────────────────────────────
-            # The hand was absent last frame and is back now.  Without this,
-            # the filters would still hold the position from wherever the
-            # hand vanished, and the cursor would slide across the screen
-            # from that stale point.  Clearing them makes the very next
-            # filter call adopt the raw target verbatim.
+            # ── Re-entry / geometry reset ────────────────────────────────
+            # Either the hand was absent last frame, or the desktop just
+            # changed shape.  Without this the filters would still hold a
+            # position from the old situation and the cursor would slide
+            # across the screen from that stale point.  Clearing them makes
+            # the very next filter call adopt the raw target verbatim.
             if not hand_present:
                 _oef_x.reset()
                 _oef_y.reset()
@@ -471,7 +586,6 @@ try:
             # time and speed to compute a dynamic cutoff: still → heavy
             # smoothing, fast → light.  Nothing here blocks the loop, so the
             # next camera sample arrives as soon as the hardware has it.
-            now_ts = time.perf_counter()
             smooth_x = _oef_x(target_x, timestamp=now_ts)
             smooth_y = _oef_y(target_y, timestamp=now_ts)
 
@@ -499,21 +613,27 @@ try:
             # No hand this frame — arm the reset for whenever it returns.
             hand_present = False
 
-        # Draw the active bounding box on the preview.
+        # Draw the active bounding box on the preview.  Read from `screen`
+        # so it follows the box when a display is plugged or unplugged.
         cv2.rectangle(
             frame,
-            (ACTIVE_LEFT, ACTIVE_TOP),
-            (ACTIVE_RIGHT, ACTIVE_BOTTOM),
+            (screen.box_left,  screen.box_top),
+            (screen.box_right, screen.box_bottom),
             (255, 0, 255), 2,
         )
 
         # FPS counter.
-        now = time.perf_counter()
-        fps = 1.0 / (now - prev_time) if (now - prev_time) > 0 else 0
-        prev_time = now
+        fps = 1.0 / (now_ts - prev_time) if now_ts > prev_time else 0.0
+        prev_time = now_ts
         cv2.putText(
             frame, f"FPS: {int(fps)}", (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+        )
+
+        # Monitor count, so a hot-plug is visible in the preview too.
+        cv2.putText(
+            frame, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
+            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
 
         cv2.imshow("Hand Cursor Control", frame)
