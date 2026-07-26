@@ -1,47 +1,38 @@
 """
-Hand-Tracking Cursor Controller (v13 — Runtime Sensitivity)
-===========================================================
+Hand-Tracking Cursor Controller (v14 — Lean & Cross-Platform)
+=============================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
 light smoothing during fast swipes.  Movement only — no click gestures.
 
-The active box maps onto the *virtual desktop* (all monitors combined) and is
-rebuilt on the fly when a display is plugged, unplugged or rearranged.
+The active box maps onto the whole virtual desktop (all monitors combined)
+and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
 
-v13 makes CURSOR_SENSITIVITY adjustable while running: '+' / '=' raise it,
-'-' / '_' lower it, and the preview reports the current multiplier.  Both of
-the loop's waitKey() call sites share one handler — the duplicate-frame skip
-path runs far more often than the bottom of the loop, so handling keys in
-only one place would swallow most presses.
+v14 trims resource use and drops the Windows-only assumption:
 
-v12 added centre-scaled CURSOR_SENSITIVITY inside ScreenGeometry, which owns
-the desktop centre and bounds the scaling needs.
+  * model_complexity=0 pins MediaPipe to the "Lite" landmark graph.
+  * The per-frame flip and BGR→RGB conversion now write into two preallocated
+    buffers instead of allocating fresh arrays every frame.  At 640×480×3
+    that is ~1.8 MB/frame of allocation churn removed, ~55 MB/s at 30 FPS.
+  * The RGB buffer is marked non-writeable around hands.process() so
+    MediaPipe borrows it instead of copying, then marked writeable again —
+    which is mandatory here, since the next frame reuses that same buffer.
+  * All OS-specific calls sit behind a small backend object, so the same
+    file runs on Windows (user32) and Linux/X11 (libX11) with nothing but
+    ctypes underneath.
 
-v11 attacked input lag on three fronts: filter tuning (MIN_CUTOFF / BETA with
-a measured response table), zero frame buffering (CAP_PROP_BUFFERSIZE plus an
-atomic newest-frame publication), and skipping redundant inference on frames
-already processed.
-
-v9 removed the sub-frame interpolation "glide" from v8.  That code called
-time.sleep() inside the main loop, which was counter-productive for two
-reasons:
-
-  1. It stole ~27 ms from the frame budget *precisely* when the hand was
-     moving fastest, delaying the next camera sample.  The larger gap
-     produced a larger jump on the following frame, which re-triggered
-     interpolation — a positive feedback loop of lag.
-
-  2. On CPython < 3.11 (this project targets 3.8/3.10), time.sleep() on
-     Windows is bounded by the ~15.6 ms system timer tick, so each 6.67 ms
-     sleep actually blocked for ~15 ms.  The real cost was closer to 60 ms
-     per triggering frame.
+v13 made CURSOR_SENSITIVITY adjustable at runtime, clamped to [1.0, 3.0].
+v12 added the centre-scaled sensitivity math inside ScreenGeometry.
+v11 attacked input lag: filter tuning, zero frame buffering, and skipping
+redundant inference on frames already processed.
+v9 removed the blocking sub-frame interpolation that made fast motion worse.
 
 Controls:  + / =  raise sensitivity      - / _  lower sensitivity
            q      quit
 
 Dependencies:  pip install opencv-python mediapipe==0.8.11
-Platform:      Windows only (uses user32.dll)
+Platform:      Windows (user32) and Linux/X11 (libX11)
 Python:        3.8 – 3.10  (mediapipe 0.8.11 ships no cp311 wheels)
 """
 
@@ -51,39 +42,14 @@ Python:        3.8 – 3.10  (mediapipe 0.8.11 ships no cp311 wheels)
 from __future__ import annotations
 
 import ctypes
-import cv2
 import math
-import mediapipe as mp
+import sys
 import threading
 import time
 
-# ─── Win32 virtual desktop metrics (direct API, no wrapper overhead) ───────
-# SM_CXSCREEN (0) / SM_CYSCREEN (1) describe the *primary* monitor only, so a
-# cursor driven from them can never leave display 1.  The SM_*VIRTUALSCREEN
-# family describes the bounding rectangle enclosing ALL monitors:
-#
-#   SM_XVIRTUALSCREEN  (76) → left edge of the virtual desktop
-#   SM_YVIRTUALSCREEN  (77) → top  edge of the virtual desktop
-#   SM_CXVIRTUALSCREEN (78) → total width  of the virtual desktop
-#   SM_CYVIRTUALSCREEN (79) → total height of the virtual desktop
-#
-# The origin matters.  Windows pins the primary monitor at (0, 0), so any
-# display arranged to its left or above it produces NEGATIVE coordinates —
-# a second monitor on the left reports SM_XVIRTUALSCREEN = −1920.  Mapping
-# into [0, width] would therefore strand the cursor on the right-hand
-# display, so every mapping below is offset by the origin.  SetCursorPos
-# accepts negative virtual-screen coordinates directly.
-#
-# ctypes leaves restype at the default c_int (signed), so negative origins
-# come back correctly; forcing c_uint here would silently wrap them.
-
-SM_XVIRTUALSCREEN  = 76
-SM_YVIRTUALSCREEN  = 77
-SM_CXVIRTUALSCREEN = 78
-SM_CYVIRTUALSCREEN = 79
-SM_CMONITORS       = 80
-
-_user32 = ctypes.windll.user32
+import cv2
+import mediapipe as mp
+import numpy as np          # already a hard dependency of cv2 and mediapipe
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  FEEL — sensitivity and latency, the knobs worth touching
@@ -186,12 +152,21 @@ BETA       = 0.015   # speed coefficient.  Higher = less trailing when moving.
 D_CUTOFF   = 1.0     # Hz — cutoff of the velocity estimator itself.
 
 # ── MediaPipe inference cost ───────────────────────────────────────────────
-# Inference is the single largest term in the end-to-end delay, far larger
-# than anything the filter contributes.  The "lite" graph roughly halves it
-# at some cost in landmark precision.
-#   0 = lite  (lowest latency)
-#   1 = full  (more accurate, slower)
+# Inference is the single largest CPU consumer in this pipeline, larger than
+# everything else combined.  model_complexity selects the landmark graph:
+#   0 = "Lite"  — roughly half the CPU, slightly noisier landmarks
+#   1 = "Full"  — more precise, noticeably heavier
+# Lite is the right default here because the 1€ filter already suppresses
+# landmark noise; paying for precision the filter then smooths away is waste.
 MODEL_COMPLEXITY = 0
+
+# ── OpenCV internal threading ──────────────────────────────────────────────
+# OpenCV farms operations out to a thread pool.  For 640×480 flips and colour
+# conversions the pool's synchronisation overhead exceeds the work itself,
+# and those idle worker threads still burn scheduler time.  Pinning to one
+# thread measurably lowers CPU here.  Set to 0 to restore OpenCV's automatic
+# choice if you move to much larger frames.
+OPENCV_THREADS = 1
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -202,9 +177,10 @@ CAM_HEIGHT = 480
 CAM_FPS = 60
 
 # ── Display hot-plug polling ───────────────────────────────────────────────
-# How often to re-read the virtual desktop rectangle.  GetSystemMetrics is a
-# cheap user-mode read, so this is nearly free, but there is no reason to do
-# it every frame: a human cannot plug a monitor in faster than this.
+# How often to re-read the virtual desktop rectangle.  The query is a cheap
+# user-mode call (Windows) or one X round-trip (Linux), so this is nearly
+# free, but there is no reason to do it every frame: a human cannot plug a
+# monitor in faster than this.
 POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 
 # ── Dynamic aspect-ratio bounding box (compact, shifted upward) ────────────
@@ -238,10 +214,6 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 SIDE_DEADZONE   = 60   # px — reserved on each side (controls sensitivity)
 BOTTOM_DEADZONE = 150  # px — reserved dead zone at the bottom of the frame
 MIN_TOP_PAD     = 10   # px — minimum clearance at the top of the frame
-
-# ─── Win32 cursor function reference ───────────────────────────────────────
-# Cache the function reference to avoid repeated attribute lookups in the loop.
-_set_cursor_pos = _user32.SetCursorPos
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -277,6 +249,181 @@ def handle_key(key: int) -> bool:
     return False
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  PLATFORM BACKENDS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Everything OS-specific is confined to these two classes so the rest of the
+# file is portable.  Both talk to the native library through plain ctypes —
+# no wrapper packages, matching how the Win32 path has always worked.
+#
+# Each backend exposes:
+#     read_geometry()  → (left, top, width, height) of the whole desktop
+#     monitor_count()  → number of attached displays
+#     move_cursor(x,y) → absolute cursor placement
+#     camera_api       → the cv2.CAP_* backend to open the webcam with
+#     close()          → release any native handles
+
+class Win32Backend:
+    """Desktop control through user32.dll."""
+
+    # SM_CXSCREEN (0) / SM_CYSCREEN (1) describe the *primary* monitor only,
+    # so a cursor driven from them could never leave display 1.  The
+    # SM_*VIRTUALSCREEN family describes the rectangle enclosing ALL monitors.
+    SM_XVIRTUALSCREEN  = 76   # left edge of the virtual desktop
+    SM_YVIRTUALSCREEN  = 77   # top  edge of the virtual desktop
+    SM_CXVIRTUALSCREEN = 78   # total width
+    SM_CYVIRTUALSCREEN = 79   # total height
+    SM_CMONITORS       = 80   # number of display monitors
+
+    name = "Windows / user32"
+    camera_api = cv2.CAP_DSHOW      # lowest-latency backend on Windows
+
+    def __init__(self):
+        self._u32 = ctypes.windll.user32
+        # Cache the bound methods: these run in the hot loop.
+        self._metric = self._u32.GetSystemMetrics
+        self._set_pos = self._u32.SetCursorPos
+        # ctypes leaves restype at the default c_int (signed), which is what
+        # we want — a monitor left of the primary reports a NEGATIVE origin
+        # (e.g. −1920), and c_uint would silently wrap it.
+
+    def read_geometry(self) -> tuple[int, int, int, int]:
+        m = self._metric
+        return (m(self.SM_XVIRTUALSCREEN), m(self.SM_YVIRTUALSCREEN),
+                m(self.SM_CXVIRTUALSCREEN), m(self.SM_CYVIRTUALSCREEN))
+
+    def monitor_count(self) -> int:
+        return self._metric(self.SM_CMONITORS)
+
+    def move_cursor(self, x: int, y: int) -> None:
+        # SetCursorPos accepts negative virtual-screen coordinates directly.
+        self._set_pos(x, y)
+
+    def close(self) -> None:
+        pass
+
+
+class X11Backend:
+    """Desktop control through libX11, via ctypes only.
+
+    Notes
+    -----
+    * The X root window spans the entire virtual screen and its origin is
+      always (0, 0), unlike Windows where a display placed left of the
+      primary yields a negative origin.  read_geometry() therefore returns
+      zeros for left/top, and the rest of the pipeline needs no special case.
+    * XGetGeometry is a server round-trip rather than a cached value, so the
+      hot-plug poll sees RandR resolution changes without reconnecting.
+    * Under a native Wayland session XWarpPointer is ignored by the
+      compositor.  An XWayland-backed session works; a pure Wayland one does
+      not, and no amount of ctypes will change that.
+    """
+
+    name = "Linux / X11"
+    camera_api = cv2.CAP_V4L2       # Video4Linux2
+
+    def __init__(self):
+        try:
+            self._xlib = ctypes.CDLL("libX11.so.6")
+        except OSError as exc:      # pragma: no cover - platform specific
+            raise RuntimeError(
+                "libX11.so.6 not found — install libx11 (e.g. "
+                "'sudo apt install libx11-6') or run under X11/XWayland."
+            ) from exc
+
+        x = self._xlib
+        # Declaring restype/argtypes is not optional on 64-bit: a Display*
+        # returned as the default c_int would be truncated and segfault.
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XGetGeometry.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+        ]
+        x.XWarpPointer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_int, ctypes.c_int,
+        ]
+        x.XFlush.argtypes = [ctypes.c_void_p]
+        x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        x.XFree.argtypes = [ctypes.c_void_p]
+
+        self._dpy = x.XOpenDisplay(None)
+        if not self._dpy:
+            raise RuntimeError(
+                "cannot open an X display — is DISPLAY set?"
+            )
+        self._root = x.XDefaultRootWindow(self._dpy)
+
+        # Xinerama is optional; without it we simply report one monitor.
+        self._xinerama = None
+        try:                        # pragma: no cover - platform specific
+            xin = ctypes.CDLL("libXinerama.so.1")
+            xin.XineramaQueryScreens.restype = ctypes.c_void_p
+            xin.XineramaQueryScreens.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+            self._xinerama = xin
+        except OSError:
+            pass
+
+        # Scratch out-params, allocated once instead of per poll.
+        self._g_root = ctypes.c_ulong()
+        self._g_x, self._g_y = ctypes.c_int(), ctypes.c_int()
+        self._g_w, self._g_h = ctypes.c_uint(), ctypes.c_uint()
+        self._g_bw, self._g_depth = ctypes.c_uint(), ctypes.c_uint()
+
+    def read_geometry(self) -> tuple[int, int, int, int]:
+        self._xlib.XGetGeometry(
+            self._dpy, self._root,
+            ctypes.byref(self._g_root),
+            ctypes.byref(self._g_x), ctypes.byref(self._g_y),
+            ctypes.byref(self._g_w), ctypes.byref(self._g_h),
+            ctypes.byref(self._g_bw), ctypes.byref(self._g_depth),
+        )
+        # The X root window always starts at (0, 0).
+        return (0, 0, int(self._g_w.value), int(self._g_h.value))
+
+    def monitor_count(self) -> int:
+        if self._xinerama is None:
+            return 1
+        n = ctypes.c_int(0)
+        ptr = self._xinerama.XineramaQueryScreens(self._dpy, ctypes.byref(n))
+        if not ptr:
+            return 1
+        self._xlib.XFree(ctypes.c_void_p(ptr))
+        return max(1, int(n.value))
+
+    def move_cursor(self, x: int, y: int) -> None:
+        # src_window 0 (None) means "move regardless of current position".
+        self._xlib.XWarpPointer(self._dpy, 0, self._root, 0, 0, 0, 0, x, y)
+        # Without a flush the request sits in the output buffer.
+        self._xlib.XFlush(self._dpy)
+
+    def close(self) -> None:
+        if getattr(self, "_dpy", None):
+            self._xlib.XCloseDisplay(self._dpy)
+            self._dpy = None
+
+
+def make_backend():
+    """Pick the desktop backend for the running platform."""
+    if sys.platform.startswith("win"):
+        return Win32Backend()
+    if sys.platform.startswith(("linux", "freebsd")):
+        return X11Backend()
+    raise RuntimeError(
+        f"unsupported platform {sys.platform!r} — this script drives the "
+        "cursor through user32 (Windows) or libX11 (Linux)."
+    )
+
+
 # ─── Screen geometry (hot-pluggable) ───────────────────────────────────────
 
 class ScreenGeometry:
@@ -293,35 +440,27 @@ class ScreenGeometry:
 
     Attributes
     ----------
-    left, top       Origin of the virtual desktop (may be negative).
+    left, top       Origin of the virtual desktop (negative on Windows when
+                    a display sits left of / above the primary; always 0 on
+                    X11, where the root window starts at the origin).
     width, height   Size of the virtual desktop, all monitors combined.
     ratio           width / height — drives the active box aspect lock.
     box_*           The active rectangle inside the webcam frame.
     """
 
-    def __init__(self, poll_interval: float = POLL_INTERVAL):
+    def __init__(self, backend, poll_interval: float = POLL_INTERVAL):
+        self._backend = backend
         self._poll_interval = poll_interval
         self._next_poll = 0.0
         self.monitors = 0
         # Seed with whatever the desktop looks like right now.
-        self._apply(self._read_metrics())
-
-    # ── Metric acquisition ─────────────────────────────────────────────
-    @staticmethod
-    def _read_metrics() -> tuple[int, int, int, int]:
-        """Snapshot the virtual desktop rectangle as (left, top, w, h)."""
-        return (
-            _user32.GetSystemMetrics(SM_XVIRTUALSCREEN),
-            _user32.GetSystemMetrics(SM_YVIRTUALSCREEN),
-            _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
+        self._apply(self._backend.read_geometry())
 
     # ── Derived geometry ───────────────────────────────────────────────
     def _apply(self, metrics: tuple[int, int, int, int]) -> None:
         """Adopt *metrics* and rebuild the active box from them."""
         self.left, self.top, self.width, self.height = metrics
-        self.monitors = _user32.GetSystemMetrics(SM_CMONITORS)
+        self.monitors = self._backend.monitor_count()
         self.ratio = self.width / self.height
 
         # Step 1: width is driven by the side dead zones.
@@ -365,9 +504,9 @@ class ScreenGeometry:
             return False
         self._next_poll = now + self._poll_interval
 
-        metrics = self._read_metrics()
+        metrics = self._backend.read_geometry()
 
-        # Mid-hotplug the API can transiently report a degenerate rectangle
+        # Mid-hotplug the OS can transiently report a degenerate rectangle
         # while the driver reconfigures.  Ignore it and keep the last known
         # good geometry; the next poll will pick up the settled values.
         if metrics[2] <= 0 or metrics[3] <= 0:
@@ -389,7 +528,7 @@ class ScreenGeometry:
              pin to a desktop edge rather than overshooting.
           2. Map linearly onto the desktop, offset by the desktop origin —
              this is what makes monitors left of / above the primary
-             (negative coords) reachable.
+             (negative coords on Windows) reachable.
           3. Scale about the desktop centre by CURSOR_SENSITIVITY, then
              clamp to the desktop rectangle.
 
@@ -397,9 +536,9 @@ class ScreenGeometry:
         adjustments apply from the next frame onward.
 
         The final clamp uses the real desktop bounds rather than [0, W] /
-        [0, H]: on a multi-monitor desktop the origin can be negative, and
-        clamping to zero would make every display left of the primary
-        unreachable.  On a single monitor at (0, 0) the two are identical.
+        [0, H]: on a multi-monitor Windows desktop the origin can be
+        negative, and clamping to zero would make every display left of the
+        primary unreachable.
         """
         cx = clamp(cam_x, self.box_left, self.box_right)
         cy = clamp(cam_y, self.box_top,  self.box_bottom)
@@ -455,27 +594,6 @@ class ScreenGeometry:
                 f"box {self.box_w}×{self.box_h}")
 
 
-# ─── MediaPipe setup ────────────────────────────────────────────────────────
-
-mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
-
-_hand_kwargs = dict(
-    static_image_mode=False,        # video stream mode (faster, uses tracking)
-    max_num_hands=1,                # single hand for pointer control
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7,
-)
-
-# model_complexity arrived partway through the 0.8.x line.  Fall back rather
-# than crash if this build predates it — the pin must keep working.
-try:
-    hands = mp_hands.Hands(model_complexity=MODEL_COMPLEXITY, **_hand_kwargs)
-    _complexity_note = f"model_complexity={MODEL_COMPLEXITY}"
-except TypeError:
-    hands = mp_hands.Hands(**_hand_kwargs)
-    _complexity_note = "model_complexity unsupported by this build"
-
 # ─── Threaded webcam capture ─────────────────────────────────────────────
 #
 # Problem:  cv2.VideoCapture.read() blocks the calling thread while the
@@ -491,7 +609,7 @@ except TypeError:
 #           ───────────              ─────────────────
 #           stream.read()   ←────   self._latest (newest)
 #           mediapipe.process()      cap.read()  [loops]
-#           SetCursorPos()           cap.read()  [loops]
+#           move_cursor()            cap.read()  [loops]
 #           cv2.imshow()             cap.read()  [loops]
 #           ...                      ...
 #
@@ -499,8 +617,8 @@ except TypeError:
 #           the main thread did not collect is simply dropped.  There is no
 #           queue and therefore no backlog to drain — read() hands back the
 #           newest physical frame every time.  CAP_PROP_BUFFERSIZE = 1 asks
-#           the *driver* to do the same one level down; DirectShow does not
-#           always honour it, so the value it returns is reported at startup.
+#           the *driver* to do the same one level down; not every backend
+#           honours it, so the value it returns is reported at startup.
 #
 # Publication:  frame, grabbed flag and sequence number are published as ONE
 #           tuple rebind.  Assigning a single attribute is atomic under the
@@ -511,10 +629,9 @@ except TypeError:
 class WebcamStream:
     """Non-blocking webcam reader that always yields the newest frame."""
 
-    def __init__(self, index: int = 0, width: int = 640,
-                 height: int = 480, fps: int = 60):
-        # Force DirectShow backend on Windows to unlock higher frame rates.
-        self._cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    def __init__(self, index: int = 0, width: int = 640, height: int = 480,
+                 fps: int = 60, api: int = 0):
+        self._cap = cv2.VideoCapture(index, api)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._cap.set(cv2.CAP_PROP_FPS,          fps)
@@ -525,6 +642,12 @@ class WebcamStream:
 
         # Read one frame synchronously so _latest is never None.
         grabbed, frame = self._cap.read()
+        if not grabbed:
+            self._cap.release()
+            raise RuntimeError(
+                f"camera {index} opened but returned no frame — is it in use "
+                "by another application?"
+            )
         self._latest = (grabbed, frame, 0)
 
         # The stop flag signals the background thread to exit.
@@ -560,10 +683,6 @@ class WebcamStream:
         self._thread.join(timeout=2.0)
         self._cap.release()
 
-
-# ─── Webcam setup ───────────────────────────────────────────────────────────
-
-stream = WebcamStream(CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, CAM_FPS)
 
 # ─── One Euro Filter implementation ────────────────────────────────────────
 
@@ -687,9 +806,46 @@ class OneEuroFilter:
         return self._x_filt(x, alpha=self._alpha(cutoff, dt=dt))
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  RUNTIME SETUP
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Pin OpenCV's internal thread pool before anything uses it.
+if OPENCV_THREADS:
+    cv2.setNumThreads(OPENCV_THREADS)
+
+backend = make_backend()
+
+# ─── MediaPipe setup ────────────────────────────────────────────────────────
+
+mp_hands = mp.solutions.hands
+mp_draw  = mp.solutions.drawing_utils
+
+_hand_kwargs = dict(
+    static_image_mode=False,        # video stream mode (faster, uses tracking)
+    max_num_hands=1,                # single hand for pointer control
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+)
+
+# model_complexity arrived partway through the 0.8.x line.  Falling back
+# rather than crashing keeps every 0.8.x build usable; on 0.8.11 the Lite
+# graph is selected normally.
+try:
+    hands = mp_hands.Hands(model_complexity=MODEL_COMPLEXITY, **_hand_kwargs)
+    _complexity_note = f"model_complexity={MODEL_COMPLEXITY} (Lite)"
+except TypeError:
+    hands = mp_hands.Hands(**_hand_kwargs)
+    _complexity_note = "model_complexity unsupported by this build"
+
+# ─── Webcam setup ───────────────────────────────────────────────────────────
+
+stream = WebcamStream(CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, CAM_FPS,
+                      api=backend.camera_api)
+
 # ─── State variables ────────────────────────────────────────────────────────
 
-screen = ScreenGeometry(POLL_INTERVAL)
+screen = ScreenGeometry(backend, POLL_INTERVAL)
 
 # Create separate One Euro Filters for X and Y axes.
 _oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
@@ -705,6 +861,14 @@ hand_present = False
 # skipped instead of re-running inference on data we already consumed.
 last_seq = -1
 
+# Reusable frame buffers.  cv2.flip() and cv2.cvtColor() each allocate a
+# fresh array when given no destination; writing into preallocated buffers
+# instead removes two full-frame allocations per frame (~1.8 MB at 640×480×3,
+# roughly 55 MB/s of churn at 30 FPS) along with the matching GC pressure.
+# Allocated lazily because the camera may not honour the requested size.
+bgr_buf = None      # mirrored frame: drawn on and displayed
+rgb_buf = None      # colour-converted copy handed to MediaPipe
+
 # Last smoothed position — retained only for the on-screen jump readout.
 prev_x, prev_y = screen.center
 
@@ -715,24 +879,25 @@ prev_time = time.perf_counter()
 
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
+print(f"Platform    : {backend.name}")
 print(f"Virtual desk: {screen.describe()}")
 print(f"Webcam      : {CAM_WIDTH} × {CAM_HEIGHT} @ {CAM_FPS} FPS")
 print(f"Active box  : x[{screen.box_left}–{screen.box_right}]  "
       f"y[{screen.box_top}–{screen.box_bottom}]")
-print(f"Sensitivity : {CURSOR_SENSITIVITY}×  start value, "
+print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
       f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
 print(f"MediaPipe   : {_complexity_note}")
-print(f"Smoothing   : filter-only (no blocking interpolation)")
-print(f"Camera      : threaded, buffersize=1 "
+print(f"OpenCV      : {cv2.getNumThreads()} thread(s), buffersize=1 "
       f"{'accepted' if stream.buffersize_accepted else 'REFUSED by backend'}")
+print(f"Frame bufs  : preallocated (no per-frame flip/convert allocation)")
 print(f"Display poll: every {POLL_INTERVAL}s (hot-plug aware)")
 print("Controls    : '+'/'=' faster   '-'/'_' slower   'q' quit")
 print("(the preview window must have focus for keys to register)\n")
 
 try:
     while True:
-        success, frame, seq = stream.read()
+        success, raw_frame, seq = stream.read()
         if not success:
             continue
 
@@ -761,17 +926,28 @@ try:
             print(f"[display] geometry changed → {screen.describe()}")
             hand_present = False
 
+        # ── Buffer preparation (allocation-free steady state) ───────────
+        # The capture thread owns raw_frame, so it is never written to in
+        # place; both transforms write into buffers this loop owns.
+        if bgr_buf is None or bgr_buf.shape != raw_frame.shape:
+            bgr_buf = np.empty_like(raw_frame)
+            rgb_buf = np.empty_like(raw_frame)
+            frame_h, frame_w = raw_frame.shape[:2]
+
         # Mirror the frame so it feels natural (like looking in a mirror).
-        frame = cv2.flip(frame, 1)
+        cv2.flip(raw_frame, 1, dst=bgr_buf)
 
-        # Convert BGR → RGB for MediaPipe.
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Convert BGR → RGB for MediaPipe, into our own buffer.
+        cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
 
-        # Mark the buffer read-only.  MediaPipe defensively copies any array
-        # it might mutate; flagging it non-writeable lets it borrow the
-        # buffer instead, saving a full-frame allocation + memcpy per frame.
-        rgb.flags.writeable = False
-        results = hands.process(rgb)
+        # Mark the buffer read-only so MediaPipe borrows it rather than
+        # defensively copying a full frame.  process() is synchronous and
+        # does not retain the array, so reusing it next iteration is safe —
+        # but the flag MUST be cleared afterwards, otherwise the cvtColor
+        # above would fail on a read-only destination on the next frame.
+        rgb_buf.flags.writeable = False
+        results = hands.process(rgb_buf)
+        rgb_buf.flags.writeable = True
 
         if results.multi_hand_landmarks:
             hand = results.multi_hand_landmarks[0]
@@ -807,24 +983,23 @@ try:
             smooth_x = _oef_x(target_x, timestamp=now_ts)
             smooth_y = _oef_y(target_y, timestamp=now_ts)
 
-            _set_cursor_pos(int(smooth_x), int(smooth_y))
+            backend.move_cursor(int(smooth_x), int(smooth_y))
 
             # Per-frame travel, kept purely as a tuning readout.
             jump = math.hypot(smooth_x - prev_x, smooth_y - prev_y)
             prev_x = smooth_x
             prev_y = smooth_y
 
-            # ── Visualisation overlays ──────────────────────────────────
-            # Draw hand skeleton.
-            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+            # ── Visualisation overlays (drawn on the writeable BGR buffer)
+            mp_draw.draw_landmarks(bgr_buf, hand, mp_hands.HAND_CONNECTIONS)
 
             # Draw a filled circle at the index finger tip.
             cx, cy = int(raw_x), int(raw_y)
-            cv2.circle(frame, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
+            cv2.circle(bgr_buf, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
 
             # Show how far the cursor moved this frame.
             cv2.putText(
-                frame, f"j={jump:.0f}", (cx + 15, cy - 10),
+                bgr_buf, f"j={jump:.0f}", (cx + 15, cy - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1,
             )
         else:
@@ -834,7 +1009,7 @@ try:
         # Draw the active bounding box on the preview.  Read from `screen`
         # so it follows the box when a display is plugged or unplugged.
         cv2.rectangle(
-            frame,
+            bgr_buf,
             (screen.box_left,  screen.box_top),
             (screen.box_right, screen.box_bottom),
             (255, 0, 255), 2,
@@ -845,7 +1020,7 @@ try:
         # it shrinks and grows live as '+' / '-' are pressed.
         _eff = screen.effective_box
         if _eff is not None:
-            cv2.rectangle(frame, (_eff[0], _eff[1]), (_eff[2], _eff[3]),
+            cv2.rectangle(bgr_buf, (_eff[0], _eff[1]), (_eff[2], _eff[3]),
                           (0, 165, 255), 1)
 
         # ── HUD ─────────────────────────────────────────────────────────
@@ -853,30 +1028,30 @@ try:
         fps = 1.0 / (now_ts - prev_time) if now_ts > prev_time else 0.0
         prev_time = now_ts
         cv2.putText(
-            frame, f"FPS: {int(fps)}", (10, 30),
+            bgr_buf, f"FPS: {int(fps)}", (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
         )
 
-        # Current sensitivity, directly below the FPS readout.  Amber to
-        # match the live-region rectangle it controls.
+        # Current sensitivity, directly below the FPS readout, rounded to one
+        # decimal place.  Amber to match the live-region rectangle it controls.
         cv2.putText(
-            frame, f"Speed: {CURSOR_SENSITIVITY:.1f}x", (10, 60),
+            bgr_buf, f"Speed: {CURSOR_SENSITIVITY:.1f}x", (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2,
         )
 
         # Desktop summary underneath.
         cv2.putText(
-            frame, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
+            bgr_buf, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
             (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
 
-        # Key hints along the bottom edge.
+        # Key hints along the bottom edge of the real frame.
         cv2.putText(
-            frame, "+/- speed   q quit", (10, CAM_HEIGHT - 12),
+            bgr_buf, "+/- speed   q quit", (10, frame_h - 12),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
         )
 
-        cv2.imshow("Hand Cursor Control", frame)
+        cv2.imshow("Hand Cursor Control", bgr_buf)
 
         # Sensitivity keys and quit, same handler as the skip path above.
         if handle_key(cv2.waitKey(1) & 0xFF):
@@ -886,4 +1061,5 @@ finally:
     stream.stop()
     cv2.destroyAllWindows()
     hands.close()
+    backend.close()
     print("Shutdown complete.")

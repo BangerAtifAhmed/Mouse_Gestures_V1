@@ -1,7 +1,11 @@
 # Hand-Tracking Cursor Controller — pinned dependencies
 #
-# Platform: Windows only.  The script drives the cursor through
-# ctypes.windll.user32, which does not exist on Linux or macOS.
+# Platform: Windows or Linux/X11.  All OS calls go through ctypes against
+#           user32.dll (Windows) or libX11.so.6 (Linux) — no wrapper
+#           packages.  On Linux, libx11-6 must be present (it is on any
+#           desktop install; add libxinerama1 for a monitor count).
+#           A native Wayland session will not accept cursor warps; run
+#           under X11/XWayland.
 #
 # Python:   3.8 – 3.10.  mediapipe 0.8.11 publishes no cp311 wheels, so a
 #           3.11+ interpreter cannot satisfy this pin at all.
@@ -10,6 +14,11 @@
 # 0.10.x restructures the package and breaks the mp.solutions.hands entry
 # point this architecture is built on (AttributeError / ModuleNotFoundError).
 # Do not bump this without porting the tracking layer first.
+#
+# numpy is imported directly for the preallocated frame buffers.  It is
+# already a hard dependency of both packages below; the floor is stated
+# only so the requirement is explicit rather than incidental.
 
 opencv-python>=4.5,<5.0
 mediapipe==0.8.11
+numpy>=1.19
