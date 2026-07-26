@@ -1,10 +1,15 @@
 # Hand-Tracking Cursor Controller — pinned dependencies
-# Compatible with Python 3.8.10 and 3.10.11 on Windows & Ubuntu.
 #
-# MediaPipe is pinned to 0.8.11 to avoid the newer Tasks API which
-# introduces breaking changes (AttributeError / ModuleNotFoundError
-# on mp.solutions.hands).
+# Platform: Windows only.  The script drives the cursor through
+# ctypes.windll.user32, which does not exist on Linux or macOS.
+#
+# Python:   3.8 – 3.10.  mediapipe 0.8.11 publishes no cp311 wheels, so a
+#           3.11+ interpreter cannot satisfy this pin at all.
+#
+# MediaPipe is pinned to 0.8.11 deliberately.  The Tasks API introduced in
+# 0.10.x restructures the package and breaks the mp.solutions.hands entry
+# point this architecture is built on (AttributeError / ModuleNotFoundError).
+# Do not bump this without porting the tracking layer first.
 
 opencv-python>=4.5,<5.0
 mediapipe==0.8.11
-pynput>=1.7,<2.0

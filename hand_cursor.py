@@ -1,15 +1,40 @@
 """
-Hand-Tracking Cursor Controller (v8 — One Euro Filter + Sub-Frame Glide)
-========================================================================
+Hand-Tracking Cursor Controller (v9 — Non-Blocking, Filter-Only)
+================================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
-Uses a One Euro Filter (Casiez et al. 2012) for speed-adaptive smoothing that
-kills jitter at rest while staying responsive during fast swipes — even at the
-camera's hardware-limited 30 Hz.  Sub-frame interpolation ensures large jumps
-look like smooth glides, not teleports.  Movement only — no click gestures.
+Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
+which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
+light smoothing during fast swipes.  Movement only — no click gestures.
+
+v9 removes the sub-frame interpolation "glide" from v8.  That code called
+time.sleep() inside the main loop, which was counter-productive for two
+reasons:
+
+  1. It stole ~27 ms from the frame budget *precisely* when the hand was
+     moving fastest, delaying the next camera sample.  The larger gap
+     produced a larger jump on the following frame, which re-triggered
+     interpolation — a positive feedback loop of lag.
+
+  2. On CPython < 3.11 (this project targets 3.8/3.10), time.sleep() on
+     Windows is bounded by the ~15.6 ms system timer tick, so each 6.67 ms
+     sleep actually blocked for ~15 ms.  The real cost was closer to 60 ms
+     per triggering frame.
+
+The One Euro Filter already produces continuous motion without stalling the
+capture loop, so the correct fix is to let it do its job unimpeded.
+
+The active box maps onto the *virtual desktop* (all monitors combined), not
+just the primary display.
 
 Dependencies:  pip install opencv-python mediapipe==0.8.11
 Platform:      Windows only (uses user32.dll)
+Python:        3.8 – 3.10  (mediapipe 0.8.11 ships no cp311 wheels)
 """
+
+# PEP 604 unions (`float | None`) are evaluated at def-time on Python < 3.10
+# and would raise TypeError there.  Deferring annotation evaluation keeps the
+# 3.8/3.9 half of the supported range importable.
+from __future__ import annotations
 
 import ctypes
 import cv2
@@ -18,12 +43,38 @@ import mediapipe as mp
 import threading
 import time
 
-# ─── Win32 screen resolution (direct API, no wrapper overhead) ─────────────
-# GetSystemMetrics(0) → screen width in pixels  (SM_CXSCREEN)
-# GetSystemMetrics(1) → screen height in pixels (SM_CYSCREEN)
+# ─── Win32 virtual desktop metrics (direct API, no wrapper overhead) ───────
+# SM_CXSCREEN (0) / SM_CYSCREEN (1) describe the *primary* monitor only, so a
+# cursor driven from them can never leave display 1.  The SM_*VIRTUALSCREEN
+# family describes the bounding rectangle enclosing ALL monitors:
+#
+#   SM_XVIRTUALSCREEN  (76) → left edge of the virtual desktop
+#   SM_YVIRTUALSCREEN  (77) → top  edge of the virtual desktop
+#   SM_CXVIRTUALSCREEN (78) → total width  of the virtual desktop
+#   SM_CYVIRTUALSCREEN (79) → total height of the virtual desktop
+#
+# The origin matters.  Windows pins the primary monitor at (0, 0), so any
+# display arranged to its left or above it produces NEGATIVE coordinates —
+# a second monitor on the left reports SM_XVIRTUALSCREEN = −1920.  Mapping
+# into [0, width] would therefore strand the cursor on the right-hand
+# display, so every mapping below is offset by the origin.  SetCursorPos
+# accepts negative virtual-screen coordinates directly.
+#
+# ctypes leaves restype at the default c_int (signed), so negative origins
+# come back correctly; forcing c_uint here would silently wrap them.
+
+SM_XVIRTUALSCREEN  = 76
+SM_YVIRTUALSCREEN  = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SM_CMONITORS       = 80
+
 _user32 = ctypes.windll.user32
-SCREEN_W = _user32.GetSystemMetrics(0)
-SCREEN_H = _user32.GetSystemMetrics(1)
+SCREEN_LEFT = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+SCREEN_TOP  = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+SCREEN_W    = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+SCREEN_H    = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+MONITORS    = _user32.GetSystemMetrics(SM_CMONITORS)
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -84,7 +135,8 @@ ACTIVE_H = _box_h
 # ── One Euro Filter parameters ─────────────────────────────────────────────
 # The One Euro Filter (Casiez, Roussel & Vogel, CHI 2012) is an adaptive
 # low-pass filter designed for real-time noisy signal smoothing.  It is
-# the industry standard for pointer/hand tracking at low frame rates.
+# the industry standard for pointer/hand tracking at low frame rates, and
+# is now the *only* smoothing stage in this pipeline.
 #
 # Core idea:
 #   - At rest (low speed):  use heavy smoothing to kill jitter.
@@ -106,7 +158,7 @@ ACTIVE_H = _box_h
 #   BETA        — how much speed increases the cutoff.  Higher = snappier.
 #   D_CUTOFF    — cutoff for the derivative filter (Hz).  Usually ~1.0.
 #
-# Tuning guide:
+# Tuning guide (BETA is the primary knob now that interpolation is gone):
 #   - Jittery at rest?  Lower MIN_CUTOFF.
 #   - Too laggy on fast moves?  Raise BETA.
 #   - Derivative noisy?  Lower D_CUTOFF.
@@ -114,22 +166,6 @@ ACTIVE_H = _box_h
 MIN_CUTOFF = 0.8    # Hz — position cutoff at rest  (lower = smoother)
 BETA       = 0.01   # speed coefficient  (higher = snappier on fast moves)
 D_CUTOFF   = 1.0    # Hz — cutoff for the speed (derivative) filter
-
-# ── Sub-frame interpolation ────────────────────────────────────────────────
-# At 30 Hz, a fast hand swipe can jump 200+ screen pixels between frames.
-# Even with perfect filtering, a single SetCursorPos() call per frame would
-# look like a teleport.  We split large jumps into INTERP_STEPS smaller
-# moves spread across a short time window, creating a visible glide.
-#
-#   If distance > INTERP_THRESHOLD:
-#       for step in 1..INTERP_STEPS:
-#           lerp_t = step / INTERP_STEPS
-#           pos    = prev + lerp_t * (target - prev)
-#           SetCursorPos(pos)
-#           sleep(frame_budget / INTERP_STEPS)
-
-INTERP_STEPS     = 5      # number of sub-steps for large jumps
-INTERP_THRESHOLD = 80.0   # px — jump distance that triggers interpolation
 
 # ─── Win32 cursor function reference ───────────────────────────────────────
 # Cache the function reference to avoid repeated attribute lookups in the loop.
@@ -226,6 +262,24 @@ class LowPassFilter:
         self._alpha = alpha
         self._initialised = False
 
+    @property
+    def initialised(self) -> bool:
+        """True once at least one sample has been absorbed."""
+        return self._initialised
+
+    @property
+    def last_value(self) -> float:
+        """The most recent filtered output."""
+        return self._y
+
+    def reset(self) -> None:
+        """Discard history so the next sample is adopted verbatim.
+
+        Used when the hand re-enters the frame: the filter must snap to the
+        new position rather than glide from wherever the hand was last seen.
+        """
+        self._initialised = False
+
     def __call__(self, value: float, alpha: float | None = None) -> float:
         if alpha is not None:
             self._alpha = alpha
@@ -254,6 +308,7 @@ class OneEuroFilter:
     """
     def __init__(self, freq: float, min_cutoff: float = 1.0,
                  beta: float = 0.0, d_cutoff: float = 1.0):
+        self._freq0 = freq          # kept so reset() can restore it
         self._freq = freq
         self._min_cutoff = min_cutoff
         self._beta = beta
@@ -278,6 +333,18 @@ class OneEuroFilter:
         tau = 1.0 / (2.0 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
+    def reset(self) -> None:
+        """Clear all internal state (position, velocity, timing).
+
+        The next __call__ adopts its input verbatim and restarts velocity
+        estimation from zero, so the cursor teleports to the hand's real
+        position instead of interpolating from a stale one.
+        """
+        self._x_filt.reset()
+        self._dx_filt.reset()
+        self._last_time = None
+        self._freq = self._freq0
+
     def __call__(self, x: float, timestamp: float | None = None) -> float:
         """Filter one sample and return the smoothed value."""
         # Estimate dt from timestamps if available.
@@ -289,8 +356,8 @@ class OneEuroFilter:
         dt = 1.0 / self._freq
 
         # 1) Estimate the derivative (speed) and smooth it.
-        if self._x_filt._initialised:
-            dx = (x - self._x_filt._y) / dt
+        if self._x_filt.initialised:
+            dx = (x - self._x_filt.last_value) / dt
         else:
             dx = 0.0
         edx = self._dx_filt(dx, alpha=self._alpha(self._d_cutoff, dt=dt))
@@ -308,11 +375,20 @@ class OneEuroFilter:
 _oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
 _oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
 
-# Previous cursor position for sub-frame interpolation.
-prev_x = SCREEN_W / 2.0
-prev_y = SCREEN_H / 2.0
+# Tracks whether a hand was visible on the *previous* frame.  A False → True
+# transition means the hand just re-entered the frame, which is when the
+# filters must be reset (see the main loop).
+hand_present = False
 
-prev_time = time.time()
+# Last smoothed position — retained only for the on-screen jump readout.
+# Seeded at the centre of the virtual desktop (origin-aware).
+prev_x = SCREEN_LEFT + SCREEN_W / 2.0
+prev_y = SCREEN_TOP  + SCREEN_H / 2.0
+
+# perf_counter() is monotonic and sub-microsecond.  time.time() on Windows
+# is backed by GetSystemTimeAsFileTime, whose ~15.6 ms granularity would
+# badly quantise the dt estimate the 1€ filter depends on at 60 FPS.
+prev_time = time.perf_counter()
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -322,12 +398,14 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
-print(f"Screen      : {SCREEN_W} × {SCREEN_H}  (ratio {_screen_ratio:.3f})")
+print(f"Virtual desk: {SCREEN_W} × {SCREEN_H} px  origin ({SCREEN_LEFT}, {SCREEN_TOP})  "
+      f"ratio {_screen_ratio:.3f}")
+print(f"Monitors    : {MONITORS}")
 print(f"Webcam      : {CAM_WIDTH} × {CAM_HEIGHT} @ {CAM_FPS} FPS")
 print(f"Active box  : {ACTIVE_W} × {ACTIVE_H} px  "
       f"x[{ACTIVE_LEFT}–{ACTIVE_RIGHT}]  y[{ACTIVE_TOP}–{ACTIVE_BOTTOM}]")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
-print(f"Interpolation: {INTERP_STEPS} steps when jump > {INTERP_THRESHOLD} px")
+print(f"Smoothing   : filter-only (no blocking interpolation)")
 print(f"Camera      : threaded (background capture)")
 print("Press 'q' in the preview window to quit.\n")
 
@@ -342,6 +420,11 @@ try:
 
         # Convert BGR → RGB for MediaPipe.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Mark the buffer read-only.  MediaPipe defensively copies any array
+        # it might mutate; flagging it non-writeable lets it borrow the
+        # buffer instead, saving a full-frame allocation + memcpy per frame.
+        rgb.flags.writeable = False
         results = hands.process(rgb)
 
         if results.multi_hand_landmarks:
@@ -358,41 +441,44 @@ try:
             clamped_x = clamp(raw_x, ACTIVE_LEFT, ACTIVE_RIGHT)
             clamped_y = clamp(raw_y, ACTIVE_TOP,  ACTIVE_BOTTOM)
 
-            # ── Screen mapping ──────────────────────────────────────────
-            # Linear interpolation from active-area coords → screen coords:
-            #   screen_x = (clamped_x − ACTIVE_LEFT) / ACTIVE_W  ×  SCREEN_W
-            # Maps the active area edges to the full screen boundaries.
-            target_x = ((clamped_x - ACTIVE_LEFT) / ACTIVE_W) * SCREEN_W
-            target_y = ((clamped_y - ACTIVE_TOP)  / ACTIVE_H) * SCREEN_H
+            # ── Virtual desktop mapping ─────────────────────────────────
+            # Linear interpolation from active-area coords → virtual-screen
+            # coords, offset by the desktop origin so monitors positioned
+            # left of / above the primary (negative origin) are reachable:
+            #
+            #   screen_x = SCREEN_LEFT
+            #            + (clamped_x − ACTIVE_LEFT) / ACTIVE_W × SCREEN_W
+            #
+            # The active-area edges therefore map to the outer corners of
+            # the whole multi-monitor desktop, not just display 1.
+            target_x = SCREEN_LEFT + ((clamped_x - ACTIVE_LEFT) / ACTIVE_W) * SCREEN_W
+            target_y = SCREEN_TOP  + ((clamped_y - ACTIVE_TOP)  / ACTIVE_H) * SCREEN_H
+
+            # ── Re-entry reset ───────────────────────────────────────────
+            # The hand was absent last frame and is back now.  Without this,
+            # the filters would still hold the position from wherever the
+            # hand vanished, and the cursor would slide across the screen
+            # from that stale point.  Clearing them makes the very next
+            # filter call adopt the raw target verbatim.
+            if not hand_present:
+                _oef_x.reset()
+                _oef_y.reset()
+                prev_x, prev_y = target_x, target_y
+                hand_present = True
 
             # ── One Euro Filter smoothing ────────────────────────────────
-            # Feed each axis through its own 1€ filter instance.
-            # The filter internally tracks time and speed to compute a
-            # dynamic cutoff: still → heavy smoothing, fast → light.
-            now_ts = time.time()
+            # The filter is the *only* smoothing stage.  It internally tracks
+            # time and speed to compute a dynamic cutoff: still → heavy
+            # smoothing, fast → light.  Nothing here blocks the loop, so the
+            # next camera sample arrives as soon as the hardware has it.
+            now_ts = time.perf_counter()
             smooth_x = _oef_x(target_x, timestamp=now_ts)
             smooth_y = _oef_y(target_y, timestamp=now_ts)
 
-            # ── Sub-frame interpolation (anti-teleport) ─────────────────
-            # At 30 Hz, even filtered positions can jump 100+ px between
-            # frames.  We split the jump into INTERP_STEPS smaller moves
-            # spread over the frame budget so the cursor *glides* visibly.
+            _set_cursor_pos(int(smooth_x), int(smooth_y))
+
+            # Per-frame travel, kept purely as a tuning readout.
             jump = math.hypot(smooth_x - prev_x, smooth_y - prev_y)
-
-            if jump > INTERP_THRESHOLD and INTERP_STEPS > 1:
-                # Spread the glide over ~1 frame period (≈33 ms at 30 Hz).
-                step_delay = (1.0 / 30.0) / INTERP_STEPS
-                for s in range(1, INTERP_STEPS + 1):
-                    t = s / INTERP_STEPS
-                    ix = prev_x + t * (smooth_x - prev_x)
-                    iy = prev_y + t * (smooth_y - prev_y)
-                    _set_cursor_pos(int(ix), int(iy))
-                    if s < INTERP_STEPS:
-                        time.sleep(step_delay)
-            else:
-                _set_cursor_pos(int(smooth_x), int(smooth_y))
-
-            # Store for next frame's interpolation baseline.
             prev_x = smooth_x
             prev_y = smooth_y
 
@@ -404,11 +490,14 @@ try:
             cx, cy = int(raw_x), int(raw_y)
             cv2.circle(frame, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
 
-            # Show the filter's effective cutoff and jump distance.
+            # Show how far the cursor moved this frame.
             cv2.putText(
                 frame, f"j={jump:.0f}", (cx + 15, cy - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1,
             )
+        else:
+            # No hand this frame — arm the reset for whenever it returns.
+            hand_present = False
 
         # Draw the active bounding box on the preview.
         cv2.rectangle(
@@ -419,7 +508,7 @@ try:
         )
 
         # FPS counter.
-        now = time.time()
+        now = time.perf_counter()
         fps = 1.0 / (now - prev_time) if (now - prev_time) > 0 else 0
         prev_time = now
         cv2.putText(
