@@ -1,6 +1,6 @@
 """
-Hand-Tracking Cursor Controller (v14 — Lean & Cross-Platform)
-=============================================================
+Hand-Tracking Cursor Controller (v23 — Auto-Negotiated Backend)
+===============================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
@@ -9,7 +9,87 @@ light smoothing during fast swipes.  Movement only — no click gestures.
 The active box maps onto the whole virtual desktop (all monitors combined)
 and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
 
-v14 trims resource use and drops the Windows-only assumption:
+v23 stops forcing DirectShow.  DSHOW was pinned for its low latency, which
+suits physical webcams and breaks some virtual ones: it would open the
+DroidCam port, report success, then return empty frames forever — a black
+preview at 0 FPS.  Captures now pass the index alone and let OpenCV pick a
+backend that the driver actually registered with.  MSMF is slower to first
+frame than DSHOW was, so the scan and the stream's open both retry more
+patiently; MSMF also ignores CAP_PROP_BUFFERSIZE, which costs nothing here
+because the capture thread already drops unclaimed frames itself.
+CAMERA_API can pin a backend again if one is ever needed.
+
+v22 puts mirroring on the 'm' key.  Front-facing webcams are normally shown
+mirrored (some drivers pre-mirror the feed themselves); rear-facing phone
+cameras are not, and the wrong choice sends the cursor backwards.  Because
+MediaPipe reads the very buffer that is displayed, flipping the picture
+flips the control direction with it — so the toggle needs to touch only
+cv2.flip, and the two can never disagree.  Flipping the frame *and*
+separately inverting the maths would cancel out and leave 'm' doing nothing
+but restyling the preview.  INVERT_CURSOR_X survives on 'i' as the
+independent control-only trim, for a driver that mirrors internally.
+
+v21 drops the aspect lock and builds the active box straight from the
+margins in NORMALISED landmark coordinates, mapping it onto the virtual
+desktop with np.interp (which saturates outside its input range, so the
+clamp is the interpolation's own behaviour).
+
+The v20 box was locked to the desktop aspect ratio, which on a 3.56:1
+virtual screen left a 640×360 frame with a box only 146 px tall — trimmed
+by the margins to a 111 px strip, 31% of the frame height.  All vertical
+steering had to happen inside that band.  The box is now 76%×76% of the
+frame, about 2.5× the vertical room.
+
+The cost is that gain is no longer isotropic: mapping a 16:9 frame onto a
+3.56:1 desktop gives roughly twice the horizontal gain as vertical, so a
+diagonal sweep no longer traces a straight diagonal.  The startup banner
+prints the measured ratio and the MARGIN_Y that would rebalance it.
+
+v20 insets the active region.  Reaching a corner used to mean pushing the
+fingertip to the very perimeter of the tracking box — exactly where it is
+half out of frame and MediaPipe is least confident.  MARGIN_X / MARGIN_Y now
+reserve a band on each side, and the window inside them is what spans the
+desktop, so the edges arrive early and the outer band pins the cursor to the
+boundary.  The margins compose with CURSOR_SENSITIVITY rather than replacing
+it: effective gain is SENSITIVITY / (1 − 2·MARGIN).
+
+v19 makes the horizontal control direction a flag.  The frame is mirrored
+with cv2.flip before MediaPipe sees it, so a plain webcam already maps the
+right way — but a source that mirrors somewhere in its own pipeline cancels
+that flip and reverses the cursor.  INVERT_CURSOR_X reflects the hand inside
+the active box, on the control path only: the preview stays mirrored and the
+fingertip marker stays on the fingertip.
+
+v18 caps the size frames are processed at.  A phone driver ignores the
+requested 640×480 and sends 1080p, which costs 6.75× the inference work and
+opens a preview window larger than the desktop — Windows then clips it, so
+the right and bottom of the overlay simply are not on screen.  The capture
+thread now downscales oversized frames before publishing them, so nothing
+downstream ever sees the large image.  It is a resize, not a crop: the whole
+field of view survives.  The budget is a bounding box rather than a fixed
+size, because forcing 16:9 into a literal 640×480 would squash the hand by a
+third — a 1080p feed becomes 640×360.
+
+v17 stops assuming the camera delivers 640×480.  The active box was computed
+from that constant while the preview buffers were sized from the real frame,
+so a 1280×720 phone feed drew the box into the top-left quadrant and scaled
+the fingertip to half its true position.  The frame size is now measured from
+the first frame WebcamStream receives, owned by ScreenGeometry, and rebuilt
+if it ever changes.  The dead zones scale with resolution too, so the box
+covers the same relative region on a 4:3 laptop sensor and a 16:9 phone.
+
+v16 stops treating the camera scan as authoritative.  A phone-backed driver
+such as DroidCam can need several hundred milliseconds to produce its first
+frame, so a fast probe reports it as absent — and v15 would then conclude
+"only one camera exists" and start on the built-in webcam without asking.
+
+The scan is now slow enough to give those drivers a chance (repeated read
+attempts, a settle pause after each release) and prints its verdict per
+index.  More importantly it no longer decides anything: the prompt always
+appears, and any index in 0..CAM_MANUAL_MAX can be typed whether or not the
+scan confirmed it.  A bare Enter takes the highest detected index.
+
+v14 trimmed resource use and dropped the Windows-only assumption:
 
   * model_complexity=0 pins MediaPipe to the "Lite" landmark graph.
   * The per-frame flip and BGR→RGB conversion now write into two preallocated
@@ -29,6 +109,8 @@ redundant inference on frames already processed.
 v9 removed the blocking sub-frame interpolation that made fast motion worse.
 
 Controls:  + / =  raise sensitivity      - / _  lower sensitivity
+           m      mirror on/off (picture AND control direction)
+           i      invert X, control only (picture unchanged)
            q      quit
 
 Dependencies:  pip install opencv-python mediapipe==0.8.11
@@ -84,6 +166,66 @@ import numpy as np          # already a hard dependency of cv2 and mediapipe
 # no object to keep in sync.
 
 CURSOR_SENSITIVITY = 1.0
+
+# ── Active-region inset margins ────────────────────────────────────────────
+# Reaching a screen corner should not require pushing the hand to the very
+# perimeter of the tracking box, where the fingertip is half out of frame and
+# MediaPipe's confidence is at its worst.  These margins reserve a band on
+# each side of the box; the region *inside* them is what maps to the full
+# desktop, so the edges arrive early and the outer band holds the cursor
+# pinned against the boundary:
+#
+#       usable window = [MARGIN, 1 − MARGIN]  of the box, per axis
+#       0.12          → the middle 76% covers the whole screen
+#
+# Per axis, deliberately: the box is already short and wide on a multi-
+# monitor desktop, so vertical and horizontal strain are not the same
+# problem and do not want the same number.
+#
+# RELATIONSHIP TO CURSOR_SENSITIVITY:  both shrink the live sub-region, and
+# they COMPOSE rather than override.  The effective gain is
+#
+#       gain = CURSOR_SENSITIVITY / (1 − 2·MARGIN)
+#
+# so 0.12 margins at 1.0× already behave like 1.32×, and the 3.0× ceiling
+# now reaches ~3.95× of effective travel.  Think of the margins as the
+# baseline comfort setting and '+' / '-' as the runtime trim on top.  The
+# amber rectangle in the preview draws the combined live region, so the
+# total is always visible rather than inferred.
+#
+# Values are sanitised at use, so a margin of 0.5 or more cannot collapse
+# the window to zero width.
+MARGIN_X = 0.12
+MARGIN_Y = 0.12
+
+# ── Mirroring — the 'm' key ────────────────────────────────────────────────
+# Cameras disagree about handedness.  A front-facing webcam is usually shown
+# mirrored (and some drivers pre-mirror the feed themselves); a rear-facing
+# phone camera is not.  Get it wrong and the cursor runs the wrong way.
+#
+# IS_MIRRORED gates cv2.flip on the ONE buffer that is both displayed and
+# handed to MediaPipe.  That single fact is what makes the toggle useful:
+# because the landmarks come from the same image you are looking at, tip.x
+# is always in *display* coordinates, so flipping the picture flips the
+# control direction with it.  Press 'm' until the cursor follows your hand.
+#
+# WORTH KNOWING:  flipping the frame *and* separately inverting the maths
+# would cancel out — two reversals leave the direction unchanged and 'm'
+# would appear to do nothing but restyle the preview.  So the flip is the
+# only thing 'm' touches, and the two stay coupled by construction.
+#
+# INVERT_CURSOR_X below is the independent trim, for the case where the
+# picture looks right but the cursor still runs backwards (a driver that
+# mirrors internally, say).  Between them the four combinations cover every
+# camera; 'm' is the one to reach for first.
+IS_MIRRORED = True
+
+# ── Horizontal direction (independent trim) ────────────────────────────────
+# Reflects the CONTROL path only, leaving the picture alone.  Toggle with
+# 'i' at runtime.  The preview stays as-is and the fingertip marker stays on
+# the fingertip, because the drawing code keeps using the unreflected
+# coordinate.
+INVERT_CURSOR_X = True
 
 SENS_STEP = 0.1    # increment per keypress
 SENS_MIN  = 1.0    # floor: plain absolute mapping, the entire box is live.
@@ -171,10 +313,85 @@ OPENCV_THREADS = 1
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 # Webcam settings
-CAM_INDEX = 0
+#
+# CAM_INDEX = None  → probe indices 0..CAM_SCAN_MAX at startup, then ALWAYS
+#                     prompt, whatever the scan found.
+# CAM_INDEX = <int> → use that index directly, skipping both the scan and the
+#                     prompt.  Set this once you know which camera you want,
+#                     or when running the script unattended.
+CAM_INDEX = None
+
+CAM_SCAN_MAX = 4       # highest index the scanner probes
+
+# ── Capture backend ────────────────────────────────────────────────────────
+# None → hand cv2.VideoCapture the index alone and let OpenCV negotiate.
+#
+# This used to force cv2.CAP_DSHOW on Windows for its lower latency, which
+# is fine for physical webcams and actively broken for some virtual ones:
+# DirectShow would open the DroidCam port, report success, and then hand
+# back empty frames forever — a black preview at 0 FPS.  Auto-negotiation
+# picks whichever backend the driver actually registered with (usually MSMF
+# for virtual cameras on Windows, V4L2 on Linux).
+#
+# Two things get worse in exchange, both handled below rather than hidden:
+#   * MSMF takes appreciably longer to produce its first frame than DSHOW,
+#     so the scan needs more patience — see CAM_SCAN_READ_TRIES.
+#   * MSMF generally ignores CAP_PROP_BUFFERSIZE.  The capture thread already
+#     drops unclaimed frames on its own, so this costs nothing but a line in
+#     the startup banner saying the request was refused.
+#
+# Set to cv2.CAP_DSHOW / cv2.CAP_MSMF / cv2.CAP_V4L2 to force one.
+CAMERA_API = None
+
+# Virtual-camera drivers (DroidCam, OBS, Iriun, ManyCam) route frames through
+# a phone or another application, so they need noticeably longer to answer
+# than a physical USB webcam.  A scan that opens and releases each index in
+# a few milliseconds will often miss them entirely, and can leave the driver
+# wedged for the next attempt.  Three settings slow the loop down enough for
+# them to respond:
+# Raised from 3 when DirectShow was dropped: MSMF is slower to hand over a
+# first frame than DSHOW was, so the same retry count bought fewer real
+# chances and a slow driver could go back to looking absent.
+CAM_SCAN_READ_TRIES = 5     # read attempts before writing an index off
+CAM_SCAN_READ_WAIT  = 0.12  # seconds between those attempts (warm-up)
+CAM_SCAN_SETTLE     = 0.1   # seconds after release, before the next index
+
+# The scan is a hint, not the truth — a driver that was still waking up can
+# be typed in by hand even though it never answered.  This bounds what the
+# prompt will accept, nothing more.
+CAM_MANUAL_MAX = 9
+
+# The resolution *requested* from the driver.  It is a request, not a fact:
+# cameras are free to ignore it and many do, so nothing downstream may assume
+# frames arrive at this size.  The authoritative numbers come from the first
+# frame WebcamStream actually receives (stream.width / stream.height), and
+# every piece of geometry is built from those.
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
 CAM_FPS = 60
+
+# ── Processing resolution budget ───────────────────────────────────────────
+# A phone-backed driver ignores the request above and hands over 1080p or
+# 720p regardless.  Working at that size costs three ways:
+#
+#   1. MediaPipe inference scales with pixel count — a 1080p frame is 6.75×
+#      the work of 640×480, which is what drags the frame rate down.
+#   2. cv2.imshow opens a window the size of the frame.  A 1920×1080 preview
+#      on a 1920×1080 monitor is larger than the usable desktop, so Windows
+#      clips it and the right/bottom of the overlay is simply not on screen.
+#   3. The flip and colour-convert buffers grow with it.
+#
+# So oversized frames are downscaled in the capture thread, before anything
+# else touches them.  This is a RESIZE, not a crop: the whole field of view
+# survives, just with fewer pixels.
+#
+# The budget is a bounding box, not a fixed size.  Forcing a 16:9 feed into
+# a literal 640×480 would squash it horizontally by a third, distorting the
+# hand MediaPipe is trying to measure and making the preview look wrong; a
+# 1920×1080 source therefore becomes 640×360, not 640×480.  Set either value
+# to 0 to disable downscaling entirely.
+PROC_MAX_WIDTH  = 640
+PROC_MAX_HEIGHT = 480
 
 # ── Display hot-plug polling ───────────────────────────────────────────────
 # How often to re-read the virtual desktop rectangle.  The query is a cheap
@@ -183,37 +400,35 @@ CAM_FPS = 60
 # monitor in faster than this.
 POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 
-# ── Dynamic aspect-ratio bounding box (compact, shifted upward) ────────────
-# The box is sized from the *horizontal* constraint first, then the height
-# is derived to lock to the monitor's aspect ratio.  This makes the box
-# smaller than the "largest possible" approach, which increases cursor
-# sensitivity — less physical hand displacement is needed to traverse the
-# full screen width/height.
+# ── The active box IS the margin rectangle ─────────────────────────────────
+# Up to v20 the box was aspect-locked to the desktop: its height was derived
+# as width / desktop_ratio, so both axes carried identical gain and a
+# diagonal hand movement produced a diagonal cursor movement.
 #
-# Horizontal:
-#   SIDE_DEADZONE reserves pixels on each side of the webcam frame.
-#   active_width  = CAM_WIDTH − 2 × SIDE_DEADZONE
+# That geometry collapses on a wide desktop.  Locked to a 3.56:1 virtual
+# screen, a 640×360 camera frame yielded a box only 146 px tall — and the
+# margins then trimmed it to a 111 px strip, 31% of the frame height.  Every
+# vertical move had to happen inside that band, which is exactly the
+# "reaching the edges needs physical extremes" complaint.
 #
-# Vertical (aspect-ratio locked):
-#   active_height = active_width / screen_aspect_ratio
+# The box is now simply the frame inset by MARGIN_X / MARGIN_Y, computed
+# from NORMALISED landmark coordinates.  On the same setup that is 76% of
+# the frame in both directions — 274 px of vertical travel instead of 111,
+# about 2.5× the room.
 #
-# Placement:
-#   BOTTOM_DEADZONE pushes the box upward so the user's hand isn't cut off.
-#   ACTIVE_BOTTOM = CAM_HEIGHT − BOTTOM_DEADZONE
-#   ACTIVE_TOP    = ACTIVE_BOTTOM − active_height  (clamped ≥ MIN_TOP_PAD)
+# THE TRADE-OFF, stated plainly: gain is no longer isotropic.  Mapping 76%
+# of a 16:9 frame onto a 3.56:1 desktop gives ~7.9 screen px per camera px
+# horizontally against ~3.9 vertically — a 2:1 ratio, where it used to be
+# 1:1.  Vertical movement is therefore half as sensitive as horizontal.  On
+# a very wide desktop that arguably matches intuition, since there is far
+# more screen to cross sideways, but a diagonal sweep will not trace a
+# straight diagonal.  Raise MARGIN_Y relative to MARGIN_X to rebalance:
+# equal gain needs (1−2·MARGIN_Y)/(1−2·MARGIN_X) = frame_ratio/desktop_ratio.
 #
-# Because the ratio comes from the *virtual* desktop, all of this has to be
-# recomputed whenever a display is added or removed — hence ScreenGeometry.
-#
-# This box controls sensitivity *geometrically* (a smaller box needs less
-# hand travel); CURSOR_SENSITIVITY then scales the result numerically.  The
-# two compose, so shrink the box for a bigger comfortable range of motion
-# and reach for CURSOR_SENSITIVITY only when the box is already as small as
-# your camera framing allows.
-
-SIDE_DEADZONE   = 60   # px — reserved on each side (controls sensitivity)
-BOTTOM_DEADZONE = 150  # px — reserved dead zone at the bottom of the frame
-MIN_TOP_PAD     = 10   # px — minimum clearance at the top of the frame
+# Because the box is built from normalised coordinates it is automatically
+# correct on any sensor — 640×480, 1280×720 or a downscaled 640×360 all
+# produce the same relative rectangle, with no reference resolution to
+# calibrate against.
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -236,7 +451,7 @@ def handle_key(key: int) -> bool:
     duplicate-frame skip path runs far more often than the bottom of the
     loop, so keys handled in only one place would mostly be swallowed.
     """
-    global CURSOR_SENSITIVITY
+    global CURSOR_SENSITIVITY, IS_MIRRORED, INVERT_CURSOR_X
 
     if key in (ord('+'), ord('=')):          # '=' is '+' without shift
         CURSOR_SENSITIVITY = round(
@@ -244,9 +459,201 @@ def handle_key(key: int) -> bool:
     elif key in (ord('-'), ord('_')):        # '_' is '-' with shift
         CURSOR_SENSITIVITY = round(
             max(SENS_MIN, CURSOR_SENSITIVITY - SENS_STEP), 2)
+    elif key in (ord('m'), ord('M')):
+        # Flips the picture and, with it, the control direction — the
+        # landmarks come from the displayed buffer, so the two cannot
+        # disagree.  The main loop notices the change and resets the
+        # filters, because the hand's mapped position mirrors instantly.
+        IS_MIRRORED = not IS_MIRRORED
+        print(f"[mirror] preview {'MIRRORED' if IS_MIRRORED else 'RAW'} "
+              f"— control direction follows the picture")
+    elif key in (ord('i'), ord('I')):
+        INVERT_CURSOR_X = not INVERT_CURSOR_X
+        print(f"[invert] control-only X inversion "
+              f"{'ON' if INVERT_CURSOR_X else 'OFF'} (picture unchanged)")
     elif key == ord('q'):
         return True
     return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CAMERA DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════════
+
+def open_capture(index: int, api=None):
+    """Open a VideoCapture on *index*, negotiating the backend by default.
+
+    With api=None the index is passed on its own, which is what tells
+    OpenCV to try its registered backends in preference order and keep the
+    first that opens.  Naming a backend explicitly is still possible, but
+    it is opt-in: forcing DirectShow is precisely what left virtual cameras
+    open-but-silent.
+
+    Every capture in this file goes through here so there is one place to
+    change if a future driver needs pinning again.
+    """
+    return cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
+
+
+def describe_api(api) -> str:
+    """Human-readable name for a backend constant, for the banner."""
+    if api is None:
+        return "auto-negotiated"
+    for name in ("CAP_DSHOW", "CAP_MSMF", "CAP_V4L2", "CAP_GSTREAMER",
+                 "CAP_AVFOUNDATION", "CAP_ANY"):
+        if getattr(cv2, name, None) == api:
+            return name.replace("CAP_", "")
+    return f"backend {api}"
+
+
+def scan_cameras(max_index: int = CAM_SCAN_MAX, api=None) -> dict:
+    """Probe indices 0..max_index and return those that actually deliver.
+
+    isOpened() alone is not a sufficient test: virtual-camera drivers and
+    stale device nodes frequently report an open handle and then never
+    produce a frame.  Each candidate therefore has to survive a real
+    read() before it counts.
+
+    The converse failure matters just as much, and is the reason this loop
+    is deliberately unhurried.  A phone-backed driver such as DroidCam can
+    take several hundred milliseconds to hand over its first frame; probed
+    at full speed it looks identical to an empty slot, and hammering it can
+    leave the driver wedged for the following attempt.  So each opened
+    device gets CAM_SCAN_READ_TRIES chances with a short wait between them,
+    and every index is followed by CAM_SCAN_SETTLE seconds of quiet after
+    release.
+
+    Progress is printed per index because this scan is fallible by nature —
+    when a camera you know is connected does not appear, the line that
+    names it tells you whether it failed to open at all or opened and then
+    stayed silent.  Those two failures have different fixes.
+
+    Every handle is released before moving on, so nothing is left holding a
+    device when WebcamStream opens the chosen one.
+
+    Returns
+    -------
+    dict  {index: (width, height)} for every index that delivered a frame.
+          The resolution is read back from the device so the prompt can show
+          what each camera actually produces — a 4:3 laptop sensor and a 16:9
+          phone feed need very different bounding boxes.
+    """
+    found = {}
+
+    for index in range(max_index + 1):
+        print(f"[SCAN] Checking index {index}...")
+
+        cap = open_capture(index, api)
+        verdict = "not available (no device or backend refused)"
+        try:
+            if cap.isOpened():
+                for attempt in range(1, CAM_SCAN_READ_TRIES + 1):
+                    grabbed, frame = cap.read()
+                    if grabbed and frame is not None:
+                        # What the driver claims…
+                        claim_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                        claim_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                        # …and what it actually handed over.  These disagree
+                        # more often than one would like: some backends echo
+                        # back the requested size, others return 0.  The array
+                        # cannot lie, so it wins.
+                        real_h, real_w = frame.shape[:2]
+                        found[index] = (real_w, real_h)
+
+                        verdict = (f"OK — {real_w}×{real_h} "
+                                   f"on attempt {attempt}/{CAM_SCAN_READ_TRIES}")
+                        if (claim_w, claim_h) != (real_w, real_h):
+                            verdict += (f"  [driver reported "
+                                        f"{claim_w}×{claim_h}]")
+                        break
+                    time.sleep(CAM_SCAN_READ_WAIT)
+                else:
+                    verdict = (f"opened but produced no frame in "
+                               f"{CAM_SCAN_READ_TRIES} tries (slow driver?)")
+        finally:
+            cap.release()    # never leave a device held
+
+        print(f"[SCAN]   index {index}: {verdict}")
+
+        # Give the driver a moment to fully let go before the next open.
+        time.sleep(CAM_SCAN_SETTLE)
+
+    return found
+
+
+def pick_best_camera(available: list) -> int:
+    """Default choice: the highest index the scan found.
+
+    Index 0 is almost always the laptop's built-in webcam.  External USB
+    and virtual cameras are enumerated after it, so the largest index is
+    the one most likely to be the camera that was deliberately added.
+    """
+    return max(available)
+
+
+def choose_camera(available: list) -> int:
+    """Prompt for a camera index.  Always asks — the scan only suggests.
+
+    There is no auto-select shortcut, not even when exactly one source
+    answers.  A virtual driver that was still waking up is indistinguishable
+    from an absent one, so "only one camera exists" is a conclusion the scan
+    is not entitled to draw.  Typing an index the scan missed is therefore
+    allowed: anything in 0..CAM_MANUAL_MAX is accepted, with a warning when
+    it is not one the scan confirmed.
+
+    A bare Enter takes the highest detected index.  Missing stdin (piped
+    input, no console) falls back to the same default rather than hanging.
+    """
+    if available:
+        best = pick_best_camera(available)
+        print(f"\n[camera] scan answered on {len(available)} index/indices:")
+        for idx in sorted(available):
+            w, h = available[idx]
+            print(f"           [{idx}]  {w}×{h}  ({w / h:.2f}:1)")
+        print(f"         index 0 is normally the built-in webcam; "
+              f"higher indices are USB or virtual cameras")
+    else:
+        best = None
+        print("\n[camera] no index answered the scan.")
+        print("         a virtual driver (DroidCam, OBS, Iriun…) may still be "
+              "running but too slow to reply —")
+        print("         if you know its index, type it anyway.")
+
+    print(f"         any index 0–{CAM_MANUAL_MAX} is accepted, detected or not.")
+
+    while True:
+        prompt = (f"         camera index [Enter = {best}]: " if best is not None
+                  else f"         camera index (0–{CAM_MANUAL_MAX}, no default): ")
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            # No interactive console (piped stdin, service, IDE runner).
+            if best is None:
+                raise RuntimeError(
+                    "no camera answered the scan and stdin is unavailable, so "
+                    "no index could be chosen — set CAM_INDEX explicitly."
+                )
+            print(f"\n[camera] stdin unavailable — defaulting to {best}\n")
+            return best
+
+        if not raw:
+            if best is None:
+                print("         nothing was detected, so there is no default "
+                      "— please type an index.")
+                continue
+            print(f"[camera] using index {best} (default)\n")
+            return best
+
+        if raw.isdigit() and 0 <= int(raw) <= CAM_MANUAL_MAX:
+            index = int(raw)
+            if index not in available:
+                print(f"         note: index {index} did not answer the scan "
+                      f"— trying it anyway.")
+            print(f"[camera] using index {index}\n")
+            return index
+
+        print(f"         '{raw}' is not a number in 0–{CAM_MANUAL_MAX} "
+              f"— try again.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -277,7 +684,7 @@ class Win32Backend:
     SM_CMONITORS       = 80   # number of display monitors
 
     name = "Windows / user32"
-    camera_api = cv2.CAP_DSHOW      # lowest-latency backend on Windows
+    camera_api = CAMERA_API         # None → OpenCV negotiates (see CAMERA_API)
 
     def __init__(self):
         self._u32 = ctypes.windll.user32
@@ -321,7 +728,7 @@ class X11Backend:
     """
 
     name = "Linux / X11"
-    camera_api = cv2.CAP_V4L2       # Video4Linux2
+    camera_api = CAMERA_API         # None → OpenCV negotiates (usually V4L2)
 
     def __init__(self):
         try:
@@ -448,50 +855,71 @@ class ScreenGeometry:
     box_*           The active rectangle inside the webcam frame.
     """
 
-    def __init__(self, backend, poll_interval: float = POLL_INTERVAL):
+    def __init__(self, backend, cam_width: int, cam_height: int,
+                 poll_interval: float = POLL_INTERVAL):
         self._backend = backend
         self._poll_interval = poll_interval
         self._next_poll = 0.0
         self.monitors = 0
+        # The camera's real frame size.  Held here rather than read from a
+        # module constant so that swapping a 4:3 laptop sensor for a 16:9
+        # phone feed rebuilds the box instead of silently drawing one sized
+        # for the wrong image.
+        self.cam_w = int(cam_width)
+        self.cam_h = int(cam_height)
         # Seed with whatever the desktop looks like right now.
         self._apply(self._backend.read_geometry())
 
+    # ── Camera size ────────────────────────────────────────────────────
+    def set_camera_size(self, width: int, height: int) -> bool:
+        """Adopt a new camera frame size and rebuild the box.
+
+        Returns True only when the size actually changed.  Called whenever
+        the incoming frames stop matching what the box was built for.
+        """
+        if (int(width), int(height)) == (self.cam_w, self.cam_h):
+            return False
+        self.cam_w, self.cam_h = int(width), int(height)
+        # Rebuild against the desktop metrics already held.
+        self._apply((self.left, self.top, self.width, self.height))
+        return True
+
     # ── Derived geometry ───────────────────────────────────────────────
     def _apply(self, metrics: tuple[int, int, int, int]) -> None:
-        """Adopt *metrics* and rebuild the active box from them."""
+        """Adopt *metrics* and rebuild the active box from them.
+
+        Two independent shapes feed this: the desktop rectangle (which sets
+        the aspect ratio the box must lock to) and the camera frame (which
+        sets the canvas the box lives on).  Either can change at runtime —
+        a monitor hot-plug or a camera swap — so both are read from state
+        rather than from constants.
+        """
         self.left, self.top, self.width, self.height = metrics
         self.monitors = self._backend.monitor_count()
         self.ratio = self.width / self.height
 
-        # Step 1: width is driven by the side dead zones.
-        box_w = CAM_WIDTH - 2 * SIDE_DEADZONE
+        # The active box is the frame inset by the margins, in normalised
+        # coordinates.  No reference resolution and no aspect lock: the same
+        # fractions land on the same relative rectangle whatever the sensor
+        # delivers, so a 640×480 laptop cam and a downscaled 640×360 phone
+        # feed both give a 76%×76% window at the default 0.12 margins.
+        mx = min(max(MARGIN_X, 0.0), 0.49)
+        my = min(max(MARGIN_Y, 0.0), 0.49)
 
-        # Step 2: height preserves the desktop's aspect ratio.
-        box_h = int(box_w / self.ratio)
-        box_w = int(box_w)
+        self.box_left   = int(round(mx * self.cam_w))
+        self.box_right  = int(round((1.0 - mx) * self.cam_w))
+        self.box_top    = int(round(my * self.cam_h))
+        self.box_bottom = int(round((1.0 - my) * self.cam_h))
 
-        # Step 3: anchor the bottom edge above the dead zone.
-        bottom = CAM_HEIGHT - BOTTOM_DEADZONE
-        top = bottom - box_h
+        # A one-pixel frame, or margins rounding both edges together, must
+        # still leave something to divide by in to_screen().
+        if self.box_right <= self.box_left:
+            self.box_left, self.box_right = 0, max(1, self.cam_w)
+        if self.box_bottom <= self.box_top:
+            self.box_top, self.box_bottom = 0, max(1, self.cam_h)
 
-        # Step 4: if the box is too tall, shrink to fit while keeping the ratio.
-        if top < MIN_TOP_PAD:
-            top = MIN_TOP_PAD
-            box_h = bottom - top
-            box_w = int(box_h * self.ratio)
-
-        # An extreme desktop ratio (very wide or very tall) can round a
-        # dimension down to zero, which would divide by zero in to_screen().
-        box_w = max(1, box_w)
-        box_h = max(1, box_h)
-
-        # Horizontally centred.
-        self.box_left   = (CAM_WIDTH - box_w) // 2
-        self.box_right  = self.box_left + box_w
-        self.box_top    = top
-        self.box_bottom = bottom
-        self.box_w      = box_w
-        self.box_h      = box_h
+        self.box_w = self.box_right - self.box_left
+        self.box_h = self.box_bottom - self.box_top
 
     # ── Polling ────────────────────────────────────────────────────────
     def poll(self, now: float) -> bool:
@@ -522,30 +950,48 @@ class ScreenGeometry:
     def to_screen(self, cam_x: float, cam_y: float) -> tuple[float, float]:
         """Map webcam pixel coords → virtual desktop coords.
 
-        Three stages:
+        Stages:
 
-          1. Clamp the hand into the active box, so positions outside it
-             pin to a desktop edge rather than overshooting.
-          2. Map linearly onto the desktop, offset by the desktop origin —
-             this is what makes monitors left of / above the primary
-             (negative coords on Windows) reachable.
+          1. Reflect horizontally when INVERT_CURSOR_X is set, so physical
+             left/right matches on-screen left/right.
+          2. Interpolate the inset window — [MARGIN, 1 − MARGIN] of the
+             frame, held here as box_left..box_right — onto the virtual
+             desktop span [left, left + width].  np.interp clamps outside
+             its input range by design, so a hand past the box holds the
+             cursor flat against the screen edge instead of running off it.
           3. Scale about the desktop centre by CURSOR_SENSITIVITY, then
-             clamp to the desktop rectangle.
+             clamp again, since the multiplier can push a mid-box position
+             beyond an edge.
 
         CURSOR_SENSITIVITY is read fresh on every call, so runtime '+' / '-'
-        adjustments apply from the next frame onward.
+        adjustments apply from the next frame onward.  It composes with the
+        margins: effective gain is SENSITIVITY / (1 − 2·MARGIN).
 
-        The final clamp uses the real desktop bounds rather than [0, W] /
-        [0, H]: on a multi-monitor Windows desktop the origin can be
-        negative, and clamping to zero would make every display left of the
-        primary unreachable.
+        The destination is [left, left + width], not [0, width]: on a
+        multi-monitor Windows desktop the origin can be negative, and
+        interpolating onto a zero-based span would make every display left
+        of the primary unreachable.  Written this way the rightmost pixel of
+        the furthest secondary monitor is the endpoint of the range.
         """
-        cx = clamp(cam_x, self.box_left, self.box_right)
-        cy = clamp(cam_y, self.box_top,  self.box_bottom)
+        cx, cy = cam_x, cam_y
 
-        # Absolute mapping (this is the CURSOR_SENSITIVITY = 1.0 result).
-        mapped_x = self.left + ((cx - self.box_left) / self.box_w) * self.width
-        mapped_y = self.top  + ((cy - self.box_top)  / self.box_h) * self.height
+        # Horizontal direction correction, applied about the FRAME centre.
+        # The margin box is symmetric about that centre, so this maps
+        # box_left onto box_right exactly.  Reflecting here rather than on
+        # the raw landmark keeps the fingertip marker on the fingertip: the
+        # overlay is drawn from the unreflected coordinate.
+        if INVERT_CURSOR_X:
+            cx = self.cam_w - cx
+
+        # ── Inset-window interpolation ──────────────────────────────────
+        # np.interp(v, xp, fp) is exactly the piecewise-linear map wanted
+        # here, and it saturates at fp[0] / fp[-1] for inputs outside xp —
+        # the clamp is the function's own behaviour rather than a separate
+        # step that could drift out of step with the mapping.
+        mapped_x = np.interp(cx, (self.box_left, self.box_right),
+                             (self.left, self.left + self.width))
+        mapped_y = np.interp(cy, (self.box_top, self.box_bottom),
+                             (self.top, self.top + self.height))
 
         # Centre-scaled sensitivity: push the offset from the middle out by
         # the multiplier, so the desktop edge is reached from a smaller
@@ -572,18 +1018,24 @@ class ScreenGeometry:
     def effective_box(self) -> tuple[int, int, int, int] | None:
         """Sub-rectangle of the active box that still reaches a desktop edge.
 
-        With CURSOR_SENSITIVITY > 1 the mapping saturates before the box
-        perimeter, so the outer band is dead.  Returns (l, t, r, b) for the
-        live region, or None when sensitivity does not magnify and the whole
-        box is live.  Recomputed per frame, so it resizes as '+' / '-' are
-        pressed.
+        The margins now define the box itself — the magenta rectangle IS
+        the inset window, and its edges are where the screen edges are
+        reached.  So the only thing left to shrink the live area is
+        CURSOR_SENSITIVITY, which narrows it to 1/S about the centre.
+
+        Everything between this rectangle and the box maps past a desktop
+        edge and clamps flat, so hand movement there does nothing.  Returns
+        (l, t, r, b), or None at 1.0× where the whole box is live and the
+        two rectangles would sit on top of each other.
         """
         if CURSOR_SENSITIVITY <= 1.0:
             return None
+
+        live = 1.0 / CURSOR_SENSITIVITY
         mid_x = (self.box_left + self.box_right) / 2.0
         mid_y = (self.box_top  + self.box_bottom) / 2.0
-        half_w = (self.box_w / 2.0) / CURSOR_SENSITIVITY
-        half_h = (self.box_h / 2.0) / CURSOR_SENSITIVITY
+        half_w = (self.box_w * live) / 2.0
+        half_h = (self.box_h * live) / 2.0
         return (int(mid_x - half_w), int(mid_y - half_h),
                 int(mid_x + half_w), int(mid_y + half_h))
 
@@ -630,8 +1082,9 @@ class WebcamStream:
     """Non-blocking webcam reader that always yields the newest frame."""
 
     def __init__(self, index: int = 0, width: int = 640, height: int = 480,
-                 fps: int = 60, api: int = 0):
-        self._cap = cv2.VideoCapture(index, api)
+                 fps: int = 60, api=None,
+                 proc_max: tuple[int, int] = (PROC_MAX_WIDTH, PROC_MAX_HEIGHT)):
+        self._cap = open_capture(index, api)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._cap.set(cv2.CAP_PROP_FPS,          fps)
@@ -641,14 +1094,54 @@ class WebcamStream:
         self.buffersize_accepted = bool(self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1))
 
         # Read one frame synchronously so _latest is never None.
-        grabbed, frame = self._cap.read()
-        if not grabbed:
+        #
+        # Retried rather than one-shot: an auto-negotiated backend (MSMF on
+        # Windows) can take appreciably longer than DirectShow did to hand
+        # over its first frame, and a phone-backed driver longer still.  A
+        # single failed read here would reject a camera the scan had just
+        # confirmed working.  The failsafe itself is unchanged — a device
+        # that never produces pixels is still refused, with the reason.
+        grabbed, frame = False, None
+        for _ in range(CAM_SCAN_READ_TRIES):
+            grabbed, frame = self._cap.read()
+            if grabbed and frame is not None:
+                break
+            time.sleep(CAM_SCAN_READ_WAIT)
+
+        if not grabbed or frame is None:
             self._cap.release()
             raise RuntimeError(
-                f"camera {index} opened but returned no frame — is it in use "
-                "by another application?"
+                f"camera {index} opened but produced no frame in "
+                f"{CAM_SCAN_READ_TRIES} attempts — it may be in use by "
+                f"another application, or the driver may need a different "
+                f"backend (set CAMERA_API)."
             )
-        self._latest = (grabbed, frame, 0)
+        # ── Native frame size ───────────────────────────────────────────
+        # This has to be measured here, not carried over from the scan: the
+        # cap.set() calls above may have moved the camera to a different mode
+        # than the one the scanner saw.
+        #
+        # frame.shape is the ground truth.  CAP_PROP_FRAME_* is queried too,
+        # because a mismatch is worth surfacing: it usually means the driver
+        # silently refused the requested mode.
+        self.native_height, self.native_width = frame.shape[:2]
+        self.reported_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        self.reported_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        self.size_mismatch = ((self.reported_width, self.reported_height)
+                              != (self.native_width, self.native_height))
+
+        # ── Processing frame size ───────────────────────────────────────
+        # width/height describe what read() actually hands back, which is
+        # what every consumer must build geometry from.  When the camera
+        # overshoots the budget they are the downscaled size, not the
+        # native one.
+        self.width, self.height = self._fit_within(
+            self.native_width, self.native_height, proc_max)
+        self.downscaled = ((self.width, self.height)
+                           != (self.native_width, self.native_height))
+        self.scale = self.width / self.native_width if self.downscaled else 1.0
+
+        self._latest = (grabbed, self._shrink(frame), 0)
 
         # The stop flag signals the background thread to exit.
         self._stopped = False
@@ -658,8 +1151,50 @@ class WebcamStream:
         self._thread = threading.Thread(target=self._update, daemon=True)
         self._thread.start()
 
+    @staticmethod
+    def _fit_within(w: int, h: int, budget: tuple[int, int]) -> tuple[int, int]:
+        """Largest size inside *budget* that keeps the source aspect ratio.
+
+        Returns (w, h) unchanged when the frame already fits, or when the
+        budget is disabled with a zero.  A single scale factor is applied to
+        both axes, which is what stops a 16:9 feed being squashed into 4:3.
+        """
+        max_w, max_h = budget
+        if max_w <= 0 or max_h <= 0:
+            return w, h
+        if w <= max_w and h <= max_h:
+            return w, h
+        scale = min(max_w / w, max_h / h)
+        return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+    def _shrink(self, frame):
+        """Downscale *frame* to the processing size, or pass it through.
+
+        INTER_AREA is the right kernel for shrinking: it averages every
+        source pixel that falls inside a destination pixel, so detail is
+        attenuated instead of aliasing into moiré the way INTER_LINEAR
+        would.  It is also the fastest of the quality options for downscale.
+
+        The result is a NEW array on purpose.  The publication below is
+        lock-free precisely because each frame handed to the main thread is
+        a distinct object; resizing into one reused destination would let
+        the capture thread overwrite pixels the main thread is still
+        reading, halfway through an inference.
+        """
+        if not self.downscaled:
+            return frame
+        return cv2.resize(frame, (self.width, self.height),
+                          interpolation=cv2.INTER_AREA)
+
     def _update(self):
-        """Grab frames continuously, discarding any the reader missed."""
+        """Grab frames continuously, discarding any the reader missed.
+
+        The resize happens here rather than in the main loop so the large
+        frame never leaves this thread: MediaPipe, the flip/convert buffers,
+        the overlay and the preview window all see only the reduced size.
+        This thread is otherwise blocked in the driver waiting on hardware,
+        so the scaling is close to free in wall-clock terms.
+        """
         seq = 0
         while not self._stopped:
             grabbed, frame = self._cap.read()
@@ -667,7 +1202,7 @@ class WebcamStream:
                 continue
             seq += 1
             # Single atomic rebind — no torn reads, no lock needed.
-            self._latest = (grabbed, frame, seq)
+            self._latest = (grabbed, self._shrink(frame), seq)
 
     def read(self):
         """Return (grabbed, frame, seq) for the newest frame, instantly.
@@ -816,6 +1351,51 @@ if OPENCV_THREADS:
 
 backend = make_backend()
 
+# ─── Camera selection and open ──────────────────────────────────────────────
+# Both happen before MediaPipe loads: the model takes a moment to initialise
+# and would delay the prompt, and its loader writes to stderr, which would
+# scroll the question the user is meant to answer.
+#
+# Opening is retried rather than fatal.  Since an index the scan never
+# confirmed can be typed on purpose, "that one does not work" is an ordinary
+# outcome here, and the right response is another prompt — not a stack trace
+# and a re-run of the whole scan.
+if CAM_INDEX is None:
+    print(f"[camera] scanning indices 0–{CAM_SCAN_MAX}, backend "
+          f"{describe_api(backend.camera_api)} "
+          f"({CAM_SCAN_READ_TRIES} read attempts each)…\n")
+    _available = scan_cameras(CAM_SCAN_MAX, backend.camera_api)
+
+    while True:
+        camera_index = choose_camera(_available)
+        try:
+            stream = WebcamStream(camera_index, CAM_WIDTH, CAM_HEIGHT,
+                                  CAM_FPS, api=backend.camera_api)
+            break
+        except RuntimeError as exc:
+            print(f"[camera] index {camera_index} could not be opened: {exc}")
+            print("         pick a different one.")
+else:
+    camera_index = CAM_INDEX
+    print(f"[camera] CAM_INDEX pinned to {camera_index}, skipping scan\n")
+    stream = WebcamStream(camera_index, CAM_WIDTH, CAM_HEIGHT, CAM_FPS,
+                          api=backend.camera_api)
+
+# Rebind the camera constants to the size frames will REALLY have after any
+# downscale.  Nothing left in the file reads them for geometry — the box and
+# the landmark scaling both go through ScreenGeometry — but leaving them at
+# the requested 640×480 would be a loaded gun for the next person who does.
+CAM_WIDTH, CAM_HEIGHT = stream.width, stream.height
+
+if stream.downscaled:
+    print(f"[camera] native {stream.native_width}×{stream.native_height} "
+          f"→ processing at {stream.width}×{stream.height} "
+          f"({stream.scale:.2f}× scale, full field of view kept)")
+    print(f"         {(1 - (stream.width * stream.height) / (stream.native_width * stream.native_height)) * 100:.0f}% "
+          f"fewer pixels per frame for MediaPipe to chew through\n")
+else:
+    print(f"[camera] {stream.width}×{stream.height} native, no rescale needed\n")
+
 # ─── MediaPipe setup ────────────────────────────────────────────────────────
 
 mp_hands = mp.solutions.hands
@@ -838,14 +1418,9 @@ except TypeError:
     hands = mp_hands.Hands(**_hand_kwargs)
     _complexity_note = "model_complexity unsupported by this build"
 
-# ─── Webcam setup ───────────────────────────────────────────────────────────
-
-stream = WebcamStream(CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, CAM_FPS,
-                      api=backend.camera_api)
-
 # ─── State variables ────────────────────────────────────────────────────────
 
-screen = ScreenGeometry(backend, POLL_INTERVAL)
+screen = ScreenGeometry(backend, stream.width, stream.height, POLL_INTERVAL)
 
 # Create separate One Euro Filters for X and Y axes.
 _oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
@@ -856,6 +1431,10 @@ _oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_C
 # filters must be reset.  A display change also lowers this flag, reusing the
 # same snap-to-target path (see the main loop).
 hand_present = False
+
+# Mirror state as of the previous frame, so a mid-run 'm' can be spotted and
+# the filters reset before the cursor tries to glide to the mirrored position.
+was_mirrored = IS_MIRRORED
 
 # Sequence number of the last frame actually processed, so duplicates can be
 # skipped instead of re-running inference on data we already consumed.
@@ -881,15 +1460,47 @@ prev_time = time.perf_counter()
 
 print(f"Platform    : {backend.name}")
 print(f"Virtual desk: {screen.describe()}")
-print(f"Webcam      : {CAM_WIDTH} × {CAM_HEIGHT} @ {CAM_FPS} FPS")
-print(f"Active box  : x[{screen.box_left}–{screen.box_right}]  "
+print(f"Webcam      : index {camera_index}, native {stream.native_width}×"
+      f"{stream.native_height} @ {CAM_FPS} FPS requested")
+print(f"Processing  : {stream.width} × {stream.height} "
+      f"({stream.width / stream.height:.2f}:1)"
+      + ("  [downscaled, aspect preserved]" if stream.downscaled
+         else "  [native, no rescale]"))
+if stream.size_mismatch:
+    print(f"              driver reports {stream.reported_width}×"
+          f"{stream.reported_height}; using the delivered frame size")
+print(f"Active box  : {screen.box_w} × {screen.box_h} px  "
+      f"x[{screen.box_left}–{screen.box_right}]  "
       f"y[{screen.box_top}–{screen.box_bottom}]")
 print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
       f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
+_mx = min(max(MARGIN_X, 0.0), 0.49)
+_my = min(max(MARGIN_Y, 0.0), 0.49)
+print(f"Edge margins: x {_mx:.0%} / y {_my:.0%} inset  →  the box IS the "
+      f"middle {1 - 2 * _mx:.0%}×{1 - 2 * _my:.0%} of the frame")
+_gx = screen.width / max(1, screen.box_w)
+_gy = screen.height / max(1, screen.box_h)
+print(f"Gain        : {_gx:.1f} screen px per camera px horizontally, "
+      f"{_gy:.1f} vertically  (ratio {_gx / _gy:.2f})")
+if abs(_gx / _gy - 1.0) > 0.15:
+    print(f"              anisotropic — a diagonal sweep will not trace a "
+          f"straight diagonal.")
+    _want_my = 0.5 * (1 - (1 - 2 * _mx) * (screen.height / screen.width)
+                      * (stream.width / stream.height))
+    if 0.0 <= _want_my < 0.49:
+        print(f"              MARGIN_Y ≈ {_want_my:.2f} would equalise it "
+              f"(at the cost of vertical room)")
+print(f"Mirroring   : {'ON' if IS_MIRRORED else 'OFF'} — press 'm' to flip "
+      f"the picture AND the control direction together")
+print(f"Invert X    : {'ON' if INVERT_CURSOR_X else 'OFF'} — press 'i' for "
+      f"control-only inversion (picture unchanged)")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
 print(f"MediaPipe   : {_complexity_note}")
-print(f"OpenCV      : {cv2.getNumThreads()} thread(s), buffersize=1 "
-      f"{'accepted' if stream.buffersize_accepted else 'REFUSED by backend'}")
+print(f"Backend     : {describe_api(backend.camera_api)}"
+      f"  (set CAMERA_API to pin one)")
+_buf_note = ("accepted" if stream.buffersize_accepted else
+             "refused — harmless, the capture thread already drops stale frames")
+print(f"OpenCV      : {cv2.getNumThreads()} thread(s), buffersize=1 {_buf_note}")
 print(f"Frame bufs  : preallocated (no per-frame flip/convert allocation)")
 print(f"Display poll: every {POLL_INTERVAL}s (hot-plug aware)")
 print("Controls    : '+'/'=' faster   '-'/'_' slower   'q' quit")
@@ -933,9 +1544,32 @@ try:
             bgr_buf = np.empty_like(raw_frame)
             rgb_buf = np.empty_like(raw_frame)
             frame_h, frame_w = raw_frame.shape[:2]
+            # The frame size is the canvas the box is drawn on, so a change
+            # here invalidates the box.  Rebuilding from the same numbers the
+            # buffers were sized with is what keeps the two in step.
+            if screen.set_camera_size(frame_w, frame_h):
+                print(f"[camera] frame size now {frame_w}×{frame_h} → "
+                      f"box rebuilt to {screen.box_w}×{screen.box_h} "
+                      f"at x[{screen.box_left}–{screen.box_right}] "
+                      f"y[{screen.box_top}–{screen.box_bottom}]")
+                hand_present = False    # snap rather than glide into the new box
 
-        # Mirror the frame so it feels natural (like looking in a mirror).
-        cv2.flip(raw_frame, 1, dst=bgr_buf)
+        # ── Mirror, or don't ────────────────────────────────────────────
+        # This one buffer is both what gets displayed and what MediaPipe
+        # reads, so the choice here sets the control direction as well as
+        # the picture.  np.copyto keeps the un-mirrored path allocation-free
+        # too, rather than dropping the preallocated buffer on the floor.
+        if IS_MIRRORED:
+            cv2.flip(raw_frame, 1, dst=bgr_buf)
+        else:
+            np.copyto(bgr_buf, raw_frame)
+
+        # A toggle mirrors the hand's mapped position instantly.  Route the
+        # next frame through the re-entry reset so the cursor snaps to the
+        # new spot rather than sweeping across the desktop to reach it.
+        if IS_MIRRORED != was_mirrored:
+            was_mirrored = IS_MIRRORED
+            hand_present = False
 
         # Convert BGR → RGB for MediaPipe, into our own buffer.
         cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
@@ -955,9 +1589,12 @@ try:
             # Landmark 8 = Index Finger Tip.
             tip = hand.landmark[8]
 
-            # MediaPipe returns normalised coords [0, 1]; convert to pixels.
-            raw_x = tip.x * CAM_WIDTH
-            raw_y = tip.y * CAM_HEIGHT
+            # MediaPipe returns normalised coords [0, 1]; convert to pixels
+            # of the REAL frame.  Scaling by a hardcoded 640×480 here would
+            # place the fingertip at a fraction of its true position on any
+            # other sensor, and the overlay would drift away from the hand.
+            raw_x = tip.x * screen.cam_w
+            raw_y = tip.y * screen.cam_h
 
             # Clamp into the active box, map onto the virtual desktop, and
             # apply centre-scaled sensitivity — all inside to_screen().
@@ -1039,15 +1676,27 @@ try:
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2,
         )
 
+        # Mirror / inversion state — the two things 'm' and 'i' change.
+        # Green when mirrored (the usual webcam case), red when raw, so a
+        # glance is enough to tell which mode is live.
+        cv2.putText(
+            bgr_buf,
+            f"Mirror: {'ON' if IS_MIRRORED else 'OFF'}"
+            f"{'  invX' if INVERT_CURSOR_X else ''}",
+            (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+            (0, 220, 0) if IS_MIRRORED else (0, 80, 255), 2,
+        )
+
         # Desktop summary underneath.
         cv2.putText(
             bgr_buf, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
-            (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+            (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
 
         # Key hints along the bottom edge of the real frame.
         cv2.putText(
-            bgr_buf, "+/- speed   q quit", (10, frame_h - 12),
+            bgr_buf, "+/- speed   m mirror   i invert-x   q quit",
+            (10, frame_h - 12),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
         )
 
