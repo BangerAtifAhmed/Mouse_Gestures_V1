@@ -1,11 +1,11 @@
 """
-Hand-Tracking Cursor Controller (v7 — Threaded Camera)
-======================================================
+Hand-Tracking Cursor Controller (v8 — One Euro Filter + Sub-Frame Glide)
+========================================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
-Uses a dedicated background thread for frame capture so cap.read() never blocks
-the main processing loop.  Active bounding box is auto-sized to the screen's
-aspect ratio.  Direct Win32 API calls for zero-latency cursor positioning.
-Movement only — no click gestures.
+Uses a One Euro Filter (Casiez et al. 2012) for speed-adaptive smoothing that
+kills jitter at rest while staying responsive during fast swipes — even at the
+camera's hardware-limited 30 Hz.  Sub-frame interpolation ensures large jumps
+look like smooth glides, not teleports.  Movement only — no click gestures.
 
 Dependencies:  pip install opencv-python mediapipe==0.8.11
 Platform:      Windows only (uses user32.dll)
@@ -33,84 +33,103 @@ CAM_WIDTH = 640
 CAM_HEIGHT = 480
 CAM_FPS = 60
 
-# ── Dynamic aspect-ratio bounding box (shifted upward) ─────────────────────
-# We compute the largest rectangle that:
-#   1. Fits inside the webcam frame (CAM_WIDTH × CAM_HEIGHT)
-#   2. Has the exact same aspect ratio as the user's monitor
-#   3. Is centred *horizontally* but pushed **upward** vertically
+# ── Dynamic aspect-ratio bounding box (compact, shifted upward) ────────────
+# The box is sized from the *horizontal* constraint first, then the height
+# is derived to lock to the monitor's aspect ratio.  This makes the box
+# smaller than the "largest possible" approach, which increases cursor
+# sensitivity — less physical hand displacement is needed to traverse the
+# full screen width/height.
 #
-# The bottom of the webcam frame is a dead zone — the user's hand gets
-# physically cut off there before the cursor can reach the screen bottom.
-# BOTTOM_DEADZONE reserves that many pixels at the bottom of the frame.
+# Horizontal:
+#   SIDE_DEADZONE reserves pixels on each side of the webcam frame.
+#   active_width  = CAM_WIDTH − 2 × SIDE_DEADZONE
 #
-# Vertical layout:
+# Vertical (aspect-ratio locked):
+#   active_height = active_width / screen_aspect_ratio
+#
+# Placement:
+#   BOTTOM_DEADZONE pushes the box upward so the user's hand isn't cut off.
 #   ACTIVE_BOTTOM = CAM_HEIGHT − BOTTOM_DEADZONE
-#   ACTIVE_TOP    = ACTIVE_BOTTOM − box_h   (clamped to ≥ MIN_TOP_PAD)
-#
-# If ACTIVE_TOP would fall below MIN_TOP_PAD, the box height is shrunk to
-# fit and the width is recalculated to preserve the aspect ratio.
+#   ACTIVE_TOP    = ACTIVE_BOTTOM − active_height  (clamped ≥ MIN_TOP_PAD)
 
-PADDING        = 10   # px — horizontal breathing room on each side
+SIDE_DEADZONE   = 60   # px — reserved on each side (controls sensitivity)
 BOTTOM_DEADZONE = 150  # px — reserved dead zone at the bottom of the frame
-MIN_TOP_PAD    = 10   # px — minimum clearance at the top of the frame
+MIN_TOP_PAD     = 10   # px — minimum clearance at the top of the frame
 
 _screen_ratio = SCREEN_W / SCREEN_H
-_cam_ratio    = CAM_WIDTH / CAM_HEIGHT
 
-# Step 1: compute the ideal box size (same as before).
-if _screen_ratio > _cam_ratio:
-    _box_w = CAM_WIDTH - 2 * PADDING
-    _box_h = _box_w / _screen_ratio
-else:
-    _box_h = CAM_HEIGHT - 2 * PADDING
-    _box_w = _box_h * _screen_ratio
+# Step 1: width is driven by the side dead zones.
+_box_w = CAM_WIDTH - 2 * SIDE_DEADZONE
 
+# Step 2: height preserves the screen's aspect ratio.
+_box_h = int(_box_w / _screen_ratio)
 _box_w = int(_box_w)
-_box_h = int(_box_h)
 
-# Step 2: anchor the bottom edge above the dead zone.
+# Step 3: anchor the bottom edge above the dead zone.
 ACTIVE_BOTTOM = CAM_HEIGHT - BOTTOM_DEADZONE
 ACTIVE_TOP    = ACTIVE_BOTTOM - _box_h
 
-# Step 3: if the box is too tall, shrink it to fit while keeping the ratio.
+# Step 4: if the box is too tall, shrink to fit while keeping the ratio.
 if ACTIVE_TOP < MIN_TOP_PAD:
     ACTIVE_TOP = MIN_TOP_PAD
     _box_h = ACTIVE_BOTTOM - ACTIVE_TOP
     _box_w = int(_box_h * _screen_ratio)
 
-# Horizontally centred (unchanged).
+# Horizontally centred.
 ACTIVE_LEFT  = (CAM_WIDTH - _box_w) // 2
 ACTIVE_RIGHT = ACTIVE_LEFT + _box_w
 ACTIVE_W = _box_w
 ACTIVE_H = _box_h
 
-# ── Adaptive EMA parameters ────────────────────────────────────────────────
-# Instead of a fixed α, we compute α per frame based on how far the new
-# target is from the previous smoothed position (Euclidean distance in
-# screen-space pixels).
+# ── One Euro Filter parameters ─────────────────────────────────────────────
+# The One Euro Filter (Casiez, Roussel & Vogel, CHI 2012) is an adaptive
+# low-pass filter designed for real-time noisy signal smoothing.  It is
+# the industry standard for pointer/hand tracking at low frame rates.
 #
-#   distance = √( (target_x − prev_x)² + (target_y − prev_y)² )
+# Core idea:
+#   - At rest (low speed):  use heavy smoothing to kill jitter.
+#   - During movement (high speed):  reduce smoothing to avoid lag.
 #
-# We then linearly interpolate α between two extremes:
+# It achieves this with TWO cascaded exponential smoothing stages:
 #
-#   • ALPHA_MIN  (e.g. 0.05)  — used when distance ≤ DIST_SLOW
-#       → aggressive jitter suppression when the hand is nearly still
+#   1. A first low-pass filter smooths the raw derivative (speed).
+#   2. The smoothed speed is used to compute a dynamic cutoff frequency
+#      for a second low-pass filter that smooths the position.
 #
-#   • ALPHA_MAX  (e.g. 0.55)  — used when distance ≥ DIST_FAST
-#       → minimal lag when the user swipes quickly
+# Key formulas:
 #
-# For distances between DIST_SLOW and DIST_FAST, α is linearly ramped:
+#   α(fc)  = 1 / (1 + 1/(2π · fc · dt))     ← smoothing factor from cutoff
+#   fc     = MIN_CUTOFF + BETA · |dx_smooth|  ← dynamic cutoff for position
 #
-#   t     = clamp( (distance − DIST_SLOW) / (DIST_FAST − DIST_SLOW) , 0, 1 )
-#   alpha = ALPHA_MIN + t × (ALPHA_MAX − ALPHA_MIN)
+# Parameters:
+#   MIN_CUTOFF  — cutoff freq when hand is still (Hz).  Lower = smoother.
+#   BETA        — how much speed increases the cutoff.  Higher = snappier.
+#   D_CUTOFF    — cutoff for the derivative filter (Hz).  Usually ~1.0.
 #
-# This gives a smooth, speed-dependent transition: steady hands feel locked
-# in place while fast movements track with near-zero latency.
+# Tuning guide:
+#   - Jittery at rest?  Lower MIN_CUTOFF.
+#   - Too laggy on fast moves?  Raise BETA.
+#   - Derivative noisy?  Lower D_CUTOFF.
 
-ALPHA_MIN  = 0.02    # α when nearly still  (heavier smoothing at 60 FPS)
-ALPHA_MAX  = 0.55    # α during fast swipes  (light smoothing)
-DIST_SLOW  = 8.0     # px — below this, hand is "still" (wider dead zone)
-DIST_FAST  = 120.0   # px — above this, hand is "fast"
+MIN_CUTOFF = 0.8    # Hz — position cutoff at rest  (lower = smoother)
+BETA       = 0.01   # speed coefficient  (higher = snappier on fast moves)
+D_CUTOFF   = 1.0    # Hz — cutoff for the speed (derivative) filter
+
+# ── Sub-frame interpolation ────────────────────────────────────────────────
+# At 30 Hz, a fast hand swipe can jump 200+ screen pixels between frames.
+# Even with perfect filtering, a single SetCursorPos() call per frame would
+# look like a teleport.  We split large jumps into INTERP_STEPS smaller
+# moves spread across a short time window, creating a visible glide.
+#
+#   If distance > INTERP_THRESHOLD:
+#       for step in 1..INTERP_STEPS:
+#           lerp_t = step / INTERP_STEPS
+#           pos    = prev + lerp_t * (target - prev)
+#           SetCursorPos(pos)
+#           sleep(frame_budget / INTERP_STEPS)
+
+INTERP_STEPS     = 5      # number of sub-steps for large jumps
+INTERP_THRESHOLD = 80.0   # px — jump distance that triggers interpolation
 
 # ─── Win32 cursor function reference ───────────────────────────────────────
 # Cache the function reference to avoid repeated attribute lookups in the loop.
@@ -192,9 +211,104 @@ class WebcamStream:
 
 stream = WebcamStream(CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, CAM_FPS)
 
+# ─── One Euro Filter implementation ────────────────────────────────────────
+
+class LowPassFilter:
+    """Simple first-order exponential low-pass filter.
+
+    Given a smoothing factor α ∈ (0, 1]:
+        output = α · input  +  (1 − α) · previous_output
+
+    α = 1 means no filtering;  α → 0 means maximum smoothing.
+    """
+    def __init__(self, alpha: float, initial: float = 0.0):
+        self._y = initial
+        self._alpha = alpha
+        self._initialised = False
+
+    def __call__(self, value: float, alpha: float | None = None) -> float:
+        if alpha is not None:
+            self._alpha = alpha
+        if not self._initialised:
+            self._y = value
+            self._initialised = True
+        else:
+            self._y = self._alpha * value + (1.0 - self._alpha) * self._y
+        return self._y
+
+
+class OneEuroFilter:
+    """One Euro Filter for a single scalar signal.
+
+    Reference:  Casiez, Roussel & Vogel, "1€ Filter: A Simple Speed-Based
+                Low-Pass Filter for Noisy Input in Interactive Systems",
+                CHI 2012.  https://cristal.univ-lille.fr/~casiez/1euro/
+
+    Parameters
+    ----------
+    freq : float      Initial sampling frequency estimate (Hz).
+    min_cutoff : float  Minimum cutoff frequency for the position filter.
+    beta : float      Speed coefficient — scales how much velocity opens
+                      the cutoff.
+    d_cutoff : float  Cutoff frequency for the derivative (speed) filter.
+    """
+    def __init__(self, freq: float, min_cutoff: float = 1.0,
+                 beta: float = 0.0, d_cutoff: float = 1.0):
+        self._freq = freq
+        self._min_cutoff = min_cutoff
+        self._beta = beta
+        self._d_cutoff = d_cutoff
+        self._x_filt = LowPassFilter(self._alpha(min_cutoff))
+        self._dx_filt = LowPassFilter(self._alpha(d_cutoff), initial=0.0)
+        self._last_time = None
+
+    @staticmethod
+    def _alpha(cutoff: float, dt: float = None, freq: float = None) -> float:
+        """Compute the smoothing factor α from a cutoff frequency.
+
+            τ  = 1 / (2π · fc)
+            α  = 1 / (1 + τ/dt)  =  1 / (1 + 1/(2π · fc · dt))
+
+        Higher cutoff → higher α → less smoothing.
+        """
+        if dt is None and freq is not None:
+            dt = 1.0 / freq
+        elif dt is None:
+            dt = 1.0 / 30.0  # fallback
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x: float, timestamp: float | None = None) -> float:
+        """Filter one sample and return the smoothed value."""
+        # Estimate dt from timestamps if available.
+        if timestamp is not None and self._last_time is not None:
+            dt = timestamp - self._last_time
+            if dt > 0:
+                self._freq = 1.0 / dt
+        self._last_time = timestamp
+        dt = 1.0 / self._freq
+
+        # 1) Estimate the derivative (speed) and smooth it.
+        if self._x_filt._initialised:
+            dx = (x - self._x_filt._y) / dt
+        else:
+            dx = 0.0
+        edx = self._dx_filt(dx, alpha=self._alpha(self._d_cutoff, dt=dt))
+
+        # 2) Dynamic cutoff:  fc = min_cutoff + β · |smoothed_speed|
+        cutoff = self._min_cutoff + self._beta * abs(edx)
+
+        # 3) Filter the position with the dynamic cutoff.
+        return self._x_filt(x, alpha=self._alpha(cutoff, dt=dt))
+
+
 # ─── State variables ────────────────────────────────────────────────────────
 
-# Previous smoothed screen coordinates (initialised to screen centre).
+# Create separate One Euro Filters for X and Y axes.
+_oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
+_oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
+
+# Previous cursor position for sub-frame interpolation.
 prev_x = SCREEN_W / 2.0
 prev_y = SCREEN_H / 2.0
 
@@ -206,29 +320,14 @@ def clamp(value: float, lo: float, hi: float) -> float:
     """Restrict *value* to the closed interval [lo, hi]."""
     return max(lo, min(hi, value))
 
-
-def adaptive_alpha(distance: float) -> float:
-    """Return a dynamic EMA α based on the displacement *distance* (px).
-
-    Linear ramp between ALPHA_MIN and ALPHA_MAX over [DIST_SLOW, DIST_FAST].
-
-        t     = clamp((distance − DIST_SLOW) / (DIST_FAST − DIST_SLOW), 0, 1)
-        alpha = ALPHA_MIN  +  t · (ALPHA_MAX − ALPHA_MIN)
-
-    Small distance  →  low α   →  heavy smoothing  (kills jitter)
-    Large distance  →  high α  →  light smoothing   (kills lag)
-    """
-    t = clamp((distance - DIST_SLOW) / (DIST_FAST - DIST_SLOW), 0.0, 1.0)
-    return ALPHA_MIN + t * (ALPHA_MAX - ALPHA_MIN)
-
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
 print(f"Screen      : {SCREEN_W} × {SCREEN_H}  (ratio {_screen_ratio:.3f})")
 print(f"Webcam      : {CAM_WIDTH} × {CAM_HEIGHT} @ {CAM_FPS} FPS")
 print(f"Active box  : {ACTIVE_W} × {ACTIVE_H} px  "
       f"x[{ACTIVE_LEFT}–{ACTIVE_RIGHT}]  y[{ACTIVE_TOP}–{ACTIVE_BOTTOM}]")
-print(f"Adaptive EMA: α ∈ [{ALPHA_MIN}, {ALPHA_MAX}]  "
-      f"speed range [{DIST_SLOW}, {DIST_FAST}] px")
+print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
+print(f"Interpolation: {INTERP_STEPS} steps when jump > {INTERP_THRESHOLD} px")
 print(f"Camera      : threaded (background capture)")
 print("Press 'q' in the preview window to quit.\n")
 
@@ -266,24 +365,36 @@ try:
             target_x = ((clamped_x - ACTIVE_LEFT) / ACTIVE_W) * SCREEN_W
             target_y = ((clamped_y - ACTIVE_TOP)  / ACTIVE_H) * SCREEN_H
 
-            # ── Adaptive EMA smoothing ──────────────────────────────────
-            # 1) Compute Euclidean distance from the last smoothed position
-            #    to the new target.  This measures "how fast" the hand moved.
-            distance = math.hypot(target_x - prev_x, target_y - prev_y)
+            # ── One Euro Filter smoothing ────────────────────────────────
+            # Feed each axis through its own 1€ filter instance.
+            # The filter internally tracks time and speed to compute a
+            # dynamic cutoff: still → heavy smoothing, fast → light.
+            now_ts = time.time()
+            smooth_x = _oef_x(target_x, timestamp=now_ts)
+            smooth_y = _oef_y(target_y, timestamp=now_ts)
 
-            # 2) Derive α dynamically from the distance.
-            alpha = adaptive_alpha(distance)
+            # ── Sub-frame interpolation (anti-teleport) ─────────────────
+            # At 30 Hz, even filtered positions can jump 100+ px between
+            # frames.  We split the jump into INTERP_STEPS smaller moves
+            # spread over the frame budget so the cursor *glides* visibly.
+            jump = math.hypot(smooth_x - prev_x, smooth_y - prev_y)
 
-            # 3) Apply EMA:  S_t = α · X_t  +  (1 − α) · S_{t−1}
-            smooth_x = alpha * target_x + (1 - alpha) * prev_x
-            smooth_y = alpha * target_y + (1 - alpha) * prev_y
+            if jump > INTERP_THRESHOLD and INTERP_STEPS > 1:
+                # Spread the glide over ~1 frame period (≈33 ms at 30 Hz).
+                step_delay = (1.0 / 30.0) / INTERP_STEPS
+                for s in range(1, INTERP_STEPS + 1):
+                    t = s / INTERP_STEPS
+                    ix = prev_x + t * (smooth_x - prev_x)
+                    iy = prev_y + t * (smooth_y - prev_y)
+                    _set_cursor_pos(int(ix), int(iy))
+                    if s < INTERP_STEPS:
+                        time.sleep(step_delay)
+            else:
+                _set_cursor_pos(int(smooth_x), int(smooth_y))
 
-            # Store for next frame.
+            # Store for next frame's interpolation baseline.
             prev_x = smooth_x
             prev_y = smooth_y
-
-            # ── Move cursor via Win32 SetCursorPos (lowest possible latency)
-            _set_cursor_pos(int(smooth_x), int(smooth_y))
 
             # ── Visualisation overlays ──────────────────────────────────
             # Draw hand skeleton.
@@ -293,9 +404,9 @@ try:
             cx, cy = int(raw_x), int(raw_y)
             cv2.circle(frame, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
 
-            # Show the current adaptive α value near the fingertip.
+            # Show the filter's effective cutoff and jump distance.
             cv2.putText(
-                frame, f"a={alpha:.2f}", (cx + 15, cy - 10),
+                frame, f"j={jump:.0f}", (cx + 15, cy - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1,
             )
 
