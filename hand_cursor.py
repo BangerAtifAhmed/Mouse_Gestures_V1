@@ -1,6 +1,6 @@
 """
-Hand-Tracking Cursor Controller (v23 — Auto-Negotiated Backend)
-===============================================================
+Hand-Tracking Cursor Controller (v24 — Portable Screen Probe)
+=============================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
@@ -8,6 +8,22 @@ light smoothing during fast swipes.  Movement only — no click gestures.
 
 The active box maps onto the whole virtual desktop (all monitors combined)
 and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
+
+v24 adds a tkinter screen probe as a portable fallback, and widens the
+active-region margins to 0.15.
+
+The probe reads the VIRTUAL ROOT, not winfo_screenwidth().  Measured on a
+dual-monitor Windows desktop, winfo_screenwidth() reported 1536×864 — the
+primary display alone, DPI-scaled — where winfo_vrootwidth() reported the
+true 3840×1080.  Sizing from the former would silently amputate the second
+monitor.  Native ctypes stays the preferred source because it alone reports
+a negative origin and a monitor count, and is cheap enough to re-read every
+poll (which is what makes hot-plug detection work); tkinter takes over only
+if that fails, and is cached because building a Tk root per poll would cost
+far more than it returns.
+
+ctypes itself is standard library and stays for one job the standard
+library cannot otherwise do: moving the cursor.  tkinter has no mouse API.
 
 v23 stops forcing DirectShow.  DSHOW was pinned for its low latency, which
 suits physical webcams and breaks some virtual ones: it would open the
@@ -195,8 +211,8 @@ CURSOR_SENSITIVITY = 1.0
 #
 # Values are sanitised at use, so a margin of 0.5 or more cannot collapse
 # the window to zero width.
-MARGIN_X = 0.12
-MARGIN_Y = 0.12
+MARGIN_X = 0.15
+MARGIN_Y = 0.15
 
 # ── Mirroring — the 'm' key ────────────────────────────────────────────────
 # Cameras disagree about handedness.  A front-facing webcam is usually shown
@@ -657,8 +673,75 @@ def choose_camera(available: list) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  SCREEN DETECTION — portable probe
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Which source supplies the desktop rectangle:
+#   "auto"     native first, tkinter if that fails  (default)
+#   "tkinter"  force the portable path
+#   "native"   force ctypes, fail loudly if unavailable
+SCREEN_SOURCE = "auto"
+
+
+def probe_screen_tkinter():
+    """Desktop rectangle via tkinter.  Returns (left, top, w, h) or None.
+
+    Uses the VIRTUAL ROOT metrics, not winfo_screenwidth().  That
+    distinction is the whole reason this function is worth having: on a
+    dual-monitor Windows desktop measured here, winfo_screenwidth() returned
+    1536×864 — the primary monitor alone, and DPI-scaled at that — while
+    winfo_vrootwidth() returned the true 3840×1080.  Sizing the mapping from
+    winfo_screenwidth() would silently amputate the second display.
+
+    tkinter is standard library, so this adds no dependency, but it is not
+    free: it builds and tears down a Tk root, needs python3-tk present on
+    Linux (not installed by default on minimal images), and reports the
+    virtual origin as (0, 0) on Windows even when a monitor sits left of the
+    primary.  Hence "fallback" rather than "primary".
+    """
+    try:
+        import tkinter
+    except Exception:
+        return None
+
+    root = None
+    try:
+        root = tkinter.Tk()
+        root.withdraw()                     # never show the helper window
+        width = int(root.winfo_vrootwidth())
+        height = int(root.winfo_vrootheight())
+        left = int(root.winfo_vrootx())
+        top = int(root.winfo_vrooty())
+
+        # Some window managers leave the vroot unset; fall back to the
+        # single-screen numbers rather than returning a zero rectangle.
+        if width <= 0 or height <= 0:
+            width = int(root.winfo_screenwidth())
+            height = int(root.winfo_screenheight())
+            left = top = 0
+
+        return (left, top, width, height) if width > 0 and height > 0 else None
+    except Exception:
+        return None
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  PLATFORM BACKENDS
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# NOTE ON ctypes:  ctypes is part of the standard library — there is no
+# win32api, pywin32 or any other wrapper anywhere in this file, and never
+# was.  It stays for one reason: MOVING THE CURSOR.  Python's standard
+# library has no mouse API at all, tkinter included; the only alternatives
+# are third-party packages, which the "no frameworks" rule rules out.  So
+# the cursor goes through user32.SetCursorPos / XWarpPointer, and screen
+# *measurement* is what gained the portable tkinter path above.
 #
 # Everything OS-specific is confined to these two classes so the rest of the
 # file is portable.  Both talk to the native library through plain ctypes —
@@ -867,8 +950,54 @@ class ScreenGeometry:
         # for the wrong image.
         self.cam_w = int(cam_width)
         self.cam_h = int(cam_height)
-        # Seed with whatever the desktop looks like right now.
-        self._apply(self._backend.read_geometry())
+
+        # Where the desktop rectangle comes from, decided once.  Native is
+        # preferred: it is the only source that reports a negative origin
+        # (a monitor left of the primary) and a monitor count, and it is
+        # cheap enough to re-read on every poll, which is what makes
+        # hot-plug detection possible.
+        self._native_ok = SCREEN_SOURCE != "tkinter"
+        self._tk_geometry = None
+        self.source = "native"
+
+        metrics = self._read_geometry()
+        if metrics is None:
+            raise RuntimeError(
+                "could not determine the desktop size from either the native "
+                "API or tkinter — on Linux install python3-tk, or set "
+                "SCREEN_SOURCE and check your display connection."
+            )
+        self._apply(metrics)
+
+    # ── Geometry source ────────────────────────────────────────────────
+    def _read_geometry(self):
+        """Desktop rectangle, native first and tkinter as the fallback.
+
+        The tkinter probe is cached after its first success.  Building a Tk
+        root costs tens of milliseconds and can flash a window; doing that
+        every POLL_INTERVAL would be wasteful, so the portable path trades
+        away hot-plug detection rather than pay it repeatedly.
+        """
+        if self._native_ok:
+            try:
+                m = self._backend.read_geometry()
+                if m and m[2] > 0 and m[3] > 0:
+                    self.source = "native"
+                    return m
+            except Exception:
+                pass
+            if SCREEN_SOURCE == "native":
+                return None
+            # One failure is enough; stop paying for it every poll.
+            self._native_ok = False
+            print("[screen] native geometry unavailable — falling back to "
+                  "tkinter (hot-plug detection disabled)")
+
+        if self._tk_geometry is None:
+            self._tk_geometry = probe_screen_tkinter()
+        if self._tk_geometry is not None:
+            self.source = "tkinter"
+        return self._tk_geometry
 
     # ── Camera size ────────────────────────────────────────────────────
     def set_camera_size(self, width: int, height: int) -> bool:
@@ -895,7 +1024,12 @@ class ScreenGeometry:
         rather than from constants.
         """
         self.left, self.top, self.width, self.height = metrics
-        self.monitors = self._backend.monitor_count()
+        # The monitor count is a native-only nicety; tkinter cannot report
+        # it, so the banner just says 1 rather than guessing.
+        try:
+            self.monitors = self._backend.monitor_count() if self._native_ok else 1
+        except Exception:
+            self.monitors = 1
         self.ratio = self.width / self.height
 
         # The active box is the frame inset by the margins, in normalised
@@ -932,7 +1066,14 @@ class ScreenGeometry:
             return False
         self._next_poll = now + self._poll_interval
 
-        metrics = self._backend.read_geometry()
+        # Only the native source is re-read; the tkinter fallback is cached
+        # and would cost a Tk root per poll for no benefit.
+        if not self._native_ok:
+            return False
+
+        metrics = self._read_geometry()
+        if metrics is None:
+            return False
 
         # Mid-hotplug the OS can transiently report a degenerate rectangle
         # while the driver reconfigures.  Ignore it and keep the last known
@@ -1459,6 +1600,10 @@ prev_time = time.perf_counter()
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
 print(f"Platform    : {backend.name}")
+print(f"Screen src  : {screen.source}"
+      + ("  (ctypes virtual desktop — origin, monitor count, hot-plug)"
+         if screen.source == "native"
+         else "  (tkinter vroot — no negative origin, no hot-plug)"))
 print(f"Virtual desk: {screen.describe()}")
 print(f"Webcam      : index {camera_index}, native {stream.native_width}×"
       f"{stream.native_height} @ {CAM_FPS} FPS requested")
