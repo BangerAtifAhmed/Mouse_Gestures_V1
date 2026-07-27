@@ -22,3 +22,9 @@
 opencv-python>=4.5,<5.0
 mediapipe==0.8.11
 numpy>=1.19
+
+# Cursor output.  Optional in practice: CURSOR_BACKEND='auto' falls back to
+# the built-in ctypes path if this is missing, so the script still runs.
+# It buys one API across both platforms and a clean click interface for
+# gesture work.  On Linux it also pulls in python-xlib.
+pynput>=1.7,<2.0

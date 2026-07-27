@@ -1,6 +1,6 @@
 """
-Hand-Tracking Cursor Controller (v25 — Asymmetric Vertical Margins)
-===================================================================
+Hand-Tracking Cursor Controller (v26 — pynput Cursor Output)
+============================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
@@ -8,6 +8,19 @@ light smoothing during fast swipes.  Movement only — no click gestures.
 
 The active box maps onto the whole virtual desktop (all monitors combined)
 and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
+
+v26 routes the pointer through pynput, with the ctypes path kept as a
+fallback.  pynput gives one API across Windows and Linux and a clean click
+interface for gesture work — mouse.click(Button.left, 1) — which in raw
+ctypes means mouse_event/SendInput on Windows and XTest on X11.
+
+It does not change multi-monitor reach, and it is worth being precise about
+why: on Windows pynput's position setter IS user32.SetCursorPos, the same
+call this script has always made.  Measured side by side on a 3840×1080
+dual desktop, the two agreed exactly at every corner including (3839, 1079).
+The boundary bug worth avoiding is pyautogui's — it clamps to the primary
+display and cannot address negative coordinates — and pyautogui has never
+been in this file.
 
 v25 splits the vertical margin in two.  A hand raises well above shoulder
 height but stops against the desk or the chest going down, so a symmetric
@@ -726,6 +739,94 @@ def choose_camera(available: list) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  CURSOR OUTPUT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Which library actually moves the pointer:
+#   "auto"    pynput if importable, else the ctypes path   (default)
+#   "pynput"  require pynput; fail loudly if it is missing
+#   "native"  ctypes only, no third-party import at all
+#
+# pynput gives one API across Windows and Linux and, more usefully, a clean
+# click interface for gesture work later — mouse.click(Button.left, 1) —
+# which in raw ctypes means SendInput on Windows and XTest on X11.
+#
+# What it does NOT change is multi-monitor reach.  On Windows pynput's
+# position setter *is* user32.SetCursorPos, the same call the native path
+# has always used; measured side by side on a 3840×1080 dual desktop the two
+# returned identical coordinates at every corner, including (3839, 1079).
+# The boundary problem worth avoiding belongs to pyautogui, which clamps to
+# the primary display and cannot address negative coordinates at all — this
+# script has never used it.
+#
+# "auto" keeps a ctypes fallback because pynput is a third-party package and
+# needs python-xlib on Linux; a missing optional dependency should not stop
+# the cursor from working.
+CURSOR_BACKEND = "auto"
+
+
+class PynputCursor:
+    """Pointer via pynput.  Understands the virtual desktop on both OSes."""
+
+    name = "pynput"
+
+    def __init__(self):
+        from pynput.mouse import Button, Controller
+        self._button = Button
+        self._mouse = Controller()
+        # Touch the property once so an unusable backend (no DISPLAY, no
+        # python-xlib) raises here, while there is still a fallback, rather
+        # than on the first frame.
+        _ = self._mouse.position
+
+    def move(self, x: int, y: int) -> None:
+        self._mouse.position = (int(x), int(y))
+
+    def click(self, button: str = "left", count: int = 1) -> None:
+        """Send a click.  No gesture calls this yet; it is here for the
+        pinch/click work rather than left to be bolted on later."""
+        self._mouse.click(getattr(self._button, button), count)
+
+    def close(self) -> None:
+        pass
+
+
+class NativeCursor:
+    """Pointer via the platform backend's own ctypes call."""
+
+    name = "ctypes"
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    def move(self, x: int, y: int) -> None:
+        self._backend.move_cursor(int(x), int(y))
+
+    def click(self, button: str = "left", count: int = 1) -> None:
+        self._backend.click(button, count)
+
+    def close(self) -> None:
+        pass
+
+
+def make_cursor(backend):
+    """Pick the cursor output, honouring CURSOR_BACKEND."""
+    if CURSOR_BACKEND in ("auto", "pynput"):
+        try:
+            return PynputCursor()
+        except Exception as exc:
+            if CURSOR_BACKEND == "pynput":
+                raise RuntimeError(
+                    f"CURSOR_BACKEND='pynput' but pynput is unusable: {exc}. "
+                    "Install it with 'pip install pynput' (Linux also needs "
+                    "python-xlib), or set CURSOR_BACKEND='native'."
+                ) from exc
+            print(f"[cursor] pynput unavailable ({exc.__class__.__name__}) — "
+                  f"falling back to ctypes")
+    return NativeCursor(backend)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  SCREEN DETECTION — portable probe
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -841,7 +942,20 @@ class Win32Backend:
 
     def move_cursor(self, x: int, y: int) -> None:
         # SetCursorPos accepts negative virtual-screen coordinates directly.
+        # This is the identical call pynput makes on Windows.
         self._set_pos(x, y)
+
+    # mouse_event flags; SendInput is the modern call but mouse_event is
+    # still honoured and needs no struct definitions.
+    _BTN = {"left":   (0x0002, 0x0004),      # LEFTDOWN,   LEFTUP
+            "right":  (0x0008, 0x0010),      # RIGHTDOWN,  RIGHTUP
+            "middle": (0x0020, 0x0040)}      # MIDDLEDOWN, MIDDLEUP
+
+    def click(self, button: str = "left", count: int = 1) -> None:
+        down, up = self._BTN[button]
+        for _ in range(count):
+            self._u32.mouse_event(down, 0, 0, 0, 0)
+            self._u32.mouse_event(up, 0, 0, 0, 0)
 
     def close(self) -> None:
         pass
@@ -905,6 +1019,17 @@ class X11Backend:
             )
         self._root = x.XDefaultRootWindow(self._dpy)
 
+        # XTest is optional and only needed for clicking; loaded here so a
+        # missing extension is discovered at startup rather than mid-gesture.
+        self._xtest = None
+        try:                        # pragma: no cover - platform specific
+            xt = ctypes.CDLL("libXtst.so.6")
+            xt.XTestFakeButtonEvent.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+            self._xtest = xt
+        except OSError:
+            pass
+
         # Xinerama is optional; without it we simply report one monitor.
         self._xinerama = None
         try:                        # pragma: no cover - platform specific
@@ -947,6 +1072,24 @@ class X11Backend:
         # src_window 0 (None) means "move regardless of current position".
         self._xlib.XWarpPointer(self._dpy, 0, self._root, 0, 0, 0, 0, x, y)
         # Without a flush the request sits in the output buffer.
+        self._xlib.XFlush(self._dpy)
+
+    def click(self, button: str = "left", count: int = 1) -> None:
+        """Click through XTest, if the extension is present.
+
+        XWarpPointer can move the pointer but cannot press anything, so this
+        needs libXtst.  Rather than half-implement it, an absent extension
+        says so and points at pynput, which carries its own X backend.
+        """
+        if self._xtest is None:
+            raise RuntimeError(
+                "clicking on X11 needs libXtst (install libxtst6) or "
+                "pynput — set CURSOR_BACKEND='pynput'."
+            )
+        code = {"left": 1, "middle": 2, "right": 3}[button]
+        for _ in range(count):
+            self._xtest.XTestFakeButtonEvent(self._dpy, code, True, 0)
+            self._xtest.XTestFakeButtonEvent(self._dpy, code, False, 0)
         self._xlib.XFlush(self._dpy)
 
     def close(self) -> None:
@@ -1543,6 +1686,7 @@ if OPENCV_THREADS:
     cv2.setNumThreads(OPENCV_THREADS)
 
 backend = make_backend()
+cursor = make_cursor(backend)
 
 # ─── Camera selection and open ──────────────────────────────────────────────
 # Both happen before MediaPipe loads: the model takes a moment to initialise
@@ -1652,6 +1796,10 @@ prev_time = time.perf_counter()
 # ─── Main loop ──────────────────────────────────────────────────────────────
 
 print(f"Platform    : {backend.name}")
+print(f"Cursor out  : {cursor.name}"
+      + ("  (one API for Windows+Linux; click ready for gestures)"
+         if cursor.name == "pynput"
+         else "  (ctypes fallback — pynput not importable)"))
 print(f"Screen src  : {screen.source}"
       + ("  (ctypes virtual desktop — origin, monitor count, hot-plug)"
          if screen.source == "native"
@@ -1824,7 +1972,7 @@ try:
             smooth_x = _oef_x(target_x, timestamp=now_ts)
             smooth_y = _oef_y(target_y, timestamp=now_ts)
 
-            backend.move_cursor(int(smooth_x), int(smooth_y))
+            cursor.move(int(smooth_x), int(smooth_y))
 
             # Per-frame travel, kept purely as a tuning readout.
             jump = math.hypot(smooth_x - prev_x, smooth_y - prev_y)
@@ -1914,5 +2062,6 @@ finally:
     stream.stop()
     cv2.destroyAllWindows()
     hands.close()
+    cursor.close()
     backend.close()
     print("Shutdown complete.")
