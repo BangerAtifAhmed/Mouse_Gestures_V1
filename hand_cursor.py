@@ -1,7 +1,33 @@
 """
-Hand-Tracking Cursor Controller (v26 — pynput Cursor Output)
-============================================================
-Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
+Hand-Tracking Cursor Controller (v28 — Knuckle Anchor + Gesture States)
+=======================================================================
+Moves the mouse cursor by tracking the middle-finger knuckle (MediaPipe
+landmark 9) and reports a gesture state read from finger geometry.
+
+MOVEMENT AND REPORTING ONLY.  No click, press, release or drag is issued
+anywhere in this file.
+
+v28 changes two things and they work together.
+
+ANCHOR.  Tracking moved from landmark 8 (index tip) to landmark 9 (middle
+MCP).  A fingertip is the most mobile point on the hand — every gesture
+moves it by definition — so anchoring there means the cursor lurches
+whenever the pose changes.  The MCP knuckle is carried by the palm rather
+than the finger, so it holds still while the fingers do the signalling.
+Landmark 8 is still read, but only as gesture input.
+
+STATE MACHINE.  detect_gesture() classifies point / peace / grip / open,
+with idle as the fallback for anything in between.  It is arithmetic only:
+a finger counts as extended when its tip sits further from the wrist than
+its PIP joint does, which is self-normalising and needs no palm divisor,
+no threshold tuning per camera, and no classifier.  The thumb gets its own
+test because it folds across the palm instead of curling radially.
+
+TRANSITION FREEZE.  Changing pose still shifts the hand slightly, so every
+state change pins the target for STATE_FREEZE_MS and then releases it.  The
+frozen point is fed through the 1€ filter rather than bypassing it, leaving
+the filter settled there so movement resumes by gliding rather than jumping.
+
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
 light smoothing during fast swipes.  Movement only — no click gestures.
@@ -279,6 +305,41 @@ IS_MIRRORED = True
 # coordinate.
 INVERT_CURSOR_X = True
 
+# ── Gesture state machine ──────────────────────────────────────────────────
+# Pure geometry: per-finger extension tests plus a thumb test, classified
+# into a handful of named states.  No gesture library, no classifier, no
+# training data — every decision below is a comparison of two distances.
+#
+# EXTENSION TEST.  A finger counts as extended when its TIP is further from
+# the wrist than its PIP joint is:
+#
+#       extended  ⇔  |tip − wrist|  >  |pip − wrist| × EXTEND_MARGIN
+#
+# Curling a finger folds the tip back toward the palm, so the radial
+# distance drops below the knuckle's.  Comparing two distances from the
+# same origin makes the test self-normalising: it needs no palm-size
+# divisor and holds at any hand distance, any frame resolution, and any
+# in-plane rotation.  The margin is slack against landmark jitter for a
+# finger held near the boundary.
+#
+# The thumb needs its own test because it does not curl radially — it folds
+# ACROSS the palm, ending up near the index knuckle without its distance
+# from the wrist changing much.  So it is measured against the index MCP
+# and scaled by palm length, which is what makes that threshold portable.
+EXTEND_MARGIN   = 1.05   # slack on the tip-vs-pip comparison
+THUMB_OUT_RATIO = 0.60   # |thumb4 − indexMCP5| / palm, above which it is out
+
+# ── State-transition freeze (anti-drift) ───────────────────────────────────
+# Changing gesture moves the whole hand a little: fingers closing or opening
+# drag the knuckles with them, and the cursor lurches at exactly the moment
+# the user meant to signal something, not move.  Holding the target still
+# for a moment after every transition absorbs that twitch.
+#
+# Landmark 9 already removes most of it (see the anchor note below); this
+# covers the residual.  Long enough to outlast the twitch, short enough that
+# an intentional move right after a transition does not feel blocked.
+STATE_FREEZE_MS = 150
+
 SENS_STEP = 0.1    # increment per keypress
 SENS_MIN  = 1.0    # floor: plain absolute mapping, the entire box is live.
                    # Below 1.0 the mapping would shrink the reachable area to
@@ -490,6 +551,85 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 def clamp(value: float, lo: float, hi: float) -> float:
     """Restrict *value* to the closed interval [lo, hi]."""
     return max(lo, min(hi, value))
+
+
+# ── MediaPipe hand landmark indices ────────────────────────────────────────
+# Named rather than inlined: hand.landmark[14] is unreadable, and the tip /
+# pip / mcp distinction is the entire basis of the extension test below.
+LM_WRIST      = 0
+LM_THUMB_TIP  = 4
+LM_INDEX_MCP  = 5
+LM_INDEX_PIP  = 6
+LM_INDEX_TIP  = 8
+LM_MIDDLE_MCP = 9        # the cursor anchor — see ANCHOR note in the header
+LM_MIDDLE_PIP = 10
+LM_MIDDLE_TIP = 12
+LM_RING_PIP   = 14
+LM_RING_TIP   = 16
+LM_PINKY_PIP  = 18
+LM_PINKY_TIP  = 20
+
+# (name, pip, tip) for the four fingers that curl radially.
+_FINGERS = (
+    ("index",  LM_INDEX_PIP,  LM_INDEX_TIP),
+    ("middle", LM_MIDDLE_PIP, LM_MIDDLE_TIP),
+    ("ring",   LM_RING_PIP,   LM_RING_TIP),
+    ("pinky",  LM_PINKY_PIP,  LM_PINKY_TIP),
+)
+
+
+def detect_gesture(hand_landmarks, frame_w=1.0, frame_h=1.0):
+    """Classify a hand pose from landmark geometry alone.
+
+    Returns (state, extended, thumb_out) where *state* is one of
+    "point", "peace", "grip", "open" or "idle", *extended* is a 4-tuple of
+    booleans for index/middle/ring/pinky, and *thumb_out* is a bool.  The
+    extra detail is returned rather than recomputed so the overlay can show
+    what the classifier actually saw.
+
+    frame_w / frame_h scale the normalised landmarks back into pixels.
+    They default to 1.0 so the function is callable with landmarks alone,
+    but passing the real frame size matters: normalised x and y are divided
+    by different dimensions, so on a 16:9 feed an unscaled "distance" is
+    stretched horizontally and the finger tests skew with it.
+
+    "idle" is the fallback for any combination that is not one of the named
+    poses — a half-curled hand mid-transition lands here rather than being
+    forced into the nearest match.
+    """
+    lm = hand_landmarks.landmark
+
+    def dist(a, b):
+        return math.hypot((lm[a].x - lm[b].x) * frame_w,
+                          (lm[a].y - lm[b].y) * frame_h)
+
+    # Palm length: wrist to middle MCP.  Fixed by skeleton, unaffected by
+    # finger articulation, so it is the natural scale reference.
+    palm = dist(LM_WRIST, LM_MIDDLE_MCP)
+    if palm <= 1e-6:
+        # Hand edge-on or a degenerate frame; refuse to guess.
+        return "idle", (False, False, False, False), False
+
+    extended = tuple(
+        dist(LM_WRIST, tip) > dist(LM_WRIST, pip) * EXTEND_MARGIN
+        for _name, pip, tip in _FINGERS
+    )
+    thumb_out = dist(LM_THUMB_TIP, LM_INDEX_MCP) > THUMB_OUT_RATIO * palm
+
+    index, middle, ring, pinky = extended
+
+    if not any(extended) and not thumb_out:
+        state = "grip"                       # closed fist
+    elif index and not middle and not ring and not pinky:
+        state = "point"                      # index only
+    elif index and middle and not ring and not pinky:
+        state = "peace"                      # index + middle
+    elif all(extended):
+        state = "open"                       # flat palm
+    else:
+        state = "idle"                       # anything in between
+
+    return state, extended, thumb_out
 
 
 def sanitise_margins() -> tuple[float, float, float]:
@@ -1773,6 +1913,18 @@ hand_present = False
 # the filters reset before the cursor tries to glide to the mirrored position.
 was_mirrored = IS_MIRRORED
 
+# ── Gesture state ──────────────────────────────────────────────────────────
+# gesture_state is the pose as of the last frame; a mismatch is a transition
+# and starts the freeze.  None means "no hand yet", which is distinct from
+# "idle" (a hand present in no recognised pose).
+gesture_state = None
+gesture = "idle"
+fingers_ext = (False, False, False, False)
+thumb_out = False
+frozen_target = None
+freeze_until = 0.0
+gesture_changes = 0
+
 # Sequence number of the last frame actually processed, so duplicates can be
 # skipped instead of re-running inference on data we already consumed.
 last_seq = -1
@@ -1846,6 +1998,15 @@ print(f"Mirroring   : {'ON' if IS_MIRRORED else 'OFF'} — press 'm' to flip "
       f"the picture AND the control direction together")
 print(f"Invert X    : {'ON' if INVERT_CURSOR_X else 'OFF'} — press 'i' for "
       f"control-only inversion (picture unchanged)")
+print(f"Anchor      : landmark {LM_MIDDLE_MCP} (middle-finger MCP) — the "
+      f"knuckle, not the index tip")
+print(f"              it barely moves when fingers bend, so gesturing does "
+      f"not drag the cursor")
+print(f"Gestures    : point / peace / grip / open / idle, from finger "
+      f"geometry only")
+print(f"              transitions freeze the target for {STATE_FREEZE_MS} ms "
+      f"to absorb the hand twitch")
+print(f"              MOVEMENT ONLY — no click, press or drag is issued")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
 print(f"MediaPipe   : {_complexity_note}")
 print(f"Backend     : {describe_api(backend.camera_api)}"
@@ -1938,15 +2099,26 @@ try:
         if results.multi_hand_landmarks:
             hand = results.multi_hand_landmarks[0]
 
-            # Landmark 8 = Index Finger Tip.
-            tip = hand.landmark[8]
+            # ── Cursor anchor: landmark 9, the middle-finger knuckle ────
+            # Not the index tip.  A fingertip is the most mobile point on
+            # the hand: every gesture moves it by design, so pointing with
+            # it means the cursor lurches whenever the pose changes.  The
+            # MCP knuckle barely moves when fingers bend — it is carried by
+            # the palm, not the finger — so the tracking signal stays put
+            # while the fingers do the signalling.  Landmark 8 is still
+            # read below, but only as gesture input.
+            anchor = hand.landmark[LM_MIDDLE_MCP]
 
             # MediaPipe returns normalised coords [0, 1]; convert to pixels
             # of the REAL frame.  Scaling by a hardcoded 640×480 here would
-            # place the fingertip at a fraction of its true position on any
+            # place the anchor at a fraction of its true position on any
             # other sensor, and the overlay would drift away from the hand.
-            raw_x = tip.x * screen.cam_w
-            raw_y = tip.y * screen.cam_h
+            raw_x = anchor.x * screen.cam_w
+            raw_y = anchor.y * screen.cam_h
+
+            # ── Gesture classification (geometry only) ──────────────────
+            gesture, fingers_ext, thumb_out = detect_gesture(
+                hand, screen.cam_w, screen.cam_h)
 
             # Clamp into the active box, map onto the virtual desktop, and
             # apply centre-scaled sensitivity — all inside to_screen().
@@ -1963,6 +2135,35 @@ try:
                 _oef_y.reset()
                 prev_x, prev_y = target_x, target_y
                 hand_present = True
+                # A hand that just arrived carries no gesture history, and
+                # a stale freeze would pin the cursor to coordinates from
+                # the previous appearance.
+                gesture_state = None
+                frozen_target = None
+                freeze_until = 0.0
+
+            # ── State-transition freeze ─────────────────────────────────
+            # Changing pose moves the whole hand slightly.  Capturing the
+            # target on the transition frame and holding it for
+            # STATE_FREEZE_MS absorbs that twitch, then movement resumes so
+            # the pose can still be dragged around once settled.
+            if gesture != gesture_state:
+                previous = gesture_state
+                gesture_state = gesture
+                frozen_target = (target_x, target_y)
+                freeze_until = now_ts + STATE_FREEZE_MS / 1000.0
+                gesture_changes += 1
+                print(f"[gesture] {previous or '-'} -> {gesture}"
+                      f"   (hold {STATE_FREEZE_MS} ms)")
+
+            if frozen_target is not None:
+                if now_ts < freeze_until:
+                    # The frozen point is fed THROUGH the filter rather than
+                    # bypassing it, so the filter stays settled there; on
+                    # release it glides back to the hand instead of jumping.
+                    target_x, target_y = frozen_target
+                else:
+                    frozen_target = None
 
             # ── One Euro Filter smoothing ────────────────────────────────
             # The filter is the *only* smoothing stage.  It internally tracks
@@ -1982,9 +2183,33 @@ try:
             # ── Visualisation overlays (drawn on the writeable BGR buffer)
             mp_draw.draw_landmarks(bgr_buf, hand, mp_hands.HAND_CONNECTIONS)
 
-            # Draw a filled circle at the index finger tip.
+            # Marker on the ANCHOR — the middle-finger knuckle the cursor
+            # actually follows, not the index tip.  Uses the UNREFLECTED
+            # coordinate so it sits on the hand as the preview shows it,
+            # whatever the control path did.  Amber while frozen.
             cx, cy = int(raw_x), int(raw_y)
-            cv2.circle(bgr_buf, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
+            _frozen = frozen_target is not None and now_ts < freeze_until
+            _anchor_col = (0, 165, 255) if _frozen else (0, 255, 0)
+            cv2.circle(bgr_buf, (cx, cy), 11, _anchor_col, cv2.FILLED)
+            cv2.circle(bgr_buf, (cx, cy), 15, _anchor_col, 2)
+
+            # The index tip is still drawn, small and hollow, to make the
+            # anchor change legible: it moves when gesturing, the anchor
+            # does not.
+            _it = hand.landmark[LM_INDEX_TIP]
+            cv2.circle(bgr_buf,
+                       (int(_it.x * screen.cam_w), int(_it.y * screen.cam_h)),
+                       5, (200, 200, 200), 1)
+
+            # Per-finger verdicts, in the order the classifier sees them.
+            _flags = "".join(
+                n[0].upper() if e else n[0]
+                for (n, _p, _t), e in zip(_FINGERS, fingers_ext)
+            ) + ("T" if thumb_out else "t")
+            cv2.putText(
+                bgr_buf, _flags, (cx + 20, cy - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
+            )
 
             # Show how far the cursor moved this frame.
             cv2.putText(
@@ -1994,6 +2219,18 @@ try:
         else:
             # No hand this frame — arm the reset for whenever it returns.
             hand_present = False
+            # Drop the gesture too.  A hand that leaves mid-freeze would
+            # otherwise keep the cursor pinned, and the next appearance
+            # would not register as a transition if the pose happened to
+            # match the stale one.
+            if gesture_state is not None:
+                print(f"[gesture] {gesture_state} -> (hand lost)")
+            gesture_state = None
+            gesture = "idle"
+            fingers_ext = (False, False, False, False)
+            thumb_out = False
+            frozen_target = None
+            freeze_until = 0.0
 
         # Draw the active bounding box on the preview.  Read from `screen`
         # so it follows the box when a display is plugged or unplugged.
@@ -2039,10 +2276,25 @@ try:
             (0, 220, 0) if IS_MIRRORED else (0, 80, 255), 2,
         )
 
+        # Gesture state, and whether the transition freeze is holding the
+        # cursor right now.  Amber while frozen so the lock is unmistakable.
+        _held = frozen_target is not None and now_ts < freeze_until
+        if _held:
+            _left_ms = (freeze_until - now_ts) * 1000.0
+            cv2.putText(
+                bgr_buf, f"{gesture.upper()}  LOCK {_left_ms:3.0f}ms",
+                (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2,
+            )
+        else:
+            cv2.putText(
+                bgr_buf, f"{gesture.upper()}  ({gesture_changes})",
+                (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+            )
+
         # Desktop summary underneath.
         cv2.putText(
             bgr_buf, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
-            (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+            (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
 
         # Key hints along the bottom edge of the real frame.
