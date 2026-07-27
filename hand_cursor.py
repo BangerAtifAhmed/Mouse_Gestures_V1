@@ -1,6 +1,6 @@
 """
-Hand-Tracking Cursor Controller (v24 — Portable Screen Probe)
-=============================================================
+Hand-Tracking Cursor Controller (v25 — Asymmetric Vertical Margins)
+===================================================================
 Moves the mouse cursor by tracking the index finger tip (MediaPipe landmark 8).
 Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
 which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
@@ -9,8 +9,17 @@ light smoothing during fast swipes.  Movement only — no click gestures.
 The active box maps onto the whole virtual desktop (all monitors combined)
 and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
 
+v25 splits the vertical margin in two.  A hand raises well above shoulder
+height but stops against the desk or the chest going down, so a symmetric
+window wasted travel at the top and ran out before the bottom — the taskbar
+was simply out of reach.  MARGIN_TOP (0.10) and MARGIN_BOTTOM (0.28) put the
+live band at 10%–72% down the frame, so the screen bottom now arrives where
+the arm actually gets to.  The window sits in the upper part of the frame,
+which also means a hand resting at chest height already sits near the bottom
+of the screen instead of the middle.
+
 v24 adds a tkinter screen probe as a portable fallback, and widens the
-active-region margins to 0.15.
+horizontal margin to 0.15.
 
 The probe reads the VIRTUAL ROOT, not winfo_screenwidth().  Measured on a
 dual-monitor Windows desktop, winfo_screenwidth() reported 1536×864 — the
@@ -211,8 +220,22 @@ CURSOR_SENSITIVITY = 1.0
 #
 # Values are sanitised at use, so a margin of 0.5 or more cannot collapse
 # the window to zero width.
-MARGIN_X = 0.15
-MARGIN_Y = 0.15
+# Vertical is deliberately ASYMMETRIC.  A hand can raise far above shoulder
+# height but stops dead against the desk or the chest on the way down, so a
+# symmetric window wastes travel at the top and runs out before the bottom —
+# which is exactly why the taskbar was unreachable.  Ending the window at
+# 1 − MARGIN_BOTTOM means the screen bottom arrives at 72% down the frame
+# instead of 85%, inside the range the arm actually covers.
+#
+#       vertical window = [MARGIN_TOP, 1 − MARGIN_BOTTOM]
+#       0.10 / 0.28     → the band from 10% to 72% down the frame
+#
+# The window is 62% of the frame height and sits in its UPPER portion, so
+# resting the hand at chest height already puts the cursor near the bottom
+# of the screen rather than in the middle.
+MARGIN_X      = 0.15
+MARGIN_TOP    = 0.10
+MARGIN_BOTTOM = 0.28
 
 # ── Mirroring — the 'm' key ────────────────────────────────────────────────
 # Cameras disagree about handedness.  A front-facing webcam is usually shown
@@ -427,7 +450,7 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 # vertical move had to happen inside that band, which is exactly the
 # "reaching the edges needs physical extremes" complaint.
 #
-# The box is now simply the frame inset by MARGIN_X / MARGIN_Y, computed
+# The box is now simply the frame inset by the margins, computed
 # from NORMALISED landmark coordinates.  On the same setup that is 76% of
 # the frame in both directions — 274 px of vertical travel instead of 111,
 # about 2.5× the room.
@@ -438,8 +461,11 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 # 1:1.  Vertical movement is therefore half as sensitive as horizontal.  On
 # a very wide desktop that arguably matches intuition, since there is far
 # more screen to cross sideways, but a diagonal sweep will not trace a
-# straight diagonal.  Raise MARGIN_Y relative to MARGIN_X to rebalance:
-# equal gain needs (1−2·MARGIN_Y)/(1−2·MARGIN_X) = frame_ratio/desktop_ratio.
+# straight diagonal.  Narrow the vertical band relative to MARGIN_X to
+# rebalance: equal gain needs
+#     (1 − MARGIN_TOP − MARGIN_BOTTOM) / (1 − 2·MARGIN_X)
+#         = frame_ratio / desktop_ratio
+# The startup banner prints the pair that would satisfy it.
 #
 # Because the box is built from normalised coordinates it is automatically
 # correct on any sensor — 640×480, 1280×720 or a downscaled 640×360 all
@@ -451,6 +477,33 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 def clamp(value: float, lo: float, hi: float) -> float:
     """Restrict *value* to the closed interval [lo, hi]."""
     return max(lo, min(hi, value))
+
+
+def sanitise_margins() -> tuple[float, float, float]:
+    """Return usable (margin_x, margin_top, margin_bottom).
+
+    Sanitising at the point of use rather than at import means editing the
+    constants takes effect with no derived value left to fall out of sync,
+    and a nonsense setting cannot collapse the mapping window to zero width
+    and divide by zero.
+
+    The vertical pair is scaled together when it overruns, because the two
+    are not independent: MARGIN_TOP + MARGIN_BOTTOM must leave a band to map
+    from.  Scaling preserves the top/bottom RATIO, which is the part that
+    encodes the ergonomics — a hand reaches higher than it reaches low — so
+    an over-large pair degrades to the same shape rather than to a
+    symmetric one.
+    """
+    mx = min(max(MARGIN_X, 0.0), 0.49)
+    mt = max(MARGIN_TOP, 0.0)
+    mb = max(MARGIN_BOTTOM, 0.0)
+
+    # Keep at least 5% of the frame height as the live band.
+    if mt + mb > 0.95:
+        scale = 0.95 / (mt + mb)
+        mt, mb = mt * scale, mb * scale
+
+    return mx, mt, mb
 
 
 def handle_key(key: int) -> bool:
@@ -1037,13 +1090,12 @@ class ScreenGeometry:
         # fractions land on the same relative rectangle whatever the sensor
         # delivers, so a 640×480 laptop cam and a downscaled 640×360 phone
         # feed both give a 76%×76% window at the default 0.12 margins.
-        mx = min(max(MARGIN_X, 0.0), 0.49)
-        my = min(max(MARGIN_Y, 0.0), 0.49)
+        mx, mt, mb = sanitise_margins()
 
         self.box_left   = int(round(mx * self.cam_w))
         self.box_right  = int(round((1.0 - mx) * self.cam_w))
-        self.box_top    = int(round(my * self.cam_h))
-        self.box_bottom = int(round((1.0 - my) * self.cam_h))
+        self.box_top    = int(round(mt * self.cam_h))
+        self.box_bottom = int(round((1.0 - mb) * self.cam_h))
 
         # A one-pixel frame, or margins rounding both edges together, must
         # still leave something to divide by in to_screen().
@@ -1619,10 +1671,13 @@ print(f"Active box  : {screen.box_w} × {screen.box_h} px  "
       f"y[{screen.box_top}–{screen.box_bottom}]")
 print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
       f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
-_mx = min(max(MARGIN_X, 0.0), 0.49)
-_my = min(max(MARGIN_Y, 0.0), 0.49)
-print(f"Edge margins: x {_mx:.0%} / y {_my:.0%} inset  →  the box IS the "
-      f"middle {1 - 2 * _mx:.0%}×{1 - 2 * _my:.0%} of the frame")
+_mx, _mt, _mb = sanitise_margins()
+print(f"Edge margins: x {_mx:.0%} each side; y {_mt:.0%} top / {_mb:.0%} bottom")
+print(f"              → live band is x[{_mx:.0%}–{1 - _mx:.0%}] "
+      f"y[{_mt:.0%}–{1 - _mb:.0%}] of the frame "
+      f"({1 - 2 * _mx:.0%}×{1 - _mt - _mb:.0%})")
+print(f"              screen bottom is reached at {1 - _mb:.0%} down the "
+      f"frame, not {100:.0f}% — no need to drop the hand past the desk")
 _gx = screen.width / max(1, screen.box_w)
 _gy = screen.height / max(1, screen.box_h)
 print(f"Gain        : {_gx:.1f} screen px per camera px horizontally, "
@@ -1630,10 +1685,14 @@ print(f"Gain        : {_gx:.1f} screen px per camera px horizontally, "
 if abs(_gx / _gy - 1.0) > 0.15:
     print(f"              anisotropic — a diagonal sweep will not trace a "
           f"straight diagonal.")
-    _want_my = 0.5 * (1 - (1 - 2 * _mx) * (screen.height / screen.width)
-                      * (stream.width / stream.height))
-    if 0.0 <= _want_my < 0.49:
-        print(f"              MARGIN_Y ≈ {_want_my:.2f} would equalise it "
+    # Equal gain needs the vertical band to be this fraction of the frame.
+    _want_band = ((1 - 2 * _mx) * (screen.height / screen.width)
+                  * (stream.width / stream.height))
+    if 0.05 < _want_band < 1.0:
+        # Shrink the current top/bottom split to that band, keeping its ratio.
+        _shrink = (1 - _want_band) / max(1e-6, _mt + _mb)
+        print(f"              MARGIN_TOP ≈ {_mt * _shrink:.2f} / "
+              f"MARGIN_BOTTOM ≈ {_mb * _shrink:.2f} would equalise it "
               f"(at the cost of vertical room)")
 print(f"Mirroring   : {'ON' if IS_MIRRORED else 'OFF'} — press 'm' to flip "
       f"the picture AND the control direction together")
