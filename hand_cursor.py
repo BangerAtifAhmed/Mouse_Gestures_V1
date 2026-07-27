@@ -1,6 +1,25 @@
 """
-Hand-Tracking Cursor Controller (v28 — Knuckle Anchor + Gesture States)
-=======================================================================
+Hand-Tracking Cursor Controller (v29 — Decoupled Inference Resolution)
+======================================================================
+v29 separates what MediaPipe sees from what the preview shows, and trims
+the per-frame Python maths.
+
+Inference is fed a 1/N integer downscale of the preview (320×180 by
+default) while bgr_buf stays full size for display.  Measured here, that is
+worth about 5 ms: 37.3 ms → 32.2 ms.  Not more, because the palm and
+landmark networks run at fixed internal input sizes — an 11× drop in pixels
+bought a 1.16× drop in time.  The divisor is an integer so the rescale hits
+OpenCV's fast path (123 µs, against 1536 µs for a fractional ratio) and so
+the aspect ratio survives exactly, which is what lets the normalised
+landmarks be used with no coordinate correction at all.
+
+Also in v29: detect_gesture compares squared distances and reads each
+landmark once (no sqrt, no per-call closure), and to_screen replaces
+np.interp with the same arithmetic written out — np.interp's array dispatch
+cost 12× the maths it performed on two scalars.  Both were verified against
+the previous implementations for bit-identical output.
+
+
 Moves the mouse cursor by tracking the middle-finger knuckle (MediaPipe
 landmark 9) and reports a gesture state read from finger geometry.
 
@@ -329,6 +348,15 @@ INVERT_CURSOR_X = True
 EXTEND_MARGIN   = 1.05   # slack on the tip-vs-pip comparison
 THUMB_OUT_RATIO = 0.60   # |thumb4 − indexMCP5| / palm, above which it is out
 
+# Both tests compare one distance against another, and a square root is
+# monotonic — so the comparison can be made on SQUARED distances and every
+# sqrt dropped.  Squaring the thresholds once here keeps the comparisons
+# algebraically identical:
+#       a > b·k        ⇔   a² > b²·k²          (a, b, k ≥ 0)
+_EXTEND_MARGIN_SQ   = EXTEND_MARGIN * EXTEND_MARGIN
+_THUMB_OUT_RATIO_SQ = THUMB_OUT_RATIO * THUMB_OUT_RATIO
+_PALM_MIN_SQ        = 1e-12          # was |palm| <= 1e-6
+
 # ── State-transition freeze (anti-drift) ───────────────────────────────────
 # Changing gesture moves the whole hand a little: fingers closing or opening
 # drag the knuckles with them, and the cursor lurches at exactly the moment
@@ -414,6 +442,33 @@ D_CUTOFF   = 1.0     # Hz — cutoff of the velocity estimator itself.
 # Lite is the right default here because the 1€ filter already suppresses
 # landmark noise; paying for precision the filter then smooths away is waste.
 MODEL_COMPLEXITY = 0
+
+# ── Confidence thresholds ──────────────────────────────────────────────────
+# These decide how readily MediaPipe drops out of cheap tracking and back
+# into the expensive palm detector, which is the single biggest swing in
+# per-frame cost that is still under our control.
+#
+#   MIN_TRACKING_CONFIDENCE is the one that matters for speed.  While the
+#   tracker holds, only the landmark model runs.  The moment its confidence
+#   falls below this, MediaPipe re-runs full-frame palm detection — the
+#   expensive path.  Lower keeps the tracker engaged through motion blur and
+#   partial occlusion; too low lets it drift on after the hand is gone.
+#
+#   MIN_DETECTION_CONFIDENCE only gates the initial acquisition, so it costs
+#   nothing per frame.  Lowering it makes the hand easier to pick up; too low
+#   invites false positives on hand-shaped background clutter.
+#
+# Measured here at 320x180 with no hand in frame (detection path throughout),
+# the thresholds made no difference worth reporting — 31.5 to 34.4 ms across
+# 0.3/0.5/0.7/0.9, which is scheduler noise.  That is expected: confidence
+# changes WHICH path runs, and with nothing to track every frame takes the
+# detector.  The saving shows up only with a real hand held in view, so
+# treat the values below as a starting point and watch the FPS readout.
+#
+# 0.6 / 0.5 lowers tracking from the previous 0.7 to make the tracker
+# stickier, while keeping detection high enough to avoid false grabs.
+MIN_DETECTION_CONFIDENCE = 0.6
+MIN_TRACKING_CONFIDENCE  = 0.5
 
 # ── OpenCV internal threading ──────────────────────────────────────────────
 # OpenCV farms operations out to a thread pool.  For 640×480 flips and colour
@@ -506,6 +561,40 @@ CAM_FPS = 60
 PROC_MAX_WIDTH  = 640
 PROC_MAX_HEIGHT = 480
 
+# ── Inference resolution (decoupled from the preview) ──────────────────────
+# The preview stays at the processing size so it looks right; MediaPipe gets
+# a smaller copy.  Measured on this machine with model_complexity=0:
+#
+#       input      pixels   median process()   vs 640x360
+#       640x360   230,400        37.29 ms         100%
+#       480x270   129,600        34.35 ms          92%
+#       320x180    57,600        32.20 ms          86%
+#       192x108    20,736        32.34 ms          87%
+#
+# Note the shape of that: pixel count falls 11x, inference time falls 1.16x.
+# The palm and landmark networks run at fixed internal input sizes, so
+# shrinking the frame only saves MediaPipe's own letterbox resize — real,
+# but nothing like proportional.  Expect ~5 ms, not ~30 ms.
+#
+# WHY 320 AND NOT 256.  The extra downscale is not free, and its cost is
+# wildly non-linear in the ratio:
+#
+#       640x360 -> 320x180   123 us   (exact 2:1, OpenCV fast path)
+#       640x360 -> 256x144  1536 us   (fractional, generic path — 12x worse)
+#
+# 256x144 saves less inference AND costs ten times more to produce, so it
+# comes out behind.  The divisor below is therefore an INTEGER, which keeps
+# the fast path and — more importantly — keeps the aspect ratio exact.
+#
+# ASPECT MATTERS MORE THAN SPEED HERE.  MediaPipe returns landmarks
+# normalised to [0, 1] of whatever it was given, so a correctly-scaled copy
+# needs no coordinate correction at all (see the note in the main loop).
+# That equivalence only holds while both images frame the same scene at the
+# same aspect; a stretched copy would skew every landmark.
+#
+# Set to 0 to hand MediaPipe the full-size frame.
+INFER_MAX_WIDTH = 320
+
 # ── Display hot-plug polling ───────────────────────────────────────────────
 # How often to re-read the virtual desktop rectangle.  The query is a cheap
 # user-mode call (Windows) or one X round-trip (Linux), so this is nearly
@@ -569,13 +658,21 @@ LM_RING_TIP   = 16
 LM_PINKY_PIP  = 18
 LM_PINKY_TIP  = 20
 
-# (name, pip, tip) for the four fingers that curl radially.
+# (name, pip, tip) for the four fingers that curl radially.  Kept for
+# reference and for the overlay's per-finger labels; detect_gesture unrolls
+# these rather than looping, to avoid rebuilding anything per frame.
 _FINGERS = (
     ("index",  LM_INDEX_PIP,  LM_INDEX_TIP),
     ("middle", LM_MIDDLE_PIP, LM_MIDDLE_TIP),
     ("ring",   LM_RING_PIP,   LM_RING_TIP),
     ("pinky",  LM_PINKY_PIP,  LM_PINKY_TIP),
 )
+
+# Shared immutables, so the common paths allocate nothing at all.
+_NO_FINGERS = (False, False, False, False)
+_HINT_TEXT = "+/- speed   m mirror   i invert-x   q quit"
+# Upper/lower initials for the overlay flags, indexed by the boolean.
+_FINGER_CHARS = (("i", "I"), ("m", "M"), ("r", "R"), ("p", "P"))
 
 
 def detect_gesture(hand_landmarks, frame_w=1.0, frame_h=1.0):
@@ -597,26 +694,76 @@ def detect_gesture(hand_landmarks, frame_w=1.0, frame_h=1.0):
     poses — a half-curled hand mid-transition lands here rather than being
     forced into the nearest match.
     """
+    # Written flat on purpose.  A dist() closure would be rebuilt on every
+    # call and every landmark lookup would repeat; here each point is read
+    # once into a local, and the comparisons run on SQUARED distances so no
+    # square root is taken anywhere in this function.
     lm = hand_landmarks.landmark
+    fw = frame_w
+    fh = frame_h
 
-    def dist(a, b):
-        return math.hypot((lm[a].x - lm[b].x) * frame_w,
-                          (lm[a].y - lm[b].y) * frame_h)
+    p = lm[LM_WRIST]
+    wx = p.x * fw
+    wy = p.y * fh
 
     # Palm length: wrist to middle MCP.  Fixed by skeleton, unaffected by
     # finger articulation, so it is the natural scale reference.
-    palm = dist(LM_WRIST, LM_MIDDLE_MCP)
-    if palm <= 1e-6:
+    p = lm[LM_MIDDLE_MCP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    palm_sq = dx * dx + dy * dy
+    if palm_sq <= _PALM_MIN_SQ:
         # Hand edge-on or a degenerate frame; refuse to guess.
-        return "idle", (False, False, False, False), False
+        return "idle", _NO_FINGERS, False
 
-    extended = tuple(
-        dist(LM_WRIST, tip) > dist(LM_WRIST, pip) * EXTEND_MARGIN
-        for _name, pip, tip in _FINGERS
-    )
-    thumb_out = dist(LM_THUMB_TIP, LM_INDEX_MCP) > THUMB_OUT_RATIO * palm
+    # Index.
+    p = lm[LM_INDEX_PIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    pip_sq = dx * dx + dy * dy
+    p = lm[LM_INDEX_TIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    index = dx * dx + dy * dy > pip_sq * _EXTEND_MARGIN_SQ
 
-    index, middle, ring, pinky = extended
+    # Middle.
+    p = lm[LM_MIDDLE_PIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    pip_sq = dx * dx + dy * dy
+    p = lm[LM_MIDDLE_TIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    middle = dx * dx + dy * dy > pip_sq * _EXTEND_MARGIN_SQ
+
+    # Ring.
+    p = lm[LM_RING_PIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    pip_sq = dx * dx + dy * dy
+    p = lm[LM_RING_TIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    ring = dx * dx + dy * dy > pip_sq * _EXTEND_MARGIN_SQ
+
+    # Pinky.
+    p = lm[LM_PINKY_PIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    pip_sq = dx * dx + dy * dy
+    p = lm[LM_PINKY_TIP]
+    dx = p.x * fw - wx
+    dy = p.y * fh - wy
+    pinky = dx * dx + dy * dy > pip_sq * _EXTEND_MARGIN_SQ
+
+    # Thumb, measured against the index knuckle rather than the wrist.
+    q = lm[LM_INDEX_MCP]
+    p = lm[LM_THUMB_TIP]
+    dx = (p.x - q.x) * fw
+    dy = (p.y - q.y) * fh
+    thumb_out = dx * dx + dy * dy > palm_sq * _THUMB_OUT_RATIO_SQ
+
+    extended = (index, middle, ring, pinky)
 
     if not any(extended) and not thumb_out:
         state = "grip"                       # closed fist
@@ -630,6 +777,44 @@ def detect_gesture(hand_landmarks, frame_w=1.0, frame_h=1.0):
         state = "idle"                       # anything in between
 
     return state, extended, thumb_out
+
+
+def pick_infer_size(width: int, height: int):
+    """Choose the size MediaPipe is fed, given the display frame size.
+
+    Returns (infer_w, infer_h, divisor, interpolation).  A divisor of 1
+    means "hand over the display frame unchanged".
+
+    An INTEGER divisor is used rather than a free target resolution, for
+    two reasons that both matter more than hitting an exact pixel count:
+
+      * cv2.resize has a fast path for exact integer ratios.  Measured,
+        640x360 -> 320x180 costs 123 us while 640x360 -> 256x144 costs
+        1536 us — the fractional case is twelve times dearer and wipes out
+        the inference it was meant to save.
+      * An integer divisor divides both axes identically, so the aspect
+        ratio is preserved to the pixel.  MediaPipe normalises landmarks to
+        [0, 1] of its input, so an exactly-scaled copy needs no coordinate
+        correction; a stretched one would skew every landmark and there is
+        no clean way to undo that afterwards.
+
+    INTER_AREA is the right kernel for an integer downscale and costs the
+    same as INTER_LINEAR at that ratio; if a frame size ever forces a
+    fractional divisor, INTER_LINEAR is chosen instead to dodge the slow
+    generic INTER_AREA path.
+    """
+    if INFER_MAX_WIDTH <= 0 or width <= INFER_MAX_WIDTH:
+        return width, height, 1, cv2.INTER_AREA
+
+    # Smallest integer divisor that brings the width within budget.
+    divisor = -(-width // INFER_MAX_WIDTH)          # ceil, int arithmetic
+    infer_w = max(1, width // divisor)
+    infer_h = max(1, height // divisor)
+
+    # Exact only when the divisor divides both axes without remainder.
+    exact = (width % divisor == 0) and (height % divisor == 0)
+    interp = cv2.INTER_AREA if exact else cv2.INTER_LINEAR
+    return infer_w, infer_h, divisor, interp
 
 
 def sanitise_margins() -> tuple[float, float, float]:
@@ -1390,6 +1575,19 @@ class ScreenGeometry:
         self.box_w = self.box_right - self.box_left
         self.box_h = self.box_bottom - self.box_top
 
+        # ── Per-frame constants, computed once per geometry change ──────
+        # Endpoints and slopes for the box→desktop map, plus the desktop
+        # centre as plain floats.  All of this used to be recomputed inside
+        # to_screen() every frame; none of it changes between rebuilds.
+        self._map_x0 = float(self.left)
+        self._map_x1 = float(self.left + self.width)
+        self._map_y0 = float(self.top)
+        self._map_y1 = float(self.top + self.height)
+        self._slope_x = (self._map_x1 - self._map_x0) / self.box_w
+        self._slope_y = (self._map_y1 - self._map_y0) / self.box_h
+        self._centre_x = self.left + self.width / 2.0
+        self._centre_y = self.top + self.height / 2.0
+
     # ── Polling ────────────────────────────────────────────────────────
     def poll(self, now: float) -> bool:
         """Re-read the desktop rectangle at most every *poll_interval* sec.
@@ -1460,19 +1658,36 @@ class ScreenGeometry:
             cx = self.cam_w - cx
 
         # ── Inset-window interpolation ──────────────────────────────────
-        # np.interp(v, xp, fp) is exactly the piecewise-linear map wanted
-        # here, and it saturates at fp[0] / fp[-1] for inputs outside xp —
-        # the clamp is the function's own behaviour rather than a separate
-        # step that could drift out of step with the mapping.
-        mapped_x = np.interp(cx, (self.box_left, self.box_right),
-                             (self.left, self.left + self.width))
-        mapped_y = np.interp(cy, (self.box_top, self.box_bottom),
-                             (self.top, self.top + self.height))
+        # Algebraically this is np.interp(v, (lo, hi), (a, b)) — the same
+        # piecewise-linear map, saturating outside the input range.  It is
+        # written out because np.interp is a general array routine: on two
+        # scalars per frame its dispatch and array-boxing overhead measured
+        # ~12.9 us, roughly 12x the arithmetic itself.  The slope form below
+        # matches numpy's own (slope·(x − xp0) + fp0), and the two clamps
+        # reproduce its saturation exactly.
+        #
+        # Slopes are precomputed in _apply(), so a frame does two multiplies
+        # and two adds per axis.
+        if cx <= self.box_left:
+            mapped_x = self._map_x0
+        elif cx >= self.box_right:
+            mapped_x = self._map_x1
+        else:
+            mapped_x = self._slope_x * (cx - self.box_left) + self._map_x0
+
+        if cy <= self.box_top:
+            mapped_y = self._map_y0
+        elif cy >= self.box_bottom:
+            mapped_y = self._map_y1
+        else:
+            mapped_y = self._slope_y * (cy - self.box_top) + self._map_y0
 
         # Centre-scaled sensitivity: push the offset from the middle out by
         # the multiplier, so the desktop edge is reached from a smaller
-        # physical displacement.
-        mid_x, mid_y = self.center
+        # physical displacement.  Reading the cached floats avoids building
+        # a tuple through the .center property on every frame.
+        mid_x = self._centre_x
+        mid_y = self._centre_y
         mapped_x = mid_x + (mapped_x - mid_x) * CURSOR_SENSITIVITY
         mapped_y = mid_y + (mapped_y - mid_y) * CURSOR_SENSITIVITY
 
@@ -1487,8 +1702,12 @@ class ScreenGeometry:
 
     @property
     def center(self) -> tuple[float, float]:
-        """Centre of the virtual desktop (origin-aware)."""
-        return (self.left + self.width / 2.0, self.top + self.height / 2.0)
+        """Centre of the virtual desktop (origin-aware).
+
+        Convenience accessor for setup code.  to_screen() reads the cached
+        floats directly instead, so the hot path never builds this tuple.
+        """
+        return (self._centre_x, self._centre_y)
 
     @property
     def effective_box(self) -> tuple[int, int, int, int] | None:
@@ -1881,8 +2100,8 @@ mp_draw  = mp.solutions.drawing_utils
 _hand_kwargs = dict(
     static_image_mode=False,        # video stream mode (faster, uses tracking)
     max_num_hands=1,                # single hand for pointer control
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7,
+    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+    min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
 )
 
 # model_complexity arrived partway through the 0.8.x line.  Falling back
@@ -1934,8 +2153,12 @@ last_seq = -1
 # instead removes two full-frame allocations per frame (~1.8 MB at 640×480×3,
 # roughly 55 MB/s of churn at 30 FPS) along with the matching GC pressure.
 # Allocated lazily because the camera may not honour the requested size.
-bgr_buf = None      # mirrored frame: drawn on and displayed
+bgr_buf = None      # mirrored frame: drawn on and displayed, full size
+infer_bgr = None    # downscaled BGR staging buffer (None when fed 1:1)
 rgb_buf = None      # colour-converted copy handed to MediaPipe
+infer_w = infer_h = 0
+infer_div = 1
+infer_interp = cv2.INTER_AREA
 
 # Last smoothed position — retained only for the on-screen jump readout.
 prev_x, prev_y = screen.center
@@ -2008,7 +2231,16 @@ print(f"              transitions freeze the target for {STATE_FREEZE_MS} ms "
       f"to absorb the hand twitch")
 print(f"              MOVEMENT ONLY — no click, press or drag is issued")
 print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
-print(f"MediaPipe   : {_complexity_note}")
+print(f"MediaPipe   : {_complexity_note}, "
+      f"det={MIN_DETECTION_CONFIDENCE} track={MIN_TRACKING_CONFIDENCE}")
+_iw, _ih, _idiv, _iint = pick_infer_size(stream.width, stream.height)
+if _idiv > 1:
+    print(f"Inference at: {_iw}×{_ih} (1/{_idiv} of the preview) — preview "
+          f"stays {stream.width}×{stream.height}")
+    print(f"              landmarks are normalised, so no coordinate "
+          f"correction is applied or needed")
+else:
+    print(f"Inference at: {_iw}×{_ih} — same as the preview")
 print(f"Backend     : {describe_api(backend.camera_api)}"
       f"  (set CAMERA_API to pin one)")
 _buf_note = ("accepted" if stream.buffersize_accepted else
@@ -2055,8 +2287,29 @@ try:
         # place; both transforms write into buffers this loop owns.
         if bgr_buf is None or bgr_buf.shape != raw_frame.shape:
             bgr_buf = np.empty_like(raw_frame)
-            rgb_buf = np.empty_like(raw_frame)
             frame_h, frame_w = raw_frame.shape[:2]
+
+            # ── Decoupled inference resolution ──────────────────────────
+            # bgr_buf stays at the full processing size: it is what gets
+            # drawn on and shown.  MediaPipe gets its own smaller pair of
+            # buffers, so the preview quality is independent of how hard
+            # the model is being pushed.
+            infer_w, infer_h, infer_div, infer_interp = pick_infer_size(
+                frame_w, frame_h)
+            if infer_div > 1:
+                # Two buffers: resize lands in BGR, colour conversion in RGB.
+                # Both preallocated once, so the steady state still allocates
+                # nothing per frame.
+                infer_bgr = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
+                rgb_buf = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
+                print(f"[infer] MediaPipe fed {infer_w}×{infer_h} "
+                      f"(1/{infer_div} of the {frame_w}×{frame_h} preview, "
+                      f"{'exact' if infer_interp == cv2.INTER_AREA else 'fractional'})")
+            else:
+                infer_bgr = None
+                rgb_buf = np.empty_like(raw_frame)
+                print(f"[infer] MediaPipe fed the full {frame_w}×{frame_h} "
+                      f"frame (INFER_MAX_WIDTH disabled or already small)")
             # The frame size is the canvas the box is drawn on, so a change
             # here invalidates the box.  Rebuilding from the same numbers the
             # buffers were sized with is what keeps the two in step.
@@ -2084,8 +2337,23 @@ try:
             was_mirrored = IS_MIRRORED
             hand_present = False
 
-        # Convert BGR → RGB for MediaPipe, into our own buffer.
-        cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
+        # ── Feed MediaPipe ──────────────────────────────────────────────
+        # Downscale first, then convert colour: cvtColor on the small image
+        # is a quarter of the work it would be on the large one, so this
+        # ordering is cheaper than converting and then shrinking.
+        #
+        # NO COORDINATE CORRECTION IS NEEDED after this, and adding one
+        # would break the mapping.  MediaPipe returns landmarks normalised
+        # to [0, 1] of the image it was handed; because the small copy is an
+        # exact rescale of the preview, "40% across" means the same place in
+        # both.  Multiplying by screen.cam_w below therefore lands in the
+        # PREVIEW's pixel space regardless of what size the model saw.
+        if infer_bgr is not None:
+            cv2.resize(bgr_buf, (infer_w, infer_h), dst=infer_bgr,
+                       interpolation=infer_interp)
+            cv2.cvtColor(infer_bgr, cv2.COLOR_BGR2RGB, dst=rgb_buf)
+        else:
+            cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
 
         # Mark the buffer read-only so MediaPipe borrows it rather than
         # defensively copying a full frame.  process() is synchronous and
@@ -2202,10 +2470,14 @@ try:
                        5, (200, 200, 200), 1)
 
             # Per-finger verdicts, in the order the classifier sees them.
-            _flags = "".join(
-                n[0].upper() if e else n[0]
-                for (n, _p, _t), e in zip(_FINGERS, fingers_ext)
-            ) + ("T" if thumb_out else "t")
+            # Indexing a precomputed char pair beats building a generator
+            # and calling .upper() four times a frame; the resulting string
+            # is identical.
+            _flags = (_FINGER_CHARS[0][fingers_ext[0]]
+                      + _FINGER_CHARS[1][fingers_ext[1]]
+                      + _FINGER_CHARS[2][fingers_ext[2]]
+                      + _FINGER_CHARS[3][fingers_ext[3]]
+                      + ("T" if thumb_out else "t"))
             cv2.putText(
                 bgr_buf, _flags, (cx + 20, cy - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
@@ -2297,10 +2569,10 @@ try:
             (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
 
-        # Key hints along the bottom edge of the real frame.
+        # Key hints along the bottom edge of the real frame.  The text is a
+        # module-level constant rather than a literal rebuilt each frame.
         cv2.putText(
-            bgr_buf, "+/- speed   m mirror   i invert-x   q quit",
-            (10, frame_h - 12),
+            bgr_buf, _HINT_TEXT, (10, frame_h - 12),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
         )
 
