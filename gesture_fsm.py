@@ -10,7 +10,6 @@ __all__ = [
     "NO_GESTURE",
     "GestureStabilizer",
     "MajorityStabilizer",
-    "ConsecutiveStabilizer",
     "GestureFSM",
     "normalise_gesture",
 ]
@@ -91,19 +90,6 @@ class MajorityStabilizer(GestureStabilizer):
         return label if count >= self._threshold else None
 
 
-class ConsecutiveStabilizer(GestureStabilizer):
-
-    def _resolve(self) -> str | None:
-        if len(self._window) < self._threshold:
-            return None
-        recent = list(self._window)[-self._threshold:]
-        first = recent[0]
-        for label in recent:
-            if label != first:
-                return None
-        return first
-
-
 class GestureFSM:
 
     def __init__(
@@ -121,7 +107,8 @@ class GestureFSM:
         if source == target:
             raise ValueError("click_transition endpoints must differ")
 
-        self._stabilizer = stabilizer if stabilizer is not None else MajorityStabilizer()
+        self._stabilizer = (stabilizer if stabilizer is not None
+                            else MajorityStabilizer())
         self._double_click_threshold = float(double_click_threshold)
         self._source_state = normalise_gesture(source)
         self._target_state = normalise_gesture(target)
@@ -205,12 +192,6 @@ class GestureFSM:
             return False
         elapsed = current_time - self._pending_click_time
         return 0.0 <= elapsed <= self._double_click_threshold
-
-    def time_remaining(self, current_time: float) -> float:
-        if self._pending_click_time is None:
-            return 0.0
-        remaining = self._double_click_threshold - (current_time - self._pending_click_time)
-        return remaining if remaining > 0.0 else 0.0
 
     def update(
         self, raw_gesture: str | None, current_time: float

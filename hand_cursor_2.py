@@ -1,297 +1,78 @@
 """
-Hand-Tracking Cursor Controller (v40 — FULL-FRAME VARIANT)
-==========================================================
-A/B variant of hand_cursor.py.  Everything is identical except what the
-gesture network is shown: this file hands YOLO the WHOLE preview frame,
-mirroring model/ptmodel.py, instead of a MediaPipe-derived hand crop.
-MediaPipe here drives only the 30 Hz geometric cursor.
+Hand-Tracking Cursor Controller
+===============================
+Moves the mouse by tracking the middle-finger knuckle (MediaPipe landmark 9)
+and drives clicks, drags and OS macros from hand pose.
 
-MEASURED ON ONE SYNTHETIC FRAME, and it favours the crop:
+Two perception paths, split by what each is good for:
 
-    input                verdict    score   latency
-    full 1280x720        four       0.857    43.2 ms
-    mediapipe crop       four       0.964    44.1 ms
+    geometry  (30 Hz)  -->  cursor movement, click, drag
+    YOLOv10n  (18 Hz)  -->  semantic labels, keyboard macros
 
-    hand pixels reaching the 640 input:
-       full frame     85 px hand ->  42 px  ( 7% of the input)
-       cropped        85 px hand -> 211 px  (33% of the input)
+    main loop  --frame.copy()-->  queue(maxsize=1)  -->  YoloWorker
+    main loop  <--get_nowait()--  queue(maxsize=8)  <--  results
 
-Same class either way, so the gap is confidence rather than a misread, and
-it tracks the pixel-density curve the rest of this project was tuned on.
-Latency is a wash — ultralytics letterboxes both to 640.
+Both hand-offs are non-blocking.  submit() replaces the pending frame rather
+than waiting for room, so the worker always classifies the freshest hand and
+stale frames are dropped.  Neither the 1 Euro filter nor cursor.move ever
+waits on inference.
 
-That measurement used one collage-like still, not a live webcam scene, and
-it cannot speak to how a real hand at a real distance behaves.  Hence this
-file: run both, watch the HUD, believe the camera over the note above.
+ANCHOR.  Landmark 9 (middle MCP), not landmark 8 (index tip).  A fingertip
+is the most mobile point on the hand, so anchoring there makes the cursor
+lurch whenever the pose changes.  The knuckle is carried by the palm, so it
+holds still while the fingers do the signalling.
 
-Everything below this point is unchanged from hand_cursor.py except the
-YOLO hand-off block and the removal of the crop helpers.
+GESTURE STATES.  detect_gesture() classifies point / peace / grip / open
+with idle as the fallback.  Arithmetic only: a finger counts as extended
+when its tip sits further from the wrist than its PIP joint does, which is
+self-normalising and needs no per-camera threshold and no classifier.  The
+thumb gets its own test because it folds across the palm rather than curling
+radially.
 
-Two perception paths, split by what each is good for.
+IDLE IS AN ABSTENTION, NOT A POSE, and this is the whole reason clicking
+works.  Curling from point to grip physically passes through a half-curled
+hand, which reads as idle.  The FSM fires only when the state immediately
+before the target was the source, so a stabilised idle in between silently
+becomes that predecessor and the click never comes.  Measured at 30 Hz with
+idle fed in, the click survives a 33 ms curl and dies at 66 ms — it never
+works for a real hand.  So idle never reaches the FSM.
 
-    geometry (30 Hz)  ──▶  cursor movement + clicking
-    YOLOv10n (4.7 Hz) ──▶  observation, reserved for semantic macros
+TRANSITION FREEZE.  Changing pose shifts the whole hand slightly, so every
+state change pins the target for STATE_FREEZE_MS.  The frozen point is fed
+THROUGH the 1 Euro filter rather than bypassing it, leaving the filter
+settled there so movement resumes by gliding rather than jumping.
 
-Clicking is latency-critical, so it runs on detect_gesture(), which costs
-microseconds and produces a verdict on every captured frame.  The transition
-"point" → "grip" fires LEFT_CLICK; repeating it inside 0.8 s fires
-DOUBLE_CLICK.  Measured end to end, the click lands 33 ms after the grip
-settles — against ~213 ms for a single network forward pass, before any
-stability window is applied.
+SMOOTHING is handled exclusively by a One Euro Filter (Casiez et al. 2012),
+which adapts its cutoff to hand speed: heavy smoothing at rest, light
+smoothing during fast swipes.
 
-The network stays running beside it, classifying the hand crop and logging
-what it sees, bound to no action.  Its 4.7 Hz is irrelevant for macros where
-a quarter-second of lag does not matter, and disqualifying for a click.
+DECOUPLED INFERENCE.  MediaPipe is fed a 1/N integer downscale of the
+preview while the display buffer stays full size.  The divisor is an integer
+so the rescale hits OpenCV's fast path and the aspect ratio survives
+exactly, which is what lets the normalised landmarks be used with no
+coordinate correction at all.
 
-ONE SUBTLETY, and it is the whole reason this works.  detect_gesture()
-returns "idle" for any half-curled hand, and curling from point to grip
-physically passes through one.  The FSM fires only when the state
-immediately before the target was the source, so a stabilised "idle" in
-between silently becomes that predecessor and the click never comes.  At
-30 Hz with "idle" fed in, the click survives a 33 ms curl and dies at 66 ms
-— it never works for a real hand.  So "idle" is treated as the classifier
-abstaining, not as a pose, and never reaches the FSM.  Widening the
-stability window to 500 ms fixes it too, at the cost of a 500 ms click.
+MAPPING.  The active box is the frame inset by MARGIN_X / MARGIN_TOP /
+MARGIN_BOTTOM, mapped onto the whole virtual desktop and rebuilt on the fly
+when a display is plugged, unplugged or rearranged.  The vertical margins
+are asymmetric because a hand raises well above shoulder height but stops
+against the desk going down.
 
-Arbitration itself lives in gesture_fsm.py, which is import-only here: the
-vocabulary, window and thresholds are all passed in from this file.
+OUTPUT goes through pynput, with a ctypes path as fallback.  On Windows
+pynput's position setter IS user32.SetCursorPos; measured side by side on a
+3840x1080 dual desktop the two agreed exactly at every corner.
 
-v31 added the threaded YOLO branch, and the design is about keeping the two
-paths from touching.
-
-YOLOv10n (the .pt, through ultralytics) classifies the hand crop into
-HaGRIDv2's 34 gestures.  v38 moved off the ONNX export and cv2.dnn, which
-was both slower and less accurate on identical crops — 554.7 ms against
-55.1 ms warm, and losing detections outright.  At ~18 Hz the branch is
-still well under the cursor loop's 30, so it keeps its own thread:
-
-    main loop  ──crop.copy()──▶  queue(maxsize=1)  ──▶  YoloWorker
-    main loop  ◀──get_nowait()──  queue(maxsize=8)  ◀──  GestureFSM
-
-Both hand-offs are non-blocking.  submit() replaces the pending crop rather
-than waiting for room, so the worker always classifies the freshest hand it
-can and stale crops are dropped — 27% of them now, against 83% on the ONNX
-path.  Worst measured submit() latency is 6.2 ms against the live model;
-poll() on an empty queue is 2.4 µs.  Neither the 1€ filter nor cursor.move
-ever waits on inference.
-
-ultralytics is imported on the WORKER THREAD, not at module scope: the
-import alone costs 10.8 s (it pulls in torch and torchvision) and the model
-a further 0.4 s.  Startup is therefore instant and the branch reports
-"loading" for about eleven seconds before its first prediction.
-
-The crop is copied because bgr_buf is preallocated and rewritten in place
-every frame; handing the worker a view would let it read pixels being
-overwritten mid-forward.
-
-Gesture→click arbitration lives in gesture_fsm.py, which the worker owns
-and the main thread never touches except through request_reset().  At
-4.7 Hz the FSM's stability window counts YOLO frames, not camera frames, so
-the window is 3-deep/2-threshold and the double-click span is 1.2 s — the
-module's own 0.4 s default is physically unreachable at this rate.
-
-The branch fails soft at every step.  A missing model file, a missing
-gesture_fsm.py, an absent ultralytics or a model that will not load leaves
-the worker parked and the cursor path completely unchanged.
-
-v29 separates what MediaPipe sees from what the preview shows, and trims
-the per-frame Python maths.
-
-Inference is fed a 1/N integer downscale of the preview (320×180 by
-default) while bgr_buf stays full size for display.  Measured here, that is
-worth about 5 ms: 37.3 ms → 32.2 ms.  Not more, because the palm and
-landmark networks run at fixed internal input sizes — an 11× drop in pixels
-bought a 1.16× drop in time.  The divisor is an integer so the rescale hits
-OpenCV's fast path (123 µs, against 1536 µs for a fractional ratio) and so
-the aspect ratio survives exactly, which is what lets the normalised
-landmarks be used with no coordinate correction at all.
-
-Also in v29: detect_gesture compares squared distances and reads each
-landmark once (no sqrt, no per-call closure), and to_screen replaces
-np.interp with the same arithmetic written out — np.interp's array dispatch
-cost 12× the maths it performed on two scalars.  Both were verified against
-the previous implementations for bit-identical output.
-
-
-Moves the mouse cursor by tracking the middle-finger knuckle (MediaPipe
-landmark 9) and reports a gesture state read from finger geometry.
-
-There is exactly one click site in this file, driven by the geometric FSM.
-No press, release or drag is issued anywhere.
-
-v28 changes two things and they work together.
-
-ANCHOR.  Tracking moved from landmark 8 (index tip) to landmark 9 (middle
-MCP).  A fingertip is the most mobile point on the hand — every gesture
-moves it by definition — so anchoring there means the cursor lurches
-whenever the pose changes.  The MCP knuckle is carried by the palm rather
-than the finger, so it holds still while the fingers do the signalling.
-Landmark 8 is still read, but only as gesture input.
-
-STATE MACHINE.  detect_gesture() classifies point / peace / grip / open,
-with idle as the fallback for anything in between.  It is arithmetic only:
-a finger counts as extended when its tip sits further from the wrist than
-its PIP joint does, which is self-normalising and needs no palm divisor,
-no threshold tuning per camera, and no classifier.  The thumb gets its own
-test because it folds across the palm instead of curling radially.
-
-TRANSITION FREEZE.  Changing pose still shifts the hand slightly, so every
-state change pins the target for STATE_FREEZE_MS and then releases it.  The
-frozen point is fed through the 1€ filter rather than bypassing it, leaving
-the filter settled there so movement resumes by gliding rather than jumping.
-
-Smoothing is handled *exclusively* by a One Euro Filter (Casiez et al. 2012),
-which adapts its cutoff frequency to hand speed: heavy smoothing at rest,
-light smoothing during fast swipes.  Movement only — no click gestures.
-
-The active box maps onto the whole virtual desktop (all monitors combined)
-and is rebuilt on the fly when a display is plugged, unplugged or rearranged.
-
-v26 routes the pointer through pynput, with the ctypes path kept as a
-fallback.  pynput gives one API across Windows and Linux and a clean click
-interface for gesture work — mouse.click(Button.left, 1) — which in raw
-ctypes means mouse_event/SendInput on Windows and XTest on X11.
-
-It does not change multi-monitor reach, and it is worth being precise about
-why: on Windows pynput's position setter IS user32.SetCursorPos, the same
-call this script has always made.  Measured side by side on a 3840×1080
-dual desktop, the two agreed exactly at every corner including (3839, 1079).
-The boundary bug worth avoiding is pyautogui's — it clamps to the primary
-display and cannot address negative coordinates — and pyautogui has never
-been in this file.
-
-v25 splits the vertical margin in two.  A hand raises well above shoulder
-height but stops against the desk or the chest going down, so a symmetric
-window wasted travel at the top and ran out before the bottom — the taskbar
-was simply out of reach.  MARGIN_TOP (0.10) and MARGIN_BOTTOM (0.28) put the
-live band at 10%–72% down the frame, so the screen bottom now arrives where
-the arm actually gets to.  The window sits in the upper part of the frame,
-which also means a hand resting at chest height already sits near the bottom
-of the screen instead of the middle.
-
-v24 adds a tkinter screen probe as a portable fallback, and widens the
-horizontal margin to 0.15.
-
-The probe reads the VIRTUAL ROOT, not winfo_screenwidth().  Measured on a
-dual-monitor Windows desktop, winfo_screenwidth() reported 1536×864 — the
-primary display alone, DPI-scaled — where winfo_vrootwidth() reported the
-true 3840×1080.  Sizing from the former would silently amputate the second
-monitor.  Native ctypes stays the preferred source because it alone reports
-a negative origin and a monitor count, and is cheap enough to re-read every
-poll (which is what makes hot-plug detection work); tkinter takes over only
-if that fails, and is cached because building a Tk root per poll would cost
-far more than it returns.
-
-ctypes itself is standard library and stays for one job the standard
-library cannot otherwise do: moving the cursor.  tkinter has no mouse API.
-
-v23 stops forcing DirectShow.  DSHOW was pinned for its low latency, which
-suits physical webcams and breaks some virtual ones: it would open the
-DroidCam port, report success, then return empty frames forever — a black
-preview at 0 FPS.  Captures now pass the index alone and let OpenCV pick a
-backend that the driver actually registered with.  MSMF is slower to first
-frame than DSHOW was, so the scan and the stream's open both retry more
-patiently; MSMF also ignores CAP_PROP_BUFFERSIZE, which costs nothing here
-because the capture thread already drops unclaimed frames itself.
-CAMERA_API can pin a backend again if one is ever needed.
-
-v22 puts mirroring on the 'm' key.  Front-facing webcams are normally shown
-mirrored (some drivers pre-mirror the feed themselves); rear-facing phone
-cameras are not, and the wrong choice sends the cursor backwards.  Because
-MediaPipe reads the very buffer that is displayed, flipping the picture
-flips the control direction with it — so the toggle needs to touch only
-cv2.flip, and the two can never disagree.  Flipping the frame *and*
-separately inverting the maths would cancel out and leave 'm' doing nothing
-but restyling the preview.  INVERT_CURSOR_X survives on 'i' as the
-independent control-only trim, for a driver that mirrors internally.
-
-v21 drops the aspect lock and builds the active box straight from the
-margins in NORMALISED landmark coordinates, mapping it onto the virtual
-desktop with np.interp (which saturates outside its input range, so the
-clamp is the interpolation's own behaviour).
-
-The v20 box was locked to the desktop aspect ratio, which on a 3.56:1
-virtual screen left a 640×360 frame with a box only 146 px tall — trimmed
-by the margins to a 111 px strip, 31% of the frame height.  All vertical
-steering had to happen inside that band.  The box is now 76%×76% of the
-frame, about 2.5× the vertical room.
-
-The cost is that gain is no longer isotropic: mapping a 16:9 frame onto a
-3.56:1 desktop gives roughly twice the horizontal gain as vertical, so a
-diagonal sweep no longer traces a straight diagonal.  The startup banner
-prints the measured ratio and the MARGIN_Y that would rebalance it.
-
-v20 insets the active region.  Reaching a corner used to mean pushing the
-fingertip to the very perimeter of the tracking box — exactly where it is
-half out of frame and MediaPipe is least confident.  MARGIN_X / MARGIN_Y now
-reserve a band on each side, and the window inside them is what spans the
-desktop, so the edges arrive early and the outer band pins the cursor to the
-boundary.  The margins compose with CURSOR_SENSITIVITY rather than replacing
-it: effective gain is SENSITIVITY / (1 − 2·MARGIN).
-
-v19 makes the horizontal control direction a flag.  The frame is mirrored
-with cv2.flip before MediaPipe sees it, so a plain webcam already maps the
-right way — but a source that mirrors somewhere in its own pipeline cancels
-that flip and reverses the cursor.  INVERT_CURSOR_X reflects the hand inside
-the active box, on the control path only: the preview stays mirrored and the
-fingertip marker stays on the fingertip.
-
-v18 caps the size frames are processed at.  A phone driver ignores the
-requested 640×480 and sends 1080p, which costs 6.75× the inference work and
-opens a preview window larger than the desktop — Windows then clips it, so
-the right and bottom of the overlay simply are not on screen.  The capture
-thread now downscales oversized frames before publishing them, so nothing
-downstream ever sees the large image.  It is a resize, not a crop: the whole
-field of view survives.  The budget is a bounding box rather than a fixed
-size, because forcing 16:9 into a literal 640×480 would squash the hand by a
-third — a 1080p feed becomes 640×360.
-
-v17 stops assuming the camera delivers 640×480.  The active box was computed
-from that constant while the preview buffers were sized from the real frame,
-so a 1280×720 phone feed drew the box into the top-left quadrant and scaled
-the fingertip to half its true position.  The frame size is now measured from
-the first frame WebcamStream receives, owned by ScreenGeometry, and rebuilt
-if it ever changes.  The dead zones scale with resolution too, so the box
-covers the same relative region on a 4:3 laptop sensor and a 16:9 phone.
-
-v16 stops treating the camera scan as authoritative.  A phone-backed driver
-such as DroidCam can need several hundred milliseconds to produce its first
-frame, so a fast probe reports it as absent — and v15 would then conclude
-"only one camera exists" and start on the built-in webcam without asking.
-
-The scan is now slow enough to give those drivers a chance (repeated read
-attempts, a settle pause after each release) and prints its verdict per
-index.  More importantly it no longer decides anything: the prompt always
-appears, and any index in 0..CAM_MANUAL_MAX can be typed whether or not the
-scan confirmed it.  A bare Enter takes the highest detected index.
-
-v14 trimmed resource use and dropped the Windows-only assumption:
-
-  * model_complexity=0 pins MediaPipe to the "Lite" landmark graph.
-  * The per-frame flip and BGR→RGB conversion now write into two preallocated
-    buffers instead of allocating fresh arrays every frame.  At 640×480×3
-    that is ~1.8 MB/frame of allocation churn removed, ~55 MB/s at 30 FPS.
-  * The RGB buffer is marked non-writeable around hands.process() so
-    MediaPipe borrows it instead of copying, then marked writeable again —
-    which is mandatory here, since the next frame reuses that same buffer.
-  * All OS-specific calls sit behind a small backend object, so the same
-    file runs on Windows (user32) and Linux/X11 (libX11) with nothing but
-    ctypes underneath.
-
-v13 made CURSOR_SENSITIVITY adjustable at runtime, clamped to [1.0, 3.0].
-v12 added the centre-scaled sensitivity math inside ScreenGeometry.
-v11 attacked input lag: filter tuning, zero frame buffering, and skipping
-redundant inference on frames already processed.
-v9 removed the blocking sub-frame interpolation that made fast motion worse.
+FAIL SOFT.  A missing model, an absent ultralytics, a missing gesture_fsm.py
+or an unavailable keyboard leaves that feature off and the cursor path
+completely unchanged.
 
 Controls:  + / =  raise sensitivity      - / _  lower sensitivity
            m      mirror on/off (picture AND control direction)
            i      invert X, control only (picture unchanged)
            q      quit
 
-Dependencies:  pip install opencv-python mediapipe==0.8.11
+Dependencies:  pip install opencv-python mediapipe numpy pynput ultralytics
 Platform:      Windows (user32) and Linux/X11 (libX11)
-Python:        3.8 – 3.10  (mediapipe 0.8.11 ships no cp311 wheels)
 """
 
 # PEP 604 unions (`float | None`) are evaluated at def-time on Python < 3.10
@@ -299,6 +80,7 @@ Python:        3.8 – 3.10  (mediapipe 0.8.11 ships no cp311 wheels)
 # 3.8/3.9 half of the supported range importable.
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import math
 import os
@@ -399,8 +181,8 @@ CURSOR_SENSITIVITY = 1.4
 # The window is 62% of the frame height and sits in its UPPER portion, so
 # resting the hand at chest height already puts the cursor near the bottom
 # of the screen rather than in the middle.
-MARGIN_X      = 0.20
-MARGIN_TOP    = 0.10
+MARGIN_X = 0.20
+MARGIN_TOP = 0.10
 MARGIN_BOTTOM = 0.28
 
 # ── Mirroring — the 'm' key ────────────────────────────────────────────────
@@ -453,7 +235,7 @@ INVERT_CURSOR_X = True
 # ACROSS the palm, ending up near the index knuckle without its distance
 # from the wrist changing much.  So it is measured against the index MCP
 # and scaled by palm length, which is what makes that threshold portable.
-EXTEND_MARGIN   = 1.05   # slack on the tip-vs-pip comparison
+EXTEND_MARGIN = 1.05   # slack on the tip-vs-pip comparison
 THUMB_OUT_RATIO = 0.60   # |thumb4 − indexMCP5| / palm, above which it is out
 
 # Both tests compare one distance against another, and a square root is
@@ -461,9 +243,9 @@ THUMB_OUT_RATIO = 0.60   # |thumb4 − indexMCP5| / palm, above which it is out
 # sqrt dropped.  Squaring the thresholds once here keeps the comparisons
 # algebraically identical:
 #       a > b·k        ⇔   a² > b²·k²          (a, b, k ≥ 0)
-_EXTEND_MARGIN_SQ   = EXTEND_MARGIN * EXTEND_MARGIN
+_EXTEND_MARGIN_SQ = EXTEND_MARGIN * EXTEND_MARGIN
 _THUMB_OUT_RATIO_SQ = THUMB_OUT_RATIO * THUMB_OUT_RATIO
-_PALM_MIN_SQ        = 1e-12          # was |palm| <= 1e-6
+_PALM_MIN_SQ = 1e-12          # was |palm| <= 1e-6
 
 # ── State-transition freeze (anti-drift) ───────────────────────────────────
 # Changing gesture moves the whole hand a little: fingers closing or opening
@@ -476,14 +258,28 @@ _PALM_MIN_SQ        = 1e-12          # was |palm| <= 1e-6
 # an intentional move right after a transition does not feel blocked.
 STATE_FREEZE_MS = 75
 
-SENS_STEP = 0.1    # increment per keypress
-SENS_MIN  = 1.0    # floor: plain absolute mapping, the entire box is live.
-                   # Below 1.0 the mapping would shrink the reachable area to
-                   # a sub-region of the desktop and strand the screen edges
-                   # — never useful here, so the range excludes it outright.
-SENS_MAX  = 3.0    # ceiling: only 1/3 of the box still reaches an edge.
-                   # Beyond this the live region gets too small to aim
-                   # inside, and key auto-repeat would otherwise run away.
+# MediaPipe prints a TFLite banner and two absl warnings while its graph
+# builds.  They are harmless and unactionable, and they are the only thing
+# this program writes to stderr that it did not choose to write.  Set False
+# to see them again — worth doing if MediaPipe ever fails to initialise,
+# since a real error would arrive by the same route.
+SUPPRESS_NATIVE_WARNINGS = True
+
+# Size of the throwaway frame used to build the graph at startup.  Any size
+# works: landmarks come back normalised and the result is discarded.
+INFER_WARMUP_W = 320
+INFER_WARMUP_H = 180
+
+SENS_STEP = 0.1
+
+# Floor: plain absolute mapping, the entire box live.  Below 1.0 the mapping
+# would shrink the reachable area to a sub-region of the desktop and strand
+# the screen edges — never useful, so the range excludes it outright.
+SENS_MIN = 1.0
+
+# Ceiling: only 1/3 of the box still reaches an edge.  Beyond this the live
+# region gets too small to aim inside, and key auto-repeat would run away.
+SENS_MAX = 3.0
 
 # ── One Euro Filter: MIN_CUTOFF and BETA ───────────────────────────────────
 # These two decide how the cursor feels.  The filter's smoothing factor is
@@ -539,8 +335,8 @@ SENS_MAX  = 3.0    # ceiling: only 1/3 of the box still reaches an edge.
 # Tune in steps of ~0.1 for MIN_CUTOFF and ~0.005 for BETA, one at a time.
 
 MIN_CUTOFF = 1.0     # Hz — cutoff at rest.  Higher = snappier, more jitter.
-BETA       = 0.015   # speed coefficient.  Higher = less trailing when moving.
-D_CUTOFF   = 1.0     # Hz — cutoff of the velocity estimator itself.
+BETA = 0.015   # speed coefficient.  Higher = less trailing when moving.
+D_CUTOFF = 1.0     # Hz — cutoff of the velocity estimator itself.
 
 # ── MediaPipe inference cost ───────────────────────────────────────────────
 # Inference is the single largest CPU consumer in this pipeline, larger than
@@ -576,67 +372,29 @@ MODEL_COMPLEXITY = 0
 # 0.6 / 0.5 lowers tracking from the previous 0.7 to make the tracker
 # stickier, while keeping detection high enough to avoid false grabs.
 MIN_DETECTION_CONFIDENCE = 0.6
-MIN_TRACKING_CONFIDENCE  = 0.5
+MIN_TRACKING_CONFIDENCE = 0.5
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  YOLO GESTURE BRANCH  (background thread — never blocks the cursor)
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Measured on this machine, a warm cv2.dnn forward through
-# YOLOv10n_gestures.onnx costs 213 ms — about 4.7 Hz, against a MediaPipe
-# frame of roughly 32 ms.  Running it inline would drop the cursor from
-# ~30 FPS to under 5.  It therefore lives on its own thread, fed by a
-# depth-1 queue that always holds the NEWEST crop: when the worker is busy
-# the main loop overwrites the pending item and moves on, so roughly five in
-# six crops are discarded by design and nothing ever waits.
-#
-# The export has a FIXED 640x640 input.  320 and 224 both fail inside the
-# PSA attention block (Reshape assertion), so YOLO_INPUT_SIZE is not a free
-# parameter for this file.
-#
-# TIMING NOTE ON THE FSM.  The stability buffer counts YOLO frames, not
-# camera frames, so its window is measured in units of 213 ms.  A 5-deep
-# window needing 3 matches would take ~640 ms just to accept one state, and
-# a two-transition double-click could not physically complete inside the
-# 0.4 s default the module ships with.  The values below are sized for the
-# real inference rate: a shallower buffer, and a double-click window wide
-# enough to actually be reachable.
+# The whole preview frame goes to the network, exactly as model/ptmodel.py
+# feeds it; ultralytics letterboxes it to the model's input size.  Measured
+# warm, a forward pass costs 55 ms — about 18 Hz, against a MediaPipe frame
+# of roughly 32 ms.  Running it inline would still halve the cursor rate, so
+# it lives on its own thread fed by a depth-1 queue that always holds the
+# NEWEST frame: when the worker is busy the main loop overwrites the pending
+# item and moves on, so nothing ever waits.
 YOLO_ENABLED = True
-# The .pt through ultralytics, not the .onnx through cv2.dnn.  Measured
-# head to head on identical crops, the native path is both more accurate and
-# faster — the ONNX export was losing detections outright:
-#
-#     crop        cv2.dnn .onnx        ultralytics .pt
-#     full        three   0.555        palm     0.882
-#     centre      rock    0.937        three2   0.964
-#     quarter     four    0.803        four     0.960
-#
-#     latency     554.7 ms (1.8 Hz)    202.0 ms CPU (5.0 Hz)
-#                                       37.8 ms CUDA (26.5 Hz)
-#
-# This does mean torch is now a runtime dependency, which the README's
-# "OpenCV DNN, no PyTorch" claim no longer describes.
 YOLO_MODEL_PATH = os.path.join("model", "YOLOv10n_gestures.pt")
 YOLO_INPUT_SIZE = 640
 
 # "auto" lets ultralytics choose, which picks CUDA when torch can see a GPU.
-# Worth leaving alone: on this machine CUDA is 5.3× faster than CPU and
-# takes the branch from 5 Hz to 26 Hz, close enough to camera rate that the
-# semantic path stops feeling like a separate, laggy system.  Force with
-# "cpu" or 0 if the GPU is needed elsewhere.
+# Worth leaving alone: on this machine CUDA is 5.3× faster than CPU, close
+# enough to camera rate that the semantic path stops feeling like a separate,
+# laggy system.  Force with "cpu" or 0 if the GPU is needed elsewhere.
 YOLO_DEVICE = "auto"
 YOLO_SCORE_THRESHOLD = 0.35
-
-# YOLO_BOX_PADDING and YOLO_MIN_CROP are gone with the crop helpers: this
-# variant never builds a box, so there is nothing for them to size.  They
-# are still in hand_cursor.py, which is the file to edit if the A/B goes the
-# other way.
-#
-# Worth keeping in mind while comparing: the crop existed to hold the hand's
-# share of the 640 input roughly constant whatever the distance.  A full
-# frame gives that up — the further away the hand, the fewer pixels of it
-# survive the letterbox — so expect the gap between the two files to widen
-# as you move back from the camera, and to close as you lean in.
 
 # Diagnostic: dump what the network is actually being shown.  Written on the
 # worker thread, never the cursor path.  Off by default — it is a JPEG
@@ -646,8 +404,8 @@ YOLO_DEBUG_CROP_PATH = "debug_crop.jpg"
 
 # Print every change in the YOLO label, so the "[yolo] a -> b" lines sit
 # alongside the "[gesture] a -> b" lines from the geometry classifier.  The
-# two are separate subsystems and only the YOLO one reaches the FSM; without
-# this line there is no way to tell them apart in the console.
+# two are separate subsystems and only the geometric one reaches the FSM;
+# without this line there is no way to tell them apart in the console.
 YOLO_LOG_CHANGES = True
 
 # ── Semantic macros: the YOLO branch's payload ─────────────────────────────
@@ -655,17 +413,17 @@ YOLO_LOG_CHANGES = True
 # on "show me the desktop" and disqualifying on a click, which is why these
 # hang off the network and the mouse hangs off the geometry.
 #
-# gesture label (post-alias) -> macro name in MacroDispatcher's table.
+# Keys are raw HaGRIDv2 class names, as reported by the model.
 YOLO_MACROS = {
     "timeout": "show_desktop",
 }
 
 # Two independent guards, because a cooldown alone does not do what it
-# sounds like.  At 4.7 Hz a 2 s cooldown still fires five times if the hand
-# is held up for ten seconds — it throttles the spam rather than stopping
-# it.  So the macro is EDGE-triggered: it fires on entering the gesture and
-# will not fire again until the label has been something else.  The cooldown
-# then remains as a backstop against a label flickering in and out.
+# sounds like.  At 18 Hz a 2 s cooldown still fires five times if the hand is
+# held up for ten seconds — it throttles the spam rather than stopping it.
+# So the macro is EDGE-triggered: it fires on entering the gesture and will
+# not fire again until the label has been something else.  The cooldown then
+# remains as a backstop against a label flickering in and out.
 YOLO_MACRO_COOLDOWN = 2.0
 
 # Macros are disruptive and irreversible in a way a click is not, so they
@@ -724,24 +482,9 @@ FSM_DOUBLE_CLICK_SECONDS = 0.8
 # version that keeps both.
 FSM_IGNORED_STATES = ("idle",)
 
-# Empty on purpose: this variant reports raw HaGRIDv2 labels, exactly as
-# model/ptmodel.py does, so the HUD and the log show the model's own verdict
-# rather than a translated one.
-#
-# The rename this used to perform is applied after the class id is resolved,
-# never to YOLO_CLASS_NAMES below — that tuple IS the training order and
-# index 5 must stay "three3" whatever anything is called.
-#
-# Nothing depends on the translation any more.  Clicking is driven by the
-# geometric classifier via FSM_CLICK_TRANSITION, not by YOLO, and YOLO_MACROS
-# is already keyed on a raw HaGRID name ("timeout").  What is lost is a
-# side effect: HaGRIDv2 ships "one"/"point" and "fist"/"grip" as separate
-# classes that look near-identical to a webcam, and folding each pair onto
-# one name stopped the model's frame-to-frame flipping between them from
-# splitting a single intent across two labels.  Expect that flicker to be
-# visible on the HUD here.
-YOLO_LABEL_ALIASES = {}
-
+# The training order.  Index 5 is "three3" whatever it gets called; the
+# worker prefers the model's own names when the export carries them and
+# falls back to this tuple otherwise.
 YOLO_CLASS_NAMES = (
     "grabbing", "grip", "holy", "point", "call", "three3", "timeout",
     "xsign", "hand_heart", "hand_heart2", "little_finger", "middle_finger",
@@ -750,8 +493,8 @@ YOLO_CLASS_NAMES = (
     "three", "three2", "two_up", "two_up_inverted", "three_gun",
     "thumb_index", "thumb_index2", "no_gesture",
 )
- 
- 
+
+
 # ── OpenCV internal threading ──────────────────────────────────────────────
 # OpenCV farms operations out to a thread pool.  For 640×480 flips and colour
 # conversions the pool's synchronisation overhead exceeds the work itself,
@@ -803,8 +546,8 @@ CAMERA_API = None
 # first frame than DSHOW was, so the same retry count bought fewer real
 # chances and a slow driver could go back to looking absent.
 CAM_SCAN_READ_TRIES = 5     # read attempts before writing an index off
-CAM_SCAN_READ_WAIT  = 0.12  # seconds between those attempts (warm-up)
-CAM_SCAN_SETTLE     = 0.1   # seconds after release, before the next index
+CAM_SCAN_READ_WAIT = 0.12  # seconds between those attempts (warm-up)
+CAM_SCAN_SETTLE = 0.1   # seconds after release, before the next index
 
 # The scan is a hint, not the truth — a driver that was still waking up can
 # be typed in by hand even though it never answered.  This bounds what the
@@ -845,11 +588,10 @@ CAM_FPS = 60
 # its cost does not move at all.  What this buys is real sensor detail —
 # measured, the hand carries 1.50× the genuine pixels at every distance.
 #
-# It matters MORE in this variant than in hand_cursor.py.  There the crop
-# held the hand's share of the 640 input roughly fixed, so the extra pixels
-# were a bonus; here the whole frame is letterboxed into 640 and the hand
-# keeps only its own fraction of it, so sensor resolution is the only thing
-# standing between the model and a hand a few dozen pixels tall.
+# That matters here because the whole frame is letterboxed into the model's
+# input and the hand keeps only its own fraction of it, so sensor resolution
+# is the only thing standing between the model and a hand a few dozen pixels
+# tall.
 #
 # What it costs is the full-size work: flip, downscale and the frame copy go
 # from 258 µs to 2984 µs per frame — 8% of a 30 FPS budget, against the
@@ -858,7 +600,7 @@ CAM_FPS = 60
 #
 # Point 2 above still stands and is the reason not to go further: at 1080p
 # the preview window would exceed most desktops.
-PROC_MAX_WIDTH  = 1280
+PROC_MAX_WIDTH = 1280
 PROC_MAX_HEIGHT = 720
 
 # ── Inference resolution (decoupled from the preview) ──────────────────────
@@ -942,6 +684,41 @@ POLL_INTERVAL = 2.5   # seconds between display-geometry checks
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
+
+@contextlib.contextmanager
+def quiet_stderr(enabled: bool = SUPPRESS_NATIVE_WARNINGS):
+    """Silence writes to file descriptor 2 for the duration of the block.
+
+    MediaPipe's TFLite banner and absl warnings are emitted by C++ before
+    absl's logger is initialised — the "All log messages before
+    absl::InitializeLog()" line says so itself.  They therefore go straight
+    to fd 2, where nothing in Python can reach them: GLOG_minloglevel,
+    TF_CPP_MIN_LOG_LEVEL, absl.logging.set_verbosity and
+    warnings.filterwarnings were all measured here, and all four left the
+    output completely untouched.
+
+    Redirecting the descriptor is the only thing that works.  It is
+    deliberately scoped to one statement rather than the whole program: the
+    saved descriptor is restored in a finally, so a genuine error raised a
+    moment later still reaches the terminal.
+    """
+    if not enabled:
+        yield
+        return
+
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stderr.flush()
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved, 2)
+        os.close(devnull)
+        os.close(saved)
+
+
 def clamp(value: float, lo: float, hi: float) -> float:
     """Restrict *value* to the closed interval [lo, hi]."""
     return max(lo, min(hi, value))
@@ -970,18 +747,18 @@ PRIMARY_HAND_TRACKING = True
 # ── MediaPipe hand landmark indices ────────────────────────────────────────
 # Named rather than inlined: hand.landmark[14] is unreadable, and the tip /
 # pip / mcp distinction is the entire basis of the extension test below.
-LM_WRIST      = 0
-LM_THUMB_TIP  = 4
-LM_INDEX_MCP  = 5
-LM_INDEX_PIP  = 6
-LM_INDEX_TIP  = 8
+LM_WRIST = 0
+LM_THUMB_TIP = 4
+LM_INDEX_MCP = 5
+LM_INDEX_PIP = 6
+LM_INDEX_TIP = 8
 LM_MIDDLE_MCP = 9        # the cursor anchor — see ANCHOR note in the header
 LM_MIDDLE_PIP = 10
 LM_MIDDLE_TIP = 12
-LM_RING_PIP   = 14
-LM_RING_TIP   = 16
-LM_PINKY_PIP  = 18
-LM_PINKY_TIP  = 20
+LM_RING_PIP = 14
+LM_RING_TIP = 16
+LM_PINKY_PIP = 18
+LM_PINKY_TIP = 20
 
 # (name, pip, tip) for the four fingers that curl radially.  Kept for
 # reference and for the overlay's per-finger labels; detect_gesture unrolls
@@ -1263,7 +1040,9 @@ def open_capture(index: int, api=None):
     Every capture in this file goes through here so there is one place to
     change if a future driver needs pinning again.
     """
-    return cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
+    if api is None:
+        return cv2.VideoCapture(index)
+    return cv2.VideoCapture(index, api)
 
 
 def describe_api(api) -> str:
@@ -1332,7 +1111,8 @@ def scan_cameras(max_index: int = CAM_SCAN_MAX, api=None) -> dict:
                         found[index] = (real_w, real_h)
 
                         verdict = (f"OK — {real_w}×{real_h} "
-                                   f"on attempt {attempt}/{CAM_SCAN_READ_TRIES}")
+                                   f"on attempt {attempt}/"
+                                   f"{CAM_SCAN_READ_TRIES}")
                         if (claim_w, claim_h) != (real_w, real_h):
                             verdict += (f"  [driver reported "
                                         f"{claim_w}×{claim_h}]")
@@ -1390,11 +1170,14 @@ def choose_camera(available: list) -> int:
               "running but too slow to reply —")
         print("         if you know its index, type it anyway.")
 
-    print(f"         any index 0–{CAM_MANUAL_MAX} is accepted, detected or not.")
+    print(f"         any index 0–{CAM_MANUAL_MAX} is accepted, "
+          f"detected or not.")
 
     while True:
-        prompt = (f"         camera index [Enter = {best}]: " if best is not None
-                  else f"         camera index (0–{CAM_MANUAL_MAX}, no default): ")
+        prompt = (
+            f"         camera index [Enter = {best}]: "
+            if best is not None
+            else f"         camera index (0–{CAM_MANUAL_MAX}, no default): ")
         try:
             raw = input(prompt).strip()
         except EOFError:
@@ -1874,11 +1657,11 @@ class Win32Backend:
     # SM_CXSCREEN (0) / SM_CYSCREEN (1) describe the *primary* monitor only,
     # so a cursor driven from them could never leave display 1.  The
     # SM_*VIRTUALSCREEN family describes the rectangle enclosing ALL monitors.
-    SM_XVIRTUALSCREEN  = 76   # left edge of the virtual desktop
-    SM_YVIRTUALSCREEN  = 77   # top  edge of the virtual desktop
+    SM_XVIRTUALSCREEN = 76   # left edge of the virtual desktop
+    SM_YVIRTUALSCREEN = 77   # top  edge of the virtual desktop
     SM_CXVIRTUALSCREEN = 78   # total width
     SM_CYVIRTUALSCREEN = 79   # total height
-    SM_CMONITORS       = 80   # number of display monitors
+    SM_CMONITORS = 80   # number of display monitors
 
     name = "Windows / user32"
     camera_api = CAMERA_API         # None → OpenCV negotiates (see CAMERA_API)
@@ -2223,7 +2006,8 @@ class ScreenGeometry:
         # The monitor count is a native-only nicety; tkinter cannot report
         # it, so the banner just says 1 rather than guessing.
         try:
-            self.monitors = self._backend.monitor_count() if self._native_ok else 1
+            self.monitors = (self._backend.monitor_count()
+                             if self._native_ok else 1)
         except Exception:
             self.monitors = 1
         self.ratio = self.width / self.height
@@ -2235,9 +2019,9 @@ class ScreenGeometry:
         # feed both give a 76%×76% window at the default 0.12 margins.
         mx, mt, mb = sanitise_margins()
 
-        self.box_left   = int(round(mx * self.cam_w))
-        self.box_right  = int(round((1.0 - mx) * self.cam_w))
-        self.box_top    = int(round(mt * self.cam_h))
+        self.box_left = int(round(mx * self.cam_w))
+        self.box_right = int(round((1.0 - mx) * self.cam_w))
+        self.box_top = int(round(mt * self.cam_h))
         self.box_bottom = int(round((1.0 - mb) * self.cam_h))
 
         # A one-pixel frame, or margins rounding both edges together, must
@@ -2403,7 +2187,7 @@ class ScreenGeometry:
 
         live = 1.0 / CURSOR_SENSITIVITY
         mid_x = (self.box_left + self.box_right) / 2.0
-        mid_y = (self.box_top  + self.box_bottom) / 2.0
+        mid_y = (self.box_top + self.box_bottom) / 2.0
         half_w = (self.box_w * live) / 2.0
         half_h = (self.box_h * live) / 2.0
         return (int(mid_x - half_w), int(mid_y - half_h),
@@ -2411,7 +2195,8 @@ class ScreenGeometry:
 
     def describe(self) -> str:
         """One-line summary for the console banner / change notices."""
-        return (f"{self.width}×{self.height} px  origin ({self.left}, {self.top})  "
+        return (f"{self.width}×{self.height} px  "
+                f"origin ({self.left}, {self.top})  "
                 f"ratio {self.ratio:.3f}  monitors {self.monitors}  "
                 f"box {self.box_w}×{self.box_h}")
 
@@ -2453,7 +2238,8 @@ class WebcamStream:
 
     def __init__(self, index: int = 0, width: int = 640, height: int = 480,
                  fps: int = 60, api=None,
-                 proc_max: tuple[int, int] = (PROC_MAX_WIDTH, PROC_MAX_HEIGHT)):
+                 proc_max: tuple[int, int] = (PROC_MAX_WIDTH,
+                                              PROC_MAX_HEIGHT)):
         self._cap = open_capture(index, api)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -2461,7 +2247,8 @@ class WebcamStream:
 
         # Ask the backend to keep at most one frame queued.  Not all
         # backends implement this; keep the result so startup can say so.
-        self.buffersize_accepted = bool(self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1))
+        self.buffersize_accepted = bool(
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1))
 
         # Read one frame synchronously so _latest is never None.
         #
@@ -2496,7 +2283,8 @@ class WebcamStream:
         # silently refused the requested mode.
         self.native_height, self.native_width = frame.shape[:2]
         self.reported_width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        self.reported_height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        self.reported_height = int(
+            self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         self.size_mismatch = ((self.reported_width, self.reported_height)
                               != (self.native_width, self.native_height))
 
@@ -2522,7 +2310,8 @@ class WebcamStream:
         self._thread.start()
 
     @staticmethod
-    def _fit_within(w: int, h: int, budget: tuple[int, int]) -> tuple[int, int]:
+    def _fit_within(w: int, h: int,
+                    budget: tuple[int, int]) -> tuple[int, int]:
         """Largest size inside *budget* that keeps the source aspect ratio.
 
         Returns (w, h) unchanged when the frame already fits, or when the
@@ -2606,14 +2395,12 @@ class YoloWorker(threading.Thread):
                  fsm=None, name="YoloWorker",
                  debug_crop=YOLO_DEBUG_CROP,
                  debug_crop_path=YOLO_DEBUG_CROP_PATH,
-                 aliases=YOLO_LABEL_ALIASES,
                  log_changes=YOLO_LOG_CHANGES,
                  device=YOLO_DEVICE):
         super().__init__(name=name, daemon=True)
         self._log_changes = bool(log_changes)
         self._model_path = model_path
         self._class_names = tuple(class_names)
-        self._aliases = dict(aliases or {})
         self._input_size = int(input_size)
         self._score_threshold = float(score_threshold)
         self._debug_crop = bool(debug_crop)
@@ -2824,9 +2611,8 @@ class YoloWorker(threading.Thread):
                 pass
 
         # Ultralytics owns the whole preprocess: letterbox, BGR→RGB, the
-        # /255 scale and the NHWC→NCHW transpose all happen inside
-        # predict(), which is a large part of why it beats the hand-rolled
-        # blobFromImage path it replaced.  The crop goes in as raw BGR.
+        # /255 scale and the NHWC→NCHW transpose all happen inside predict().
+        # The frame goes in as raw BGR.
         started = time.perf_counter()
         results = self._net.predict(crop, imgsz=self._input_size,
                                     verbose=False, **self._predict_kwargs)
@@ -2847,8 +2633,7 @@ class YoloWorker(threading.Thread):
 
         class_id = int(boxes.cls[best])
         if 0 <= class_id < len(self._class_names):
-            name = self._class_names[class_id]
-            return self._aliases.get(name, name), score, latency_ms
+            return self._class_names[class_id], score, latency_ms
         return None, score, latency_ms
 
 
@@ -3046,15 +2831,18 @@ if stream.downscaled:
     print(f"[camera] native {stream.native_width}×{stream.native_height} "
           f"→ processing at {stream.width}×{stream.height} "
           f"({stream.scale:.2f}× scale, full field of view kept)")
-    print(f"         {(1 - (stream.width * stream.height) / (stream.native_width * stream.native_height)) * 100:.0f}% "
+    _kept = ((stream.width * stream.height)
+             / (stream.native_width * stream.native_height))
+    print(f"         {(1 - _kept) * 100:.0f}% "
           f"fewer pixels per frame for MediaPipe to chew through\n")
 else:
-    print(f"[camera] {stream.width}×{stream.height} native, no rescale needed\n")
+    print(f"[camera] {stream.width}×{stream.height} native, "
+          f"no rescale needed\n")
 
 # ─── MediaPipe setup ────────────────────────────────────────────────────────
 
 mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
+mp_draw = mp.solutions.drawing_utils
 
 _hand_kwargs = dict(
     static_image_mode=False,        # video stream mode (faster, uses tracking)
@@ -3066,12 +2854,30 @@ _hand_kwargs = dict(
 # model_complexity arrived partway through the 0.8.x line.  Falling back
 # rather than crashing keeps every 0.8.x build usable; on 0.8.11 the Lite
 # graph is selected normally.
-try:
-    hands = mp_hands.Hands(model_complexity=MODEL_COMPLEXITY, **_hand_kwargs)
-    _complexity_note = f"model_complexity={MODEL_COMPLEXITY} (Lite)"
-except TypeError:
-    hands = mp_hands.Hands(**_hand_kwargs)
-    _complexity_note = "model_complexity unsupported by this build"
+#
+# Wrapped in quiet_stderr(): this is the ONE noisy moment in the program.
+# Four TFLite/absl lines are written straight to fd 2 by C++, and measured
+# here they appear during the FIRST process() call rather than the
+# constructor — MediaPipe's graph builds lazily on worker threads, so the
+# constructor returns before they are flushed.  Suppressing around the
+# constructor alone therefore does nothing; the warm-up call below is what
+# holds the window open long enough to catch them, deterministically.
+#
+# The warm-up earns its place anyway: it builds the graph here instead of
+# stalling the first real frame.  The frame size is arbitrary — landmarks
+# are normalised, and this result is discarded.
+#
+# The window closes before the YOLO worker exists, so no other thread's
+# output can be swallowed by it.
+with quiet_stderr():
+    try:
+        hands = mp_hands.Hands(model_complexity=MODEL_COMPLEXITY,
+                               **_hand_kwargs)
+        _complexity_note = f"model_complexity={MODEL_COMPLEXITY} (Lite)"
+    except TypeError:
+        hands = mp_hands.Hands(**_hand_kwargs)
+        _complexity_note = "model_complexity unsupported by this build"
+    hands.process(np.zeros((INFER_WARMUP_H, INFER_WARMUP_W, 3), np.uint8))
 
 # ─── YOLO gesture branch ────────────────────────────────────────────────────
 
@@ -3123,8 +2929,10 @@ else:
 screen = ScreenGeometry(backend, stream.width, stream.height, POLL_INTERVAL)
 
 # Create separate One Euro Filters for X and Y axes.
-_oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
-_oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA, d_cutoff=D_CUTOFF)
+_oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
+                       d_cutoff=D_CUTOFF)
+_oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
+                       d_cutoff=D_CUTOFF)
 
 # Tracks whether a hand was visible on the *previous* frame.  A False → True
 # transition means the hand just re-entered the frame, which is when the
@@ -3209,7 +3017,8 @@ print(f"Active box  : {screen.box_w} × {screen.box_h} px  "
 print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
       f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
 _mx, _mt, _mb = sanitise_margins()
-print(f"Edge margins: x {_mx:.0%} each side; y {_mt:.0%} top / {_mb:.0%} bottom")
+print(f"Edge margins: x {_mx:.0%} each side; "
+      f"y {_mt:.0%} top / {_mb:.0%} bottom")
 print(f"              → live band is x[{_mx:.0%}–{1 - _mx:.0%}] "
       f"y[{_mt:.0%}–{1 - _mb:.0%}] of the frame "
       f"({1 - 2 * _mx:.0%}×{1 - _mt - _mb:.0%})")
@@ -3275,8 +3084,10 @@ else:
 print(f"Backend     : {describe_api(backend.camera_api)}"
       f"  (set CAMERA_API to pin one)")
 _buf_note = ("accepted" if stream.buffersize_accepted else
-             "refused — harmless, the capture thread already drops stale frames")
-print(f"OpenCV      : {cv2.getNumThreads()} thread(s), buffersize=1 {_buf_note}")
+             "refused — harmless, the capture thread already drops "
+             "stale frames")
+print(f"OpenCV      : {cv2.getNumThreads()} thread(s), "
+      f"buffersize=1 {_buf_note}")
 print(f"Frame bufs  : preallocated (no per-frame flip/convert allocation)")
 print(f"Display poll: every {POLL_INTERVAL}s (hot-plug aware)")
 print("Controls    : '+'/'=' faster   '-'/'_' slower   'q' quit")
@@ -3333,9 +3144,11 @@ try:
                 # nothing per frame.
                 infer_bgr = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
                 rgb_buf = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
+                _infer_kind = ("exact" if infer_interp == cv2.INTER_AREA
+                               else "fractional")
                 print(f"[infer] MediaPipe fed {infer_w}×{infer_h} "
                       f"(1/{infer_div} of the {frame_w}×{frame_h} preview, "
-                      f"{'exact' if infer_interp == cv2.INTER_AREA else 'fractional'})")
+                      f"{_infer_kind})")
             else:
                 infer_bgr = None
                 rgb_buf = np.empty_like(raw_frame)
@@ -3349,7 +3162,8 @@ try:
                       f"box rebuilt to {screen.box_w}×{screen.box_h} "
                       f"at x[{screen.box_left}–{screen.box_right}] "
                       f"y[{screen.box_top}–{screen.box_bottom}]")
-                hand_present = False    # snap rather than glide into the new box
+                # Snap rather than glide into the new box.
+                hand_present = False
 
         # ── Mirror, or don't ────────────────────────────────────────────
         # This one buffer is both what gets displayed and what MediaPipe
@@ -3697,7 +3511,8 @@ try:
         if yolo_worker is not None:
             _yolo_gesture, _yolo_score, _yolo_ms = yolo_worker.current_state
             if not yolo_worker.ready:
-                _yolo_text = ("YOLO: loading..." if yolo_worker.load_error is None
+                _yolo_text = ("YOLO: loading..."
+                              if yolo_worker.load_error is None
                               else "YOLO: unavailable")
             elif _yolo_gesture is None:
                 _yolo_text = f"YOLO: none  {_yolo_ms:.0f}ms"
@@ -3712,7 +3527,8 @@ try:
                           and macros.last_macro is not None
                           and now_ts - macros.last_macro_time < 1.0)
             if _macro_hot:
-                _yolo_text = f"MACRO: {macros.last_macro}  ({macros.fired_count})"
+                _yolo_text = (f"MACRO: {macros.last_macro}  "
+                              f"({macros.fired_count})")
 
             cv2.putText(
                 bgr_buf, _yolo_text,
