@@ -1,6 +1,32 @@
 """
-Hand-Tracking Cursor Controller (v32 — Hybrid Perception)
-=========================================================
+Hand-Tracking Cursor Controller (v40 — FULL-FRAME VARIANT)
+==========================================================
+A/B variant of hand_cursor.py.  Everything is identical except what the
+gesture network is shown: this file hands YOLO the WHOLE preview frame,
+mirroring model/ptmodel.py, instead of a MediaPipe-derived hand crop.
+MediaPipe here drives only the 30 Hz geometric cursor.
+
+MEASURED ON ONE SYNTHETIC FRAME, and it favours the crop:
+
+    input                verdict    score   latency
+    full 1280x720        four       0.857    43.2 ms
+    mediapipe crop       four       0.964    44.1 ms
+
+    hand pixels reaching the 640 input:
+       full frame     85 px hand ->  42 px  ( 7% of the input)
+       cropped        85 px hand -> 211 px  (33% of the input)
+
+Same class either way, so the gap is confidence rather than a misread, and
+it tracks the pixel-density curve the rest of this project was tuned on.
+Latency is a wash — ultralytics letterboxes both to 640.
+
+That measurement used one collage-like still, not a live webcam scene, and
+it cannot speak to how a real hand at a real distance behaves.  Hence this
+file: run both, watch the HUD, believe the camera over the note above.
+
+Everything below this point is unchanged from hand_cursor.py except the
+YOLO hand-off block and the removal of the crop helpers.
+
 Two perception paths, split by what each is good for.
 
     geometry (30 Hz)  ──▶  cursor movement + clicking
@@ -600,16 +626,17 @@ YOLO_INPUT_SIZE = 640
 # "cpu" or 0 if the GPU is needed elsewhere.
 YOLO_DEVICE = "auto"
 YOLO_SCORE_THRESHOLD = 0.35
-YOLO_BOX_PADDING = 0.25
 
-# Smallest crop, in frame pixels, handed to the network.  A hand at normal
-# webcam distance measures ~215 px on a 640×480 feed, and this export's
-# confidence collapses below ~224: measured on one fixed pose, 320 px scored
-# 0.937, 224 px 0.881, 160 px 0.757 and 128 px 0.293 — under the threshold,
-# and the predicted class had already changed by 224.  Widening a small box
-# takes real pixels from the frame instead of interpolating them, which is
-# the only version of "more detail" that exists here.
-YOLO_MIN_CROP = 256
+# YOLO_BOX_PADDING and YOLO_MIN_CROP are gone with the crop helpers: this
+# variant never builds a box, so there is nothing for them to size.  They
+# are still in hand_cursor.py, which is the file to edit if the A/B goes the
+# other way.
+#
+# Worth keeping in mind while comparing: the crop existed to hold the hand's
+# share of the 640 input roughly constant whatever the distance.  A full
+# frame gives that up — the further away the hand, the fewer pixels of it
+# survive the letterbox — so expect the gap between the two files to widen
+# as you move back from the camera, and to close as you lean in.
 
 # Diagnostic: dump what the network is actually being shown.  Written on the
 # worker thread, never the cursor path.  Off by default — it is a JPEG
@@ -697,21 +724,23 @@ FSM_DOUBLE_CLICK_SECONDS = 0.8
 # version that keeps both.
 FSM_IGNORED_STATES = ("idle",)
 
-# The model speaks HaGRIDv2; the geometry classifier speaks point/peace/grip/
-# open.  Renaming the raw class list would break it — the tuple order below
-# IS the training order and index 5 must stay "three3" whatever we call it —
-# so the rename happens here, after the class id is resolved.
+# Empty on purpose: this variant reports raw HaGRIDv2 labels, exactly as
+# model/ptmodel.py does, so the HUD and the log show the model's own verdict
+# rather than a translated one.
 #
-# HaGRIDv2 ships "one" (index up) and "point" (index extended) as separate
-# classes, and likewise "fist" and "grip".  Each pair is near-identical to a
-# webcam, so the model flips between them frame to frame and a transition
-# rule naming only one of them misses about half its triggers.  Folding each
-# pair onto one name fixes that as a side effect: "one"→"point" merges with
-# the native "point", "fist"→"grip" with the native "grip".
-YOLO_LABEL_ALIASES = {
-    "one": "point",
-    "fist": "grip",
-}
+# The rename this used to perform is applied after the class id is resolved,
+# never to YOLO_CLASS_NAMES below — that tuple IS the training order and
+# index 5 must stay "three3" whatever anything is called.
+#
+# Nothing depends on the translation any more.  Clicking is driven by the
+# geometric classifier via FSM_CLICK_TRANSITION, not by YOLO, and YOLO_MACROS
+# is already keyed on a raw HaGRID name ("timeout").  What is lost is a
+# side effect: HaGRIDv2 ships "one"/"point" and "fist"/"grip" as separate
+# classes that look near-identical to a webcam, and folding each pair onto
+# one name stopped the model's frame-to-frame flipping between them from
+# splitting a single intent across two labels.  Expect that flicker to be
+# visible on the HUD here.
+YOLO_LABEL_ALIASES = {}
 
 YOLO_CLASS_NAMES = (
     "grabbing", "grip", "holy", "point", "call", "three3", "timeout",
@@ -812,12 +841,16 @@ CAM_FPS = 60
 # to 0 to disable downscaling entirely.
 # Raised to 720p for the gesture network.  Point 1 above no longer applies:
 # MediaPipe is fed a decoupled 320×180 either way (see pick_infer_size), so
-# its cost does not move at all.  What this buys is real sensor detail
-# behind the YOLO crop — measured, the hand carries 1.50× the genuine pixels
-# at every distance, and at 640×480 the YOLO_MIN_CROP floor was binding on
-# ordinary poses and diluting the hand's share of the 640×640 input.
+# its cost does not move at all.  What this buys is real sensor detail —
+# measured, the hand carries 1.50× the genuine pixels at every distance.
 #
-# What it costs is the full-size work: flip, downscale and crop together go
+# It matters MORE in this variant than in hand_cursor.py.  There the crop
+# held the hand's share of the 640 input roughly fixed, so the extra pixels
+# were a bonus; here the whole frame is letterboxed into 640 and the hand
+# keeps only its own fraction of it, so sensor resolution is the only thing
+# standing between the model and a hand a few dozen pixels tall.
+#
+# What it costs is the full-size work: flip, downscale and the frame copy go
 # from 258 µs to 2984 µs per frame — 8% of a 30 FPS budget, against the
 # ~32 ms MediaPipe still spends.  The 1280→320 downscale is 2496 µs of that
 # and is now the second-largest cost in the loop.
@@ -1084,24 +1117,6 @@ def _as_hand_list(hand_landmarks):
     return tuple(hand_landmarks)
 
 
-def _landmark_bounds(hand_landmarks, frame_w, frame_h):
-    """Tight pixel box enclosing every landmark of every hand given.
-
-    With one hand this is the box it always was.  With two it is the union,
-    which is what a two-handed gesture means to the network: `timeout` is
-    one hand across the other, and cropping to either alone shows it a
-    gesture that is not there.
-    """
-    hands = _as_hand_list(hand_landmarks)
-    if not hands:
-        return 0.0, 0.0, float(frame_w), float(frame_h)
-
-    xs = [p.x for hand in hands for p in hand.landmark]
-    ys = [p.y for hand in hands for p in hand.landmark]
-    return (min(xs) * frame_w, min(ys) * frame_h,
-            max(xs) * frame_w, max(ys) * frame_h)
-
-
 def pick_primary_hand(hands, previous_anchor=None):
     """The hand the cursor follows, chosen for continuity across frames.
 
@@ -1125,91 +1140,6 @@ def pick_primary_hand(hands, previous_anchor=None):
         if best_dist is None or dist < best_dist:
             best, best_dist = hand, dist
     return best
-
-
-def _pad_bounds(x0, y0, x1, y1, padding):
-    """Grow the box by *padding* of its own size on each side.
-
-    padding=0.25 adds 25% of the width left and right and 25% of the height
-    top and bottom, i.e. a 1.5× box — the context factor.
-    """
-    dx = (x1 - x0) * padding
-    dy = (y1 - y0) * padding
-    return x0 - dx, y0 - dy, x1 + dx, y1 + dy
-
-
-def _clamp_bounds(x0, y0, x1, y1, frame_w, frame_h):
-    """Trim the padded box to the frame before anything derives from it.
-
-    A hand at the edge is padded past the border; clamping here means the
-    box is then recentred on the part of the hand that actually exists
-    rather than on an extrapolated centre half outside the image.
-    """
-    return (max(0.0, x0), max(0.0, y0),
-            min(float(frame_w), x1), min(float(frame_h), y1))
-
-
-def _fit_box(x0, y0, x1, y1, frame_w, frame_h, square, min_size):
-    """Square the box, enforce the minimum, and translate it inside frame.
-
-    Translating rather than truncating is what keeps the box square when
-    the hand is near an edge: a truncated box gets stretched by
-    the preprocess and the hand arrives at the network distorted.  Size is
-    only sacrificed when the frame itself is smaller than the minimum.
-
-    Since v38 ultralytics letterboxes rather than stretching, so a
-    non-square crop is padded instead of skewed — but padding spends input
-    area on grey bars, so a square crop is still the one to want.
-    """
-    cx = (x0 + x1) * 0.5
-    cy = (y0 + y1) * 0.5
-    box_w = x1 - x0
-    box_h = y1 - y0
-    floor = float(min(min_size, frame_w, frame_h))
-
-    limit_w = float(frame_w)
-    limit_h = float(frame_h)
-
-    if square:
-        side = max(box_w, box_h, floor)
-        if side <= min(limit_w, limit_h):
-            box_w = box_h = side
-        else:
-            # A square can never be wider than the frame's short axis, so on
-            # a 16:9 feed a widely-separated pair of hands needs more width
-            # than squareness allows.  Measured, two hands more than 0.4 of
-            # the frame apart were being clipped — 329 px of hand lost at
-            # 0.7 separation, i.e. the gesture cropped out of its own crop.
-            #
-            # Containing the content wins.  ultralytics letterboxes the
-            # result, so a wide pair of hands arrives padded rather than
-            # skewed; either way an intact gesture beats a cropped one.
-            box_w = min(max(box_w, floor), limit_w)
-            box_h = min(max(box_h, floor), limit_h)
-    else:
-        box_w = min(max(box_w, floor), limit_w)
-        box_h = min(max(box_h, floor), limit_h)
-
-    left = min(max(0.0, cx - box_w * 0.5), frame_w - box_w)
-    top = min(max(0.0, cy - box_h * 0.5), frame_h - box_h)
-    return left, top, box_w, box_h
-
-
-def get_hand_bounding_box(hand_landmarks, frame_w, frame_h,
-                          padding=YOLO_BOX_PADDING, square=True,
-                          min_size=YOLO_MIN_CROP):
-    """Crop rectangle for the gesture network: pad, clamp, square, fit."""
-    bounds = _landmark_bounds(hand_landmarks, frame_w, frame_h)
-    bounds = _pad_bounds(*bounds, padding)
-    bounds = _clamp_bounds(*bounds, frame_w, frame_h)
-    left, top, box_w, box_h = _fit_box(*bounds, frame_w, frame_h,
-                                       square, min_size)
-
-    x0 = max(0, min(frame_w - 1, int(round(left))))
-    y0 = max(0, min(frame_h - 1, int(round(top))))
-    x1 = max(x0 + 1, min(frame_w, int(round(left + box_w))))
-    y1 = max(y0 + 1, min(frame_h, int(round(top + box_h))))
-    return x0, y0, x1, y1
 
 
 def pick_infer_size(width: int, height: int):
@@ -3500,13 +3430,13 @@ try:
             # bgr_buf is a preallocated buffer the next frame overwrites in
             # place, and handing the worker a view would let it read pixels
             # being rewritten mid-inference.
-            # The whole list goes in, not the primary hand: a two-handed
-            # gesture cropped to either hand alone is a different gesture.
+            # The whole frame, exactly as ptmodel.py feeds it.  Still copied:
+            # bgr_buf is a preallocated buffer the next frame overwrites in
+            # place, so a view would let the worker read pixels being
+            # rewritten mid-inference.  The copy is now full-size, which
+            # costs more than the old crop did — see the note in the header.
             if yolo_worker is not None:
-                yolo_x0, yolo_y0, yolo_x1, yolo_y1 = get_hand_bounding_box(
-                    detected_hands, frame_w, frame_h)
-                yolo_worker.submit(
-                    bgr_buf[yolo_y0:yolo_y1, yolo_x0:yolo_x1].copy())
+                yolo_worker.submit(bgr_buf.copy())
 
             # Clamp into the active box, map onto the virtual desktop, and
             # apply centre-scaled sensitivity — all inside to_screen().

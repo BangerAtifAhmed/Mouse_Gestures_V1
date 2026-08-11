@@ -1,0 +1,2 @@
+one → fist = LEFT_CLICK
+same transition again within 1.2 s = DOUBLE_CLICK
