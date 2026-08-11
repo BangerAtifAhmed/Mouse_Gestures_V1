@@ -750,7 +750,8 @@ YOLO_CLASS_NAMES = (
     "three", "three2", "two_up", "two_up_inverted", "three_gun",
     "thumb_index", "thumb_index2", "no_gesture",
 )
-
+ 
+ 
 # ── OpenCV internal threading ──────────────────────────────────────────────
 # OpenCV farms operations out to a thread pool.  For 640×480 flips and colour
 # conversions the pool's synchronisation overhead exceeds the work itself,
