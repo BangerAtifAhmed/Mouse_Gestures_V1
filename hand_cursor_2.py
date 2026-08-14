@@ -85,6 +85,7 @@ import ctypes
 import math
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -264,6 +265,10 @@ STATE_FREEZE_MS = 75
 # to see them again — worth doing if MediaPipe ever fails to initialise,
 # since a real error would arrive by the same route.
 SUPPRESS_NATIVE_WARNINGS = True
+
+# Launch system_monitor.py alongside the preview.  Set False to run without
+# it — the main script neither reads from it nor waits on it.
+SYSTEM_MONITOR_ENABLED = True
 
 # Size of the throwaway frame used to build the graph at startup.  Any size
 # works: landmarks come back normalised and the result is discarded.
@@ -2821,6 +2826,30 @@ else:
     stream = WebcamStream(camera_index, CAM_WIDTH, CAM_HEIGHT, CAM_FPS,
                           api=backend.camera_api)
 
+# ─── Resource monitor ───────────────────────────────────────────────────────
+# Launched here, where both the scanned and the pinned camera paths have
+# converged on a stream that really opened — so the window never appears for
+# a camera that then fails.
+#
+# Its own process, not a thread: GPUtil shells out to nvidia-smi, ~157 ms a
+# poll measured here, and Tk insists on owning the thread it was created on.
+# Neither belongs anywhere near the 30 Hz cursor loop.
+#
+# The path is resolved against this file rather than the working directory,
+# so launching from anywhere still finds the script.
+monitor_process = None
+if SYSTEM_MONITOR_ENABLED:
+    _monitor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "system_monitor.py")
+    try:
+        monitor_process = subprocess.Popen(
+            [sys.executable, _monitor_script, str(os.getpid())])
+        print(f"[monitor] resource window started (pid "
+              f"{monitor_process.pid}, watching {os.getpid()})")
+    except Exception as exc:
+        monitor_process = None
+        print(f"[monitor] could not start: {exc.__class__.__name__}: {exc}")
+
 # Rebind the camera constants to the size frames will REALLY have after any
 # downscale.  Nothing left in the file reads them for geometry — the box and
 # the landmark scaling both go through ScreenGeometry — but leaving them at
@@ -3574,6 +3603,20 @@ finally:
         print(f"[yolo] {yolo_worker.inference_count} inferences, "
               f"{yolo_worker.dropped_count} crops dropped, "
               f"observing only")
+    # The monitor is a child process, so it outlives us unless it is told
+    # otherwise — terminate then reap, with a kill as the backstop so a
+    # wedged Tk loop cannot leave a window on screen after we are gone.
+    if monitor_process is not None and monitor_process.poll() is None:
+        try:
+            monitor_process.terminate()
+            monitor_process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            monitor_process.kill()
+        except Exception as exc:
+            print(f"[monitor] could not stop: {exc.__class__.__name__}: {exc}")
+        else:
+            print("[monitor] resource window closed")
+
     cv2.destroyAllWindows()
     hands.close()
     cursor.close()
