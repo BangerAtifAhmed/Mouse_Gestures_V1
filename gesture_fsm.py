@@ -1,46 +1,220 @@
+"""Universal, config-driven gesture state machine.
+
+Nothing in this module knows the name of a single gesture.  Every pose,
+every transition and every action pairing arrives from gesture_config.json
+(or an equivalent dict), so adding a gesture to the vocabulary is a change
+to a JSON file and never a change to this file.  The engine's only
+assumptions are that gestures are strings and that time moves forward.
+
+The config it eats:
+
+    {
+      "settings": { ... optional tuning ... },
+      "transitions": [
+        {"from_state": "point", "to_state": "grip",
+         "action": "LEFT_CLICK", "max_time_sec": 0.8}
+      ],
+      "holds": [
+        {"pose": "timeout", "action": "SHOW_DESKTOP",
+         "hold_sec": 0.4, "cooldown_sec": 2.0}
+      ]
+    }
+
+Four failure modes drive the design, and each one is a separate mechanism
+rather than a knob on a shared one:
+
+  * A classifier that flickers for a frame must not break a chain, so raw
+    labels pass through a sliding-window majority vote before the rules
+    ever see them, and declared abstentions never enter the window at all.
+
+  * A held pose must not fire a macro thirty times a second, so holds are
+    edge-triggered — armed on entry, disarmed only by leaving the pose —
+    with a cooldown as a second, independent guard.
+
+  * Two deliberate single clicks must not merge into a double, and a
+    deliberate double must not arrive as two singles, so click timing is
+    discriminated explicitly rather than left to the OS.
+
+  * A mouse button held down outlives the process that pressed it.  Any
+    path that loses the hand, sees an unmapped pose, or simply runs out of
+    patience emits the matching DRAG_STOP rather than assuming one is
+    coming.
+"""
+
 from __future__ import annotations
 
+import json
+import os
 from collections import Counter, deque
 
 __all__ = [
-    "LEFT_CLICK",
-    "DOUBLE_CLICK",
-    "DRAG_START",
-    "DRAG_STOP",
+    # Action vocabulary
+    "LEFT_CLICK", "RIGHT_CLICK", "MIDDLE_CLICK", "DOUBLE_CLICK",
+    "DRAG_START", "DRAG_STOP", "SCROLL_UP", "SCROLL_DOWN",
+    "SHOW_DESKTOP", "TASK_VIEW", "MINIMISE_ALL", "LOCK_SCREEN",
+    "SWITCH_WINDOW", "CLOSE_WINDOW", "COPY", "PASTE", "SCREENSHOT",
+    "VOLUME_UP", "VOLUME_DOWN", "MUTE", "MEDIA_PLAY_PAUSE",
+    "KEYBOARD_MACRO",
+    "ACTIONS", "MOUSE_ACTIONS", "MACRO_ACTIONS", "ACTION_MACROS",
     "NO_GESTURE",
-    "GestureStabilizer",
-    "MajorityStabilizer",
-    "GestureFSM",
+    # Engine
+    "GestureStabilizer", "MajorityStabilizer",
+    "TransitionRule", "HoldRule", "ActionEvent",
+    "GestureFSM", "ActionExecutor",
+    # Config plumbing
+    "CONFIG_PATH", "DEFAULT_SETTINGS",
+    "SENSITIVITY_MIN", "SENSITIVITY_MAX", "SENSITIVITY_STEP",
+    "load_config", "save_config", "default_config", "fallback_config",
     "normalise_gesture",
 ]
 
+# ─── Action vocabulary ──────────────────────────────────────────────────────
+# Plain strings on purpose: they cross a JSON boundary in both directions
+# and appear verbatim in the GUI, so an enum would only add a translation
+# layer at every edge.
+
 LEFT_CLICK = "LEFT_CLICK"
+RIGHT_CLICK = "RIGHT_CLICK"
+MIDDLE_CLICK = "MIDDLE_CLICK"
 DOUBLE_CLICK = "DOUBLE_CLICK"
 DRAG_START = "DRAG_START"
 DRAG_STOP = "DRAG_STOP"
+SCROLL_UP = "SCROLL_UP"
+SCROLL_DOWN = "SCROLL_DOWN"
+
+SHOW_DESKTOP = "SHOW_DESKTOP"
+TASK_VIEW = "TASK_VIEW"
+MINIMISE_ALL = "MINIMISE_ALL"
+LOCK_SCREEN = "LOCK_SCREEN"
+SWITCH_WINDOW = "SWITCH_WINDOW"
+CLOSE_WINDOW = "CLOSE_WINDOW"
+COPY = "COPY"
+PASTE = "PASTE"
+SCREENSHOT = "SCREENSHOT"
+VOLUME_UP = "VOLUME_UP"
+VOLUME_DOWN = "VOLUME_DOWN"
+MUTE = "MUTE"
+MEDIA_PLAY_PAUSE = "MEDIA_PLAY_PAUSE"
+
+KEYBOARD_MACRO = "KEYBOARD_MACRO"
+
+# Mouse actions are the ones the cursor backend performs directly.
+MOUSE_ACTIONS = (
+    LEFT_CLICK, RIGHT_CLICK, MIDDLE_CLICK, DOUBLE_CLICK,
+    DRAG_START, DRAG_STOP, SCROLL_UP, SCROLL_DOWN,
+)
+
+# Named macros expand to a chord.  Keeping the expansion here rather than
+# in the executor means the GUI can show a user what a name will actually
+# press without importing pynput.
+ACTION_MACROS = {
+    SHOW_DESKTOP: "win+d",
+    TASK_VIEW: "win+tab",
+    MINIMISE_ALL: "win+m",
+    LOCK_SCREEN: "win+l",
+    SWITCH_WINDOW: "alt+tab",
+    CLOSE_WINDOW: "alt+f4",
+    COPY: "ctrl+c",
+    PASTE: "ctrl+v",
+    SCREENSHOT: "win+shift+s",
+    VOLUME_UP: "volume_up",
+    VOLUME_DOWN: "volume_down",
+    MUTE: "volume_mute",
+    MEDIA_PLAY_PAUSE: "media_play_pause",
+}
+
+MACRO_ACTIONS = tuple(ACTION_MACROS) + (KEYBOARD_MACRO,)
+
+ACTIONS = MOUSE_ACTIONS + MACRO_ACTIONS
+
+# The sentinel for "no gesture was supplied".  It is a real state as far as
+# the engine is concerned — losing the hand is exactly the event that has
+# to release a stuck drag — so it is not in the ignored list.
 NO_GESTURE = "none"
 
-DEFAULT_WINDOW_SIZE = 5
-DEFAULT_STABILITY_THRESHOLD = 3
-DEFAULT_DOUBLE_CLICK_THRESHOLD = 0.4
-DEFAULT_CLICK_TRANSITION = ("one", "fist")
-DEFAULT_DRAG_TRANSITION = None
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "gesture_config.json")
+
+DEFAULT_SETTINGS = {
+    # Sliding-window majority vote.  3/2 is 100 ms at 30 Hz and absorbs any
+    # single-frame misclassification; widen both together for a noisier
+    # classifier at the cost of latency on every rule.
+    "window_size": 3,
+    "stability_threshold": 2,
+
+    # Labels that mean "the classifier is abstaining", not "the hand is in
+    # this pose".  They never enter the vote and never become a state, so a
+    # half-curled hand between two poses cannot break a transition chain.
+    # Anything listed here is invisible to the rules.
+    "ignored_states": ["idle", ""],
+
+    # Two clicks closer together than this are one double-click; anything
+    # further apart is two singles.  0.8 s because a pose-cycle double is
+    # four stabilised poses and measures 0.20–0.67 s end to end.
+    "double_click_sec": 0.8,
+
+    # How far back a transition may look for its origin pose.  With this at
+    # 2 a chain tolerates exactly one unmapped pose in the middle, which is
+    # what a real hand produces when curling; raising it trades false
+    # negatives for false positives.
+    "transition_memory": 2,
+
+    # Failsafes.  A drag with no hand to steer it is released after this
+    # long, and no drag survives drag_timeout_sec whatever the hand does.
+    "stuck_release_sec": 0.5,
+    "drag_timeout_sec": 30.0,
+
+    # Applied to any rule that does not name its own.
+    "default_cooldown_sec": 0.35,
+    "default_hold_sec": 0.4,
+    "default_max_time_sec": 0.8,
+
+    # ── Cursor settings: read by hand_cursor_2.py, ignored by this engine ──
+    # They live here so one file is the whole configuration and the GUI has
+    # somewhere to put them; the FSM simply carries them through.
+    "cursor_sensitivity": 1.4,
+
+    # These two are the mirror pair, and only ONE may be on at a time.
+    # Mirroring the preview already puts the landmarks in display space, so
+    # reflecting the control maths as well cancels out and the cursor runs
+    # backwards under a picture that looks correct.
+    "is_mirrored": True,
+    "invert_cursor_x": False,
+}
+
+# Bounds the GUI enforces and hand_cursor clamps to.
+SENSITIVITY_MIN = 1.0
+SENSITIVITY_MAX = 3.0
+SENSITIVITY_STEP = 0.1
 
 
-def normalise_gesture(raw_gesture: str | None) -> str:
+def normalise_gesture(raw_gesture) -> str:
+    """Fold a classifier label into the form the rules are matched against."""
     if raw_gesture is None:
         return NO_GESTURE
     label = str(raw_gesture).strip().lower()
     return label if label else NO_GESTURE
 
 
-class GestureStabilizer:
+def _as_float(value, fallback: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return out if out == out else float(fallback)      # reject NaN
 
-    def __init__(
-        self,
-        window_size: int = DEFAULT_WINDOW_SIZE,
-        threshold: int = DEFAULT_STABILITY_THRESHOLD,
-    ) -> None:
+
+# ─── Stabiliser ─────────────────────────────────────────────────────────────
+
+class GestureStabilizer:
+    """Sliding window over raw labels.  Subclasses decide what 'stable' means.
+
+    The last stable verdict is retained when the window is inconclusive, so
+    a moment of genuine ambiguity holds the previous state rather than
+    dropping to None and re-arming every rule that was waiting on it.
+    """
+
+    def __init__(self, window_size: int = 3, threshold: int = 2) -> None:
         if window_size < 1:
             raise ValueError("window_size must be at least 1")
         if threshold < 1:
@@ -63,10 +237,10 @@ class GestureStabilizer:
         return tuple(self._window)
 
     @property
-    def stable(self) -> str | None:
+    def stable(self):
         return self._stable
 
-    def push(self, label: str) -> str | None:
+    def push(self, label: str):
         self._window.append(label)
         candidate = self._resolve()
         if candidate is not None:
@@ -77,181 +251,979 @@ class GestureStabilizer:
         self._window.clear()
         self._stable = None
 
-    def _resolve(self) -> str | None:
+    def _resolve(self):
         raise NotImplementedError
 
 
 class MajorityStabilizer(GestureStabilizer):
+    """Majority vote.  A label must win `threshold` of `window_size` frames."""
 
-    def _resolve(self) -> str | None:
+    def _resolve(self):
         if not self._window:
             return None
         label, count = Counter(self._window).most_common(1)[0]
         return label if count >= self._threshold else None
 
 
-class GestureFSM:
+# ─── Rules ──────────────────────────────────────────────────────────────────
 
-    def __init__(
-        self,
-        stabilizer: GestureStabilizer | None = None,
-        double_click_threshold: float = DEFAULT_DOUBLE_CLICK_THRESHOLD,
-        click_transition: tuple = DEFAULT_CLICK_TRANSITION,
-        drag_transition: tuple | None = DEFAULT_DRAG_TRANSITION,
-        drag_release: str | None = None,
-    ) -> None:
-        if double_click_threshold < 0.0:
-            raise ValueError("double_click_threshold must be non-negative")
+class _Rule:
+    """Fields shared by both trigger kinds."""
 
-        source, target = click_transition
-        if source == target:
-            raise ValueError("click_transition endpoints must differ")
+    __slots__ = ("id", "name", "enabled", "action", "keys",
+                 "cooldown_sec", "source")
 
-        self._stabilizer = (stabilizer if stabilizer is not None
-                            else MajorityStabilizer())
-        self._double_click_threshold = float(double_click_threshold)
-        self._source_state = normalise_gesture(source)
-        self._target_state = normalise_gesture(target)
+    def __init__(self, raw: dict, index: int, settings: dict) -> None:
+        self.id = str(raw.get("id") or f"rule-{index}")
+        self.enabled = bool(raw.get("enabled", True))
+        self.action = str(raw.get("action", "")).strip().upper()
+        if not self.action:
+            raise ValueError("rule has no action")
 
-        if drag_transition is None:
-            self._drag_source = None
-            self._drag_target = None
+        # Free-text chord, used when action is KEYBOARD_MACRO and ignored
+        # otherwise.  Named actions carry their own chord in ACTION_MACROS.
+        self.keys = str(raw.get("keys", "")).strip()
+        if self.action == KEYBOARD_MACRO and not self.keys:
+            raise ValueError("KEYBOARD_MACRO rule has no keys")
+
+        self.cooldown_sec = max(0.0, _as_float(
+            raw.get("cooldown_sec"), settings["default_cooldown_sec"]))
+
+        # Optional: which classifier a rule listens to.  Left at "any" the
+        # engine is fully source-agnostic, which is the documented default;
+        # a project running two classifiers at different rates can tag its
+        # rules and keep the two vocabularies from colliding.
+        self.source = str(raw.get("source", "any")).strip().lower() or "any"
+
+        # Filled in by _finalise(), which subclasses call once their own
+        # fields exist — _describe() reads them.
+        self.name = str(raw.get("name") or "")
+
+    def _finalise(self) -> None:
+        if not self.name:
+            self.name = self._describe()
+
+    def _describe(self) -> str:
+        return self.action
+
+    def accepts_source(self, source) -> bool:
+        return self.source == "any" or source is None or source == self.source
+
+    def to_dict(self) -> dict:
+        out = {
+            "id": self.id,
+            "name": self.name,
+            "enabled": self.enabled,
+            "action": self.action,
+            "cooldown_sec": round(self.cooldown_sec, 3),
+        }
+        if self.action == KEYBOARD_MACRO:
+            out["keys"] = self.keys
+        if self.source != "any":
+            out["source"] = self.source
+        return out
+
+
+class TransitionRule(_Rule):
+    """Fires when the stable pose becomes `to_state` having been `from_state`.
+
+    `max_time_sec` bounds the gap between the two, which is what separates
+    "the user curled point into grip" from "the user was pointing a minute
+    ago and has now closed their hand for an unrelated reason".
+    """
+
+    __slots__ = ("from_state", "to_state", "max_time_sec", "promote_double")
+
+    def __init__(self, raw: dict, index: int, settings: dict) -> None:
+        super().__init__(raw, index, settings)
+        self.from_state = normalise_gesture(raw.get("from_state"))
+        self.to_state = normalise_gesture(raw.get("to_state"))
+        if self.from_state == NO_GESTURE or self.to_state == NO_GESTURE:
+            raise ValueError("transition needs both from_state and to_state")
+        if self.from_state == self.to_state:
+            raise ValueError("transition endpoints must differ")
+
+        self.max_time_sec = max(0.0, _as_float(
+            raw.get("max_time_sec"), settings["default_max_time_sec"]))
+
+        # Opt-in: repeat the same trigger inside the double-click window and
+        # get one DOUBLE_CLICK instead of two LEFT_CLICKs.  Off by default,
+        # because a user who wants a double-click has a gesture for it.
+        self.promote_double = bool(raw.get("promote_double", False))
+        self._finalise()
+
+    def _describe(self) -> str:
+        return f"{self.from_state} → {self.to_state}"
+
+    def to_dict(self) -> dict:
+        out = super().to_dict()
+        out.update({
+            "trigger": "transition",
+            "from_state": self.from_state,
+            "to_state": self.to_state,
+            "max_time_sec": round(self.max_time_sec, 3),
+        })
+        if self.promote_double:
+            out["promote_double"] = True
+        return out
+
+
+class HoldRule(_Rule):
+    """Fires once when `pose` has been stable for `hold_sec`.
+
+    Edge-triggered: the rule arms on entering the pose, fires when the hold
+    matures, and cannot fire again until the pose has been something else.
+    `repeat` opts into level-triggering for the handful of actions that are
+    useless without it — scrolling, volume — and stays off for everything
+    else so a held hand cannot spam a macro.
+    """
+
+    __slots__ = ("pose", "hold_sec", "repeat", "repeat_sec")
+
+    def __init__(self, raw: dict, index: int, settings: dict) -> None:
+        super().__init__(raw, index, settings)
+        self.pose = normalise_gesture(raw.get("pose") or raw.get("state"))
+        if self.pose == NO_GESTURE:
+            raise ValueError("hold needs a pose")
+
+        # hold_ms is accepted because it is the natural unit in a GUI.
+        if raw.get("hold_ms") is not None:
+            self.hold_sec = max(0.0, _as_float(raw.get("hold_ms"), 0.0) / 1000.0)
         else:
-            drag_source, drag_target = drag_transition
-            if drag_source == drag_target:
-                raise ValueError("drag_transition endpoints must differ")
-            self._drag_source = normalise_gesture(drag_source)
-            self._drag_target = normalise_gesture(drag_target)
-            if (self._drag_source == self._source_state
-                    and self._drag_target == self._target_state):
-                raise ValueError(
-                    "click_transition and drag_transition are identical; "
-                    "the two would be indistinguishable"
-                )
+            self.hold_sec = max(0.0, _as_float(
+                raw.get("hold_sec"), settings["default_hold_sec"]))
 
-        self._drag_release = (None if drag_release is None
-                              else normalise_gesture(drag_release))
+        self.repeat = bool(raw.get("repeat", False))
+        self.repeat_sec = max(0.05, _as_float(raw.get("repeat_sec"), 0.25))
+        self._finalise()
 
-        self._previous_stable_state = None
-        self._current_stable_state = None
-        self._pending_click_time = None
-        self._is_dragging = False
-        self._click_count = 0
-        self._double_click_count = 0
-        self._drag_start_count = 0
-        self._drag_stop_count = 0
+    def _describe(self) -> str:
+        return f"hold {self.pose}"
+
+    def to_dict(self) -> dict:
+        out = super().to_dict()
+        out.update({
+            "trigger": "hold",
+            "pose": self.pose,
+            "hold_sec": round(self.hold_sec, 3),
+        })
+        if self.repeat:
+            out["repeat"] = True
+            out["repeat_sec"] = round(self.repeat_sec, 3)
+        return out
+
+
+# ─── Emitted events ─────────────────────────────────────────────────────────
+
+class ActionEvent(str):
+    """The action string, with the rule that produced it attached.
+
+    Subclassing str rather than wrapping it keeps every caller that only
+    wants the name working unchanged — `event == LEFT_CLICK`, `event in
+    MOUSE_ACTIONS` and f-string interpolation all behave — while an
+    executor that needs the chord can read `.keys` off the same object.
+    """
+
+    __slots__ = ("rule_id", "rule_name", "keys", "at")
+
+    def __new__(cls, action, rule_id=None, rule_name=None, keys="", at=0.0):
+        self = super().__new__(cls, action)
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        self.keys = keys or ACTION_MACROS.get(str(action), "")
+        self.at = float(at)
+        return self
 
     @property
-    def stabilizer(self) -> GestureStabilizer:
+    def action(self) -> str:
+        return str(self)
+
+    def __repr__(self) -> str:
+        return f"<ActionEvent {str(self)} from {self.rule_name!r}>"
+
+
+# ─── Config I/O ─────────────────────────────────────────────────────────────
+
+def default_config() -> dict:
+    """The bindings the GUI's "Load Defaults" button installs."""
+    return {
+        "version": 1,
+        "settings": dict(DEFAULT_SETTINGS),
+        "transitions": [
+            # The cooldown is the floor on how fast two clicks may arrive,
+            # so with promote_double on it must sit below a real double —
+            # a point→grip→point→grip cycle measures 0.20–0.67 s.  At 0.35
+            # the second click would be swallowed and the double could
+            # never happen.
+            {"id": "click", "name": "Left click",
+             "from_state": "point", "to_state": "grip",
+             "action": LEFT_CLICK, "max_time_sec": 0.8,
+             "cooldown_sec": 0.15, "promote_double": True},
+            {"id": "drag-on", "name": "Grab",
+             "from_state": "open", "to_state": "grip",
+             "action": DRAG_START, "max_time_sec": 0.8,
+             "cooldown_sec": 0.35},
+            {"id": "drag-off", "name": "Drop",
+             "from_state": "grip", "to_state": "open",
+             "action": DRAG_STOP, "max_time_sec": 0.0,
+             "cooldown_sec": 0.0},
+            {"id": "right-click", "name": "Right click",
+             "from_state": "peace", "to_state": "grip",
+             "action": RIGHT_CLICK, "max_time_sec": 0.8,
+             "cooldown_sec": 0.35},
+        ],
+        "holds": [
+            {"id": "desktop", "name": "Show desktop",
+             "pose": "timeout", "action": SHOW_DESKTOP,
+             "hold_sec": 0.4, "cooldown_sec": 2.0},
+        ],
+    }
+
+
+def fallback_config() -> dict:
+    """The minimum safe binding used when the config cannot be read.
+
+    Deliberately one rule.  A config that failed to parse is a config whose
+    contents are unknown, and quietly installing a large default scheme
+    would hand the user a set of bindings they never chose.
+    """
+    return {
+        "version": 1,
+        "settings": dict(DEFAULT_SETTINGS),
+        "transitions": [
+            # 0.15 for the same reason default_config() uses it: a cooldown
+            # above ~0.2 s outlasts a real double-click cycle and would stop
+            # promote_double from ever firing.
+            {"id": "fallback-click", "name": "Left click (fallback)",
+             "from_state": "point", "to_state": "grip",
+             "action": LEFT_CLICK, "max_time_sec": 0.8,
+             "cooldown_sec": 0.15, "promote_double": True},
+        ],
+        "holds": [],
+    }
+
+
+def load_config(path: str = CONFIG_PATH, *, quiet: bool = False) -> dict:
+    """Read a config, never raising.
+
+    Every failure downgrades to fallback_config() with a console warning:
+    a gesture controller that refuses to start because a JSON file has a
+    trailing comma is worse than one that starts with one known-good rule.
+    """
+    if not os.path.exists(path):
+        if not quiet:
+            print(f"[config] {os.path.basename(path)} not found — "
+                  f"falling back to point -> grip = LEFT_CLICK")
+        return fallback_config()
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        if not quiet:
+            print(f"[config] {os.path.basename(path)} unreadable ({exc}) — "
+                  f"falling back to point -> grip = LEFT_CLICK")
+        return fallback_config()
+
+    if not isinstance(data, dict):
+        if not quiet:
+            print(f"[config] {os.path.basename(path)} is not an object — "
+                  f"falling back to point -> grip = LEFT_CLICK")
+        return fallback_config()
+
+    data.setdefault("settings", {})
+    data.setdefault("transitions", [])
+    data.setdefault("holds", [])
+    return data
+
+
+def save_config(config: dict, path: str = CONFIG_PATH) -> None:
+    """Write atomically, so a crash mid-write cannot destroy the config."""
+    payload = json.dumps(config, indent=2, ensure_ascii=False)
+    temp = f"{path}.tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+# ─── The state machine ──────────────────────────────────────────────────────
+
+class GestureFSM:
+    """Turns a stream of gesture labels into a stream of action strings.
+
+    Feed it every frame:
+
+        action = fsm.update(label, time.perf_counter())
+        if action is not None:
+            executor.dispatch(action)
+
+    `update` returns at most one action per call.  When two rules mature on
+    the same frame the second is queued and returned on the next call — at
+    30 Hz that is a 33 ms deferral, and it keeps the contract to one
+    action per call rather than making every caller handle a list.
+    """
+
+    def __init__(self, config=None, stabilizer=None, **overrides) -> None:
+        if config is None:
+            config = load_config()
+        elif isinstance(config, str):
+            config = load_config(config)
+        elif not isinstance(config, dict):
+            raise TypeError("config must be a path, a dict, or None")
+
+        settings = dict(DEFAULT_SETTINGS)
+        settings.update(config.get("settings") or {})
+        settings.update(overrides)
+        self._settings = settings
+
+        self._ignored = frozenset(
+            normalise_gesture(s) for s in settings["ignored_states"]
+            if str(s).strip() != ""
+        ) | {""}
+
+        self._double_click_sec = max(0.0, _as_float(
+            settings["double_click_sec"], 0.8))
+        self._stuck_release_sec = max(0.0, _as_float(
+            settings["stuck_release_sec"], 0.5))
+        self._drag_timeout_sec = max(0.0, _as_float(
+            settings["drag_timeout_sec"], 30.0))
+
+        self._stabilizer = stabilizer or MajorityStabilizer(
+            int(settings["window_size"]), int(settings["stability_threshold"]))
+
+        raw_count = (len(config.get("transitions") or [])
+                     + len(config.get("holds") or [])
+                     + len(config.get("mappings") or []))
+        self._transitions, self._holds = self._compile(config, settings)
+
+        # A config that parses but yields nothing is as useless as one that
+        # did not parse at all, and far more confusing: the tracker starts,
+        # the cursor moves, and no gesture ever does anything.  Which of the
+        # two cases it is decides whether falling back is right.
+        if not self._transitions and not self._holds:
+            if raw_count:
+                print(f"[config] all {raw_count} rule(s) were unusable — "
+                      f"falling back to point -> grip = LEFT_CLICK")
+                self._transitions, self._holds = self._compile(
+                    fallback_config(), settings)
+            else:
+                print("[config] no bindings in gesture_config.json — the "
+                      "cursor will move but no gesture will act. Run "
+                      "app.py, press Load Defaults, then Save Config.")
+
+        # A rule cannot promote a double it is not allowed to fire.  The
+        # two guards are independently sensible and silently incompatible,
+        # so the conflict is reported rather than resolved behind the
+        # user's back — lowering the cooldown here would weaken the jitter
+        # protection they asked for.
+        for rule in self._transitions:
+            if rule.promote_double and \
+                    rule.cooldown_sec > self._double_click_sec * 0.25:
+                print(f"[config] '{rule.name}': a {rule.cooldown_sec:.2f}s "
+                      f"cooldown blocks the second click of a double "
+                      f"(window {self._double_click_sec:.2f}s). Lower it to "
+                      f"~{self._double_click_sec * 0.2:.2f}s or turn off "
+                      f"promote_double.")
+
+        # Every pose any rule mentions.  A stable pose outside this set is
+        # "unmapped", which is one of the conditions that releases a drag.
+        self._known = {r.from_state for r in self._transitions}
+        self._known |= {r.to_state for r in self._transitions}
+        self._known |= {r.pose for r in self._holds}
+
+        memory = max(2, int(_as_float(settings["transition_memory"], 2)) + 1)
+        self._recent = deque(maxlen=memory)
+
+        self._current = None
+        self._previous = None
+        self._entered_at = 0.0
+        self._queue = deque()
+
+        self._last_fired = {}          # rule id -> time
+        self._hold_armed = {}          # rule id -> time it fired
+        self._hold_next = {}           # rule id -> next repeat due
+        self._pending_click = {}       # rule id -> time of unmatched click
+
+        self._dragging = False
+        self._drag_rule = None
+        self._drag_started_at = 0.0
+        self._drag_lost_since = None
+
+        self.click_count = 0
+        self.double_click_count = 0
+        self.drag_start_count = 0
+        self.drag_stop_count = 0
+        self.macro_count = 0
+
+    # ── construction helpers ────────────────────────────────────────────
+
+    @classmethod
+    def from_config(cls, path: str = CONFIG_PATH, **kwargs) -> "GestureFSM":
+        return cls(load_config(path), **kwargs)
+
+    @staticmethod
+    def _compile(config: dict, settings: dict):
+        """Build rule objects, dropping the bad ones rather than the file.
+
+        One malformed rule in a hand-edited config should cost that rule
+        and nothing else — the user still gets the other fourteen bindings
+        they wrote, plus a line telling them which one to fix.
+        """
+        transitions, holds = [], []
+
+        raw_transitions = config.get("transitions") or []
+        raw_holds = config.get("holds") or []
+
+        # A single "mappings" list with a "trigger" discriminator is also
+        # accepted, because that is the shape a GUI naturally produces.
+        for entry in (config.get("mappings") or []):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("trigger", "")).lower() == "hold":
+                raw_holds = list(raw_holds) + [entry]
+            else:
+                raw_transitions = list(raw_transitions) + [entry]
+
+        for index, raw in enumerate(raw_transitions):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                rule = TransitionRule(raw, index, settings)
+            except (ValueError, TypeError) as exc:
+                print(f"[config] skipping transition #{index}: {exc}")
+                continue
+            if rule.enabled:
+                transitions.append(rule)
+
+        for index, raw in enumerate(raw_holds):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                rule = HoldRule(raw, index, settings)
+            except (ValueError, TypeError) as exc:
+                print(f"[config] skipping hold #{index}: {exc}")
+                continue
+            if rule.enabled:
+                holds.append(rule)
+
+        return transitions, holds
+
+    # ── introspection ───────────────────────────────────────────────────
+
+    @property
+    def stabilizer(self):
         return self._stabilizer
 
     @property
-    def previous_stable_state(self) -> str | None:
-        return self._previous_stable_state
+    def stable_gesture(self):
+        """What the engine currently believes, after the majority vote."""
+        return self._current
 
     @property
-    def current_stable_state(self) -> str | None:
-        return self._current_stable_state
-
-    @property
-    def double_click_threshold(self) -> float:
-        return self._double_click_threshold
-
-    @property
-    def click_transition(self) -> tuple:
-        return (self._source_state, self._target_state)
-
-    @property
-    def drag_transition(self) -> tuple | None:
-        if self._drag_source is None:
-            return None
-        return (self._drag_source, self._drag_target)
+    def previous_gesture(self):
+        return self._previous
 
     @property
     def is_dragging(self) -> bool:
-        return self._is_dragging
+        return self._dragging
 
     @property
-    def click_count(self) -> int:
-        return self._click_count
+    def rules(self) -> tuple:
+        return tuple(self._transitions) + tuple(self._holds)
 
-    @property
-    def double_click_count(self) -> int:
-        return self._double_click_count
+    def describe(self) -> str:
+        return (f"{len(self._transitions)} transition(s), "
+                f"{len(self._holds)} hold(s), "
+                f"{self._stabilizer.threshold}/{self._stabilizer.window_size} "
+                f"window")
 
-    @property
-    def drag_start_count(self) -> int:
-        return self._drag_start_count
+    # ── the loop entry point ────────────────────────────────────────────
 
-    @property
-    def drag_stop_count(self) -> int:
-        return self._drag_stop_count
+    def update(self, gesture, timestamp: float, source=None):
+        """One frame.  Returns an action string, or None.
 
-    def is_double_click_window_open(self, current_time: float) -> bool:
-        if self._pending_click_time is None:
-            return False
-        elapsed = current_time - self._pending_click_time
-        return 0.0 <= elapsed <= self._double_click_threshold
+        The return is an ActionEvent, which *is* a str — compare it to the
+        action constants directly.  `.keys` carries the chord for macros.
+        """
+        events = self._advance(gesture, float(timestamp), source)
+        if events:
+            self._queue.extend(events)
+        return self._queue.popleft() if self._queue else None
 
-    def update(
-        self, raw_gesture: str | None, current_time: float
-    ) -> tuple[str | None, str | None]:
-        label = normalise_gesture(raw_gesture)
-        stable = self._stabilizer.push(label)
+    def update_pair(self, gesture, timestamp: float, source=None):
+        """`(stable_gesture, action)` for callers that display both."""
+        action = self.update(gesture, timestamp, source)
+        return self._current, action
 
-        if stable is None or stable == self._current_stable_state:
-            return stable, None
+    def poll(self, gesture, timestamp: float, source=None) -> list:
+        """Every action this frame produced, in order.  Drains the queue."""
+        events = self._advance(gesture, float(timestamp), source)
+        if self._queue:
+            events = list(self._queue) + events
+            self._queue.clear()
+        return events
 
-        self._previous_stable_state = self._current_stable_state
-        self._current_stable_state = stable
+    def reset(self, timestamp: float = 0.0) -> list:
+        """Forget everything, releasing anything still held.
 
-        return stable, self._evaluate_transition(current_time)
+        Returns the cleanup actions.  Callers that maintain their own
+        button state may ignore the return value; callers that do not must
+        dispatch it, or a drag interrupted by a lost hand stays pressed.
+        """
+        cleanup = []
+        if self._dragging:
+            cleanup.append(self._emit_drag_stop(self._drag_rule,
+                                                float(timestamp)))
+        cleanup.extend(self._queue)
 
-    def reset(self) -> None:
         self._stabilizer.reset()
-        self._previous_stable_state = None
-        self._current_stable_state = None
-        self._pending_click_time = None
-        self._is_dragging = False
+        self._recent.clear()
+        self._queue.clear()
+        self._current = None
+        self._previous = None
+        self._entered_at = 0.0
+        self._hold_armed.clear()
+        self._hold_next.clear()
+        self._pending_click.clear()
+        self._drag_lost_since = None
+        return cleanup
 
-    def _evaluate_transition(self, current_time: float) -> str | None:
-        previous = self._previous_stable_state
-        current = self._current_stable_state
+    # ── engine ──────────────────────────────────────────────────────────
 
-        if self._is_dragging and self._releases_drag(current):
-            self._is_dragging = False
-            self._drag_stop_count += 1
-            return DRAG_STOP
+    def _advance(self, gesture, now: float, source) -> list:
+        label = normalise_gesture(gesture)
+        events = []
 
-        if self._starts_drag(previous, current):
-            self._is_dragging = True
-            self._drag_start_count += 1
-            self._pending_click_time = None
-            return DRAG_START
+        if label in self._ignored:
+            # An abstention is not a pose.  It must not enter the vote,
+            # because a stabilised "idle" between point and grip would
+            # become the predecessor of grip and silently break the chain
+            # every transition depends on.
+            pass
+        else:
+            stable = self._stabilizer.push(label)
+            if stable is not None and stable != self._current:
+                self._previous = self._current
+                self._current = stable
+                self._entered_at = now
+                self._recent.append((stable, now))
+                events.extend(self._on_state_change(now, source))
 
-        if previous == self._source_state and current == self._target_state:
-            return self._register_click(current_time)
+        events.extend(self._tick(now, source))
+        return events
 
-        return None
+    def _on_state_change(self, now: float, source) -> list:
+        # Safety before features: a drag whose pose has ended is released
+        # before any new rule gets a chance to fire on the same frame.
+        events = self._drag_safety(now)
 
-    def _starts_drag(self, previous: str | None, current: str | None) -> bool:
-        if self._drag_source is None or self._is_dragging:
+        candidates = [rule for rule in self._transitions
+                      if rule.to_state == self._current
+                      and rule.accepts_source(source)]
+        matched = self._match_origin(candidates, now)
+
+        if matched:
+            for rule in matched:
+                events.extend(self._fire(rule, now))
+            # Consume the history the match was drawn from, so one arrival
+            # at a target cannot be claimed twice by a later frame.
+            self._recent.clear()
+            self._recent.append((self._current, now))
+
+        return events
+
+    def _match_origin(self, candidates: list, now: float) -> list:
+        """Pick the rules whose origin is the pose the hand actually came from.
+
+        Walking back through recent poses tolerates an intermediate hop,
+        which is what lets a chain survive the brief stable pose a real
+        hand makes while curling.  Left unbounded, though, that tolerance
+        is actively wrong: with point→grip bound to click and open→grip
+        bound to drag, the sequence open→point→grip satisfies *both*, and
+        one deliberate click also presses and holds the mouse button.
+
+        So the search stops at the first pose that is an origin for
+        anything targeting this state.  The nearest origin is the one the
+        user just left, and only rules starting there are eligible — a
+        farther one lost the race and does not get a second look, even if
+        the nearer rule turns out to be cooling down.
+        """
+        if not candidates:
+            return []
+
+        origins = {rule.from_state for rule in candidates}
+
+        # index -1 is the pose just entered; an origin has to precede it.
+        for index in range(len(self._recent) - 2, -1, -1):
+            state, entered = self._recent[index]
+            if state in origins:
+                return [rule for rule in candidates
+                        if rule.from_state == state
+                        and not self._cooling(rule, now)
+                        and (rule.max_time_sec <= 0.0
+                             or (now - entered) <= rule.max_time_sec)]
+            if state == self._current:
+                # Already visited the target; the chain restarted there.
+                return []
+        return []
+
+    def _tick(self, now: float, source) -> list:
+        events = self._drag_safety(now)
+
+        for rule in self._holds:
+            if not rule.accepts_source(source):
+                continue
+
+            if self._current != rule.pose:
+                # Leaving the pose is what re-arms the rule.  This is the
+                # edge in "edge-triggered": without it a held hand would
+                # satisfy the hold test on every frame forever.
+                self._hold_armed.pop(rule.id, None)
+                self._hold_next.pop(rule.id, None)
+                continue
+
+            if (now - self._entered_at) < rule.hold_sec:
+                continue
+
+            if rule.id in self._hold_armed:
+                if not rule.repeat:
+                    continue
+                if now < self._hold_next.get(rule.id, 0.0):
+                    continue
+
+            if self._cooling(rule, now):
+                continue
+
+            events.extend(self._fire(rule, now))
+            self._hold_armed[rule.id] = now
+            self._hold_next[rule.id] = now + rule.repeat_sec
+
+        # Expire click halves that never found a partner, so a pending
+        # single from a minute ago cannot promote an unrelated later click.
+        if self._pending_click:
+            stale = [rid for rid, when in self._pending_click.items()
+                     if (now - when) > self._double_click_sec]
+            for rid in stale:
+                self._pending_click.pop(rid, None)
+
+        return events
+
+    def _drag_safety(self, now: float) -> list:
+        """Release a drag that nothing is going to end on its own.
+
+        Three independent ways out, because the failure they prevent — a
+        mouse button still held after the process exits — is the one bug
+        in this system that makes the whole desktop unusable:
+
+          1. the hand is gone, or the pose is one no rule mentions, for
+             longer than stuck_release_sec;
+          2. the drag has simply run too long;
+          3. (elsewhere) an explicit DRAG_STOP rule fired.
+        """
+        if not self._dragging:
+            self._drag_lost_since = None
+            return []
+
+        if self._drag_timeout_sec > 0.0 and \
+                (now - self._drag_started_at) > self._drag_timeout_sec:
+            print("[fsm] drag exceeded its time limit — releasing")
+            return [self._emit_drag_stop(self._drag_rule, now)]
+
+        adrift = self._current is None \
+            or self._current == NO_GESTURE \
+            or self._current not in self._known
+
+        if not adrift:
+            self._drag_lost_since = None
+            return []
+
+        if self._drag_lost_since is None:
+            self._drag_lost_since = now
+            return []
+
+        if (now - self._drag_lost_since) >= self._stuck_release_sec:
+            print("[fsm] hand lost or pose unmapped while dragging — "
+                  "releasing")
+            return [self._emit_drag_stop(self._drag_rule, now)]
+
+        return []
+
+    def _cooling(self, rule: _Rule, now: float) -> bool:
+        if rule.cooldown_sec <= 0.0:
             return False
-        return previous == self._drag_source and current == self._drag_target
+        last = self._last_fired.get(rule.id)
+        return last is not None and (now - last) < rule.cooldown_sec
 
-    def _releases_drag(self, current: str | None) -> bool:
-        if self._drag_target is None:
+    def _fire(self, rule: _Rule, now: float) -> list:
+        """Run a rule's action through the per-action bookkeeping."""
+        self._last_fired[rule.id] = now
+        action = rule.action
+
+        if action == DRAG_START:
+            if self._dragging:
+                # Already down.  Re-pressing would desynchronise the
+                # engine's idea of the button from the OS's.
+                return []
+            self._dragging = True
+            self._drag_rule = rule
+            self._drag_started_at = now
+            self._drag_lost_since = None
+            self.drag_start_count += 1
+            return [self._event(rule, DRAG_START, now)]
+
+        if action == DRAG_STOP:
+            if not self._dragging:
+                return []
+            return [self._emit_drag_stop(rule, now)]
+
+        if action == DOUBLE_CLICK:
+            # An explicit double cancels any single waiting to be promoted,
+            # so the two cannot overlap into a triple.
+            self._pending_click.clear()
+            self.double_click_count += 1
+            return [self._event(rule, DOUBLE_CLICK, now)]
+
+        if action in (LEFT_CLICK, RIGHT_CLICK, MIDDLE_CLICK):
+            return [self._register_click(rule, now)]
+
+        if action in MACRO_ACTIONS:
+            self.macro_count += 1
+            return [self._event(rule, action, now)]
+
+        return [self._event(rule, action, now)]
+
+    def _register_click(self, rule: _Rule, now: float) -> ActionEvent:
+        """Single or double, decided by the gap since this rule last fired.
+
+        Only a repeat of the *same* rule can promote.  Two different
+        gestures bound to LEFT_CLICK are two deliberate clicks that happen
+        to land close together, and merging them would be the accidental
+        overlap this is here to prevent.
+        """
+        promote = getattr(rule, "promote_double", False)
+        if promote:
+            pending = self._pending_click.get(rule.id)
+            if pending is not None and 0.0 <= (now - pending) <= self._double_click_sec:
+                self._pending_click.pop(rule.id, None)
+                self.double_click_count += 1
+                return self._event(rule, DOUBLE_CLICK, now)
+            self._pending_click[rule.id] = now
+
+        self.click_count += 1
+        return self._event(rule, rule.action, now)
+
+    def _emit_drag_stop(self, rule, now: float) -> ActionEvent:
+        self._dragging = False
+        self._drag_rule = None
+        self._drag_lost_since = None
+        self.drag_stop_count += 1
+        return self._event(rule, DRAG_STOP, now)
+
+    @staticmethod
+    def _event(rule, action: str, now: float) -> ActionEvent:
+        return ActionEvent(
+            action,
+            rule_id=getattr(rule, "id", None),
+            rule_name=getattr(rule, "name", None),
+            keys=getattr(rule, "keys", "") if action == KEYBOARD_MACRO else "",
+            at=now,
+        )
+
+
+# ─── Output ─────────────────────────────────────────────────────────────────
+
+_KEY_ALIASES = {
+    "win": "cmd", "super": "cmd", "meta": "cmd", "windows": "cmd",
+    "control": "ctrl", "escape": "esc", "return": "enter",
+    "del": "delete", "ins": "insert", "pgup": "page_up",
+    "pgdn": "page_down", "pagedown": "page_down", "pageup": "page_up",
+}
+
+
+class ActionExecutor:
+    """Performs action strings against the OS.
+
+    pynput is imported on construction rather than at module scope so
+    gesture_fsm stays importable — and unit-testable — on a machine with no
+    input stack at all.  A missing package costs the output and nothing
+    else.
+
+    Held buttons are tracked here because this object is the only thing
+    that knows whether a press actually reached the OS.  `release_all` is
+    idempotent and safe to call from a finally block or an atexit hook,
+    which is where it belongs.
+    """
+
+    def __init__(self, dry_run: bool = False) -> None:
+        self.dry_run = dry_run
+        self._held = set()
+        self._error_shown = False
+        self._mouse = None
+        self._keyboard = None
+        self._Button = None
+        self._Key = None
+
+        if dry_run:
+            return
+
+        from pynput.mouse import Button, Controller as MouseController
+        from pynput.keyboard import Key, Controller as KeyController
+        self._mouse = MouseController()
+        self._keyboard = KeyController()
+        self._Button = Button
+        self._Key = Key
+
+    # ── public ──────────────────────────────────────────────────────────
+
+    def dispatch(self, action, now: float = 0.0) -> bool:
+        """Perform one action.  Never raises; returns True if it happened."""
+        name = str(action)
+        keys = getattr(action, "keys", "") or ACTION_MACROS.get(name, "")
+
+        # Checked before the dry-run branch so a rehearsal reports the same
+        # refusal a real run would; otherwise dry_run would claim success
+        # for an action nothing knows how to perform.
+        if name not in MOUSE_ACTIONS and not keys:
             return False
-        if self._drag_release is not None:
-            return current in (self._drag_release, NO_GESTURE)
-        return current != self._drag_target
 
-    def _register_click(self, current_time: float) -> str:
-        if self.is_double_click_window_open(current_time):
-            self._pending_click_time = None
-            self._double_click_count += 1
-            return DOUBLE_CLICK
+        if self.dry_run:
+            print(f"[dry-run] {name}" + (f" ({keys})" if keys else ""))
+            return True
 
-        self._pending_click_time = current_time
-        self._click_count += 1
-        return LEFT_CLICK
+        try:
+            if name == LEFT_CLICK:
+                self._mouse.click(self._Button.left, 1)
+            elif name == RIGHT_CLICK:
+                self._mouse.click(self._Button.right, 1)
+            elif name == MIDDLE_CLICK:
+                self._mouse.click(self._Button.middle, 1)
+            elif name == DOUBLE_CLICK:
+                self._mouse.click(self._Button.left, 2)
+            elif name == DRAG_START:
+                self._mouse.press(self._Button.left)
+                self._held.add("left")
+            elif name == DRAG_STOP:
+                self._mouse.release(self._Button.left)
+                self._held.discard("left")
+            elif name == SCROLL_UP:
+                self._mouse.scroll(0, 2)
+            elif name == SCROLL_DOWN:
+                self._mouse.scroll(0, -2)
+            elif keys:
+                return self._chord(keys)
+            else:
+                return False
+        except Exception as exc:
+            self._warn(f"output unavailable: {exc}")
+            return False
+        return True
+
+    def release_all(self) -> None:
+        """Drop anything still held.  Safe to call repeatedly."""
+        if self.dry_run or not self._held:
+            self._held.clear()
+            return
+        for name in tuple(self._held):
+            try:
+                self._mouse.release(getattr(self._Button, name))
+            except Exception:
+                pass
+            self._held.discard(name)
+
+    def close(self) -> None:
+        self.release_all()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.release_all()
+        return False
+
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _chord(self, spec: str) -> bool:
+        """Press a chord and release it, whatever happens in between.
+
+        The release runs from a finally over the keys actually pressed, so
+        a failure halfway through cannot leave the Windows key latched —
+        the keyboard's version of the stuck mouse button, and considerably
+        harder to escape.
+        """
+        tokens = [t.strip().lower() for t in str(spec).split("+") if t.strip()]
+        if not tokens:
+            return False
+
+        resolved = []
+        for token in tokens:
+            key = self._resolve(token)
+            if key is None:
+                self._warn(f"unknown key {token!r} in macro {spec!r}")
+                return False
+            resolved.append(key)
+
+        pressed = []
+        try:
+            for key in resolved:
+                self._keyboard.press(key)
+                pressed.append(key)
+            return True
+        except Exception as exc:
+            self._warn(f"keyboard unavailable: {exc}")
+            return False
+        finally:
+            for key in reversed(pressed):
+                try:
+                    self._keyboard.release(key)
+                except Exception:
+                    pass
+
+    def _resolve(self, token: str):
+        token = _KEY_ALIASES.get(token, token)
+        if len(token) == 1:
+            return token
+        return getattr(self._Key, token, None)
+
+    def _warn(self, message: str) -> None:
+        if not self._error_shown:
+            self._error_shown = True
+            print(f"[action] {message}")
+
+
+def validate_macro(spec: str) -> bool:
+    """True if `spec` names keys pynput can resolve.  Import-safe."""
+    tokens = [t.strip().lower() for t in str(spec).split("+") if t.strip()]
+    if not tokens:
+        return False
+    try:
+        from pynput.keyboard import Key
+    except Exception:
+        return True                       # cannot check; assume the user is right
+    for token in tokens:
+        token = _KEY_ALIASES.get(token, token)
+        if len(token) == 1:
+            continue
+        if getattr(Key, token, None) is None:
+            return False
+    return True
+
+
+if __name__ == "__main__":
+    import time
+
+    fsm = GestureFSM()
+    print(f"[fsm] {fsm.describe()}")
+    for rule in fsm.rules:
+        print(f"       {rule.name:<28} -> {rule.action}")
+
+    # A scripted hand: point, a stray frame, the curl through an unmapped
+    # pose, then grip.  The click must survive all of it.
+    script = ["point", "point", "point", "peace", "idle", "idle",
+              "grip", "grip", "grip"]
+    clock = time.perf_counter()
+    for index, label in enumerate(script):
+        action = fsm.update(label, clock + index * 0.033)
+        if action is not None:
+            print(f"  frame {index:>2} {label:<8} -> {action}")

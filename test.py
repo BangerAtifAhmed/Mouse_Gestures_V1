@@ -279,7 +279,7 @@ STATE_FREEZE_MS = 75
 # since a real error would arrive by the same route.
 SUPPRESS_NATIVE_WARNINGS = True
 
-# Launch system_monitor.py alongside the preview.  Set False to run without
+# Launch testmoniter.py alongside the preview.  Set False to run without
 # it — the main script neither reads from it nor waits on it.
 SYSTEM_MONITOR_ENABLED = True
 
@@ -2879,7 +2879,7 @@ else:
 monitor_process = None
 if SYSTEM_MONITOR_ENABLED:
     _monitor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "system_monitor.py")
+                                   "testmoniter.py")
     try:
         monitor_process = subprocess.Popen(
             [sys.executable, _monitor_script, str(os.getpid())])

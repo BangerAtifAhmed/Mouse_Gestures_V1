@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "settings": {
+    "window_size": 3,
+    "stability_threshold": 2,
+    "ignored_states": [
+      "idle",
+      ""
+    ],
+    "double_click_sec": 0.8,
+    "transition_memory": 2,
+    "stuck_release_sec": 0.5,
+    "drag_timeout_sec": 30.0,
+    "default_cooldown_sec": 0.35,
+    "default_hold_sec": 0.4,
+    "default_max_time_sec": 0.8,
+    "cursor_sensitivity": 1.4,
+    "is_mirrored": false,
+    "invert_cursor_x": true
+  },
+  "transitions": [
+    {
+      "id": "click",
+      "name": "Left click",
+      "from_state": "point",
+      "to_state": "grip",
+      "action": "LEFT_CLICK",
+      "max_time_sec": 0.8,
+      "cooldown_sec": 0.15,
+      "promote_double": true,
+      "enabled": true,
+      "source": "any"
+    },
+    {
+      "id": "drag-on",
+      "name": "Grab",
+      "from_state": "open",
+      "to_state": "grip",
+      "action": "DRAG_START",
+      "max_time_sec": 0.8,
+      "cooldown_sec": 0.35,
+      "enabled": true,
+      "source": "geometry"
+    },
+    {
+      "id": "drag-off",
+      "name": "Drop",
+      "from_state": "grip",
+      "to_state": "open",
+      "action": "DRAG_STOP",
+      "max_time_sec": 0.0,
+      "cooldown_sec": 0.0,
+      "enabled": true,
+      "source": "geometry"
+    },
+    {
+      "id": "right-click",
+      "name": "Right click",
+      "from_state": "peace",
+      "to_state": "grip",
+      "action": "RIGHT_CLICK",
+      "max_time_sec": 0.8,
+      "cooldown_sec": 0.35,
+      "enabled": true,
+      "source": "any"
+    }
+  ],
+  "holds": [
+    {
+      "id": "desktop",
+      "name": "Show desktop",
+      "pose": "timeout",
+      "action": "SHOW_DESKTOP",
+      "hold_sec": 0.4,
+      "cooldown_sec": 2.0,
+      "enabled": true,
+      "source": "semantic"
+    }
+  ]
+}
