@@ -919,6 +919,47 @@ def _as_hand_list(hand_landmarks):
     return tuple(hand_landmarks)
 
 
+def handedness_of(results, hand, mirrored: bool) -> str:
+    """"left" / "right" for *hand*, or "" when it cannot be determined.
+
+    Two things make this more than a lookup.
+
+    THE RIGHT HAND, LITERALLY.  multi_handedness runs parallel to
+    multi_hand_landmarks, so the label has to be taken at the index of the
+    hand the cursor actually follows — pick_primary_hand() may well have
+    chosen the second entry, and index 0 would then name the other hand.
+    Matched by identity, because comparing protobuf messages with == is
+    both slow and not what is meant here.
+
+    THE MIRROR.  MediaPipe's own docs: "it determines handedness assuming
+    the input image is mirrored".  We hand it the flipped buffer when
+    IS_MIRRORED is on, which is exactly that assumption, so the label is
+    already correct.  With mirroring off it sees the raw camera image and
+    every label comes back inverted, so it is swapped here.  Getting this
+    backwards would name every gesture after the wrong hand.
+
+    Returns "" rather than guessing when the skeleton is missing, which is
+    the caller's cue to fall back to the bare gesture name.
+    """
+    try:
+        landmarks = results.multi_hand_landmarks
+        labels = results.multi_handedness
+        if not landmarks or not labels:
+            return ""
+        index = next((i for i, h in enumerate(landmarks) if h is hand), None)
+        if index is None or index >= len(labels):
+            return ""
+        label = labels[index].classification[0].label.strip().lower()
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return ""
+
+    if label not in ("left", "right"):
+        return ""
+    if not mirrored:
+        label = "right" if label == "left" else "left"
+    return label
+
+
 def pick_primary_hand(hands, previous_anchor=None):
     """The hand the cursor follows, chosen for continuity across frames.
 
@@ -2894,6 +2935,7 @@ class HandTrackerEngine:
         self.screen = None
         self.hands = None
         self.fsm = None
+        self.semantic_fsm = None
         self.macros = None
         self.yolo_worker = None
         self.monitor_process = None
@@ -2937,6 +2979,12 @@ class HandTrackerEngine:
 
         cfg = load_config()
         self.fsm = GestureFSM(cfg)
+
+        # Same rules, separate state.  The geometric stream runs at the
+        # camera rate and the semantic one at the network rate, so they
+        # need one stabiliser each; sharing would let a 5 Hz label
+        # outvote a 30 Hz one inside the same window.
+        self.semantic_fsm = GestureFSM(cfg)
 
         settings = cfg.get("settings") or {}
         try:
@@ -3040,8 +3088,9 @@ class HandTrackerEngine:
 
         if self.actions.release():
             self._log("[action] DRAG_STOP (engine stopped)")
-        if self.fsm is not None:
-            self.fsm.reset()
+        for machine in (self.fsm, self.semantic_fsm):
+            if machine is not None:
+                machine.reset()
 
         if self.stream is not None:
             try:
@@ -3356,6 +3405,7 @@ class HandTrackerEngine:
         screen = self.screen
         hands = self.hands
         fsm = self.fsm
+        semantic_fsm = self.semantic_fsm
         actions = self.actions
         yolo_worker = self.yolo_worker
         macros = self.macros
@@ -3378,6 +3428,7 @@ class HandTrackerEngine:
         gesture_changes = 0
         stable_gesture = None
         primary_anchor = None
+        hand_side = ""            # "left" / "right" / "" when unknown
 
         yolo_action_count = 0
         last_seq = -1
@@ -3484,6 +3535,7 @@ class HandTrackerEngine:
                 if results.multi_hand_landmarks:
                     detected_hands = results.multi_hand_landmarks
                     hand = pick_primary_hand(detected_hands, primary_anchor)
+                    hand_side = handedness_of(results, hand, IS_MIRRORED)
 
                     anchor = hand.landmark[LM_MIDDLE_MCP]
                     primary_anchor = (anchor.x, anchor.y)
@@ -3589,10 +3641,12 @@ class HandTrackerEngine:
                     # further transition is coming to end the drag.
                     if actions.release():
                         self._log("[action] DRAG_STOP (hand lost)")
-                    if fsm is not None:
-                        fsm.reset()
+                    for _machine in (fsm, semantic_fsm):
+                        if _machine is not None:
+                            _machine.reset()
                     stable_gesture = None
                     primary_anchor = None
+                    hand_side = ""
                     if yolo_worker is not None:
                         yolo_worker.request_reset()
                     if gesture_state is not None:
@@ -3648,9 +3702,44 @@ class HandTrackerEngine:
 
                 if yolo_worker is not None:
                     _yg, _ys, _yms = yolo_worker.current_state
-                    self.status["yolo"] = _yg
+
+                    # ── Handedness suffix ───────────────────────────────
+                    # YOLO cannot tell the hands apart and we are not
+                    # retraining it to; MediaPipe already knows, and is
+                    # already running on the same frame.  Gluing the two
+                    # gives "three_gun_left" from a model that only ever
+                    # learned "three_gun".
+                    #
+                    # If the skeleton is missing while YOLO still sees a
+                    # box, hand_side is "" and the bare label is used —
+                    # a rule bound to "three_gun" keeps working, it just
+                    # cannot tell you which hand made it.
+                    _labelled = (f"{_yg}_{hand_side}"
+                                 if _yg and hand_side else _yg)
+
+                    self.status["yolo"] = _labelled
                     self.status["yolo_score"] = _ys
                     self.status["yolo_ms"] = _yms
+                    self.status["handedness"] = hand_side
+
+                    # ── Semantic stream into its own FSM ────────────────
+                    # A SEPARATE instance from the geometric one: the two
+                    # streams speak different vocabularies at different
+                    # rates, and interleaving them in one sliding window
+                    # would leave neither able to stabilise.  Same rule
+                    # set, same dispatcher — a rule matches whichever
+                    # stream actually emits its pose.
+                    if semantic_fsm is not None:
+                        try:
+                            _sem = semantic_fsm.update(_labelled, now_ts)
+                            if _sem is not None:
+                                actions.dispatch(_sem, now_ts)
+                        except Exception as exc:
+                            self._log_once(
+                                "semantic",
+                                f"[action] semantic binding failed, "
+                                f"tracking continues "
+                                f"({exc.__class__.__name__}: {exc})")
 
                     # ── Gesture prediction overlay ──────────────────────
                     # Fixed top-left rather than pinned above a box: the
@@ -3663,11 +3752,14 @@ class HandTrackerEngine:
                                  if yolo_worker.load_error is None
                                  else "Gesture: model unavailable")
                         _colour = _PREDICT_IDLE_COLOUR
-                    elif _yg is None:
+                    elif _labelled is None:
                         _text = "Gesture: none"
                         _colour = _PREDICT_IDLE_COLOUR
                     else:
-                        _text = f"Gesture: {_yg} ({_ys:.2f})"
+                        # The combined name, so what is on screen is
+                        # exactly what the PNG in gestures/ must be
+                        # called and exactly what a rule must bind.
+                        _text = f"Gesture: {_labelled} ({_ys:.2f})"
                         _colour = _PREDICT_COLOUR
 
                     # Drawn twice — a thick black pass, then the colour on
