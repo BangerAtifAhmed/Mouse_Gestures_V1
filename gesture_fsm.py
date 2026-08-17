@@ -20,6 +20,19 @@ The config it eats:
       ]
     }
 
+Rules may also arrive grouped by which classifier feeds them, which is the
+shape app.py writes.  "geometry_bindings", "yolo_bindings", "bindings" and
+"mappings" are all read, and each entry is routed to the right rule class
+by its own "trigger" key (or by carrying a "pose", which only a hold does):
+
+    {"settings": {...},
+     "geometry_bindings": [ {..., "trigger": "transition"}, ... ],
+     "yolo_bindings":     [ {..., "trigger": "hold"}, ... ],
+     "deleted_bindings":  [ ... ]}
+
+"deleted_bindings" is the GUI's recycle bin and is deliberately NOT read:
+a binned rule must never fire, so it is the one list this engine ignores.
+
 Four failure modes drive the design, and each one is a separate mechanism
 rather than a knob on a shared one:
 
@@ -64,7 +77,7 @@ __all__ = [
     # Config plumbing
     "CONFIG_PATH", "DEFAULT_SETTINGS",
     "SENSITIVITY_MIN", "SENSITIVITY_MAX", "SENSITIVITY_STEP",
-    "load_config", "save_config", "default_config", "fallback_config",
+    "load_config", "save_config", "default_config", "empty_config",
     "normalise_gesture",
 ]
 
@@ -388,7 +401,8 @@ class HoldRule(_Rule):
 
         # hold_ms is accepted because it is the natural unit in a GUI.
         if raw.get("hold_ms") is not None:
-            self.hold_sec = max(0.0, _as_float(raw.get("hold_ms"), 0.0) / 1000.0)
+            self.hold_sec = max(
+                0.0, _as_float(raw.get("hold_ms"), 0.0) / 1000.0)
         else:
             self.hold_sec = max(0.0, _as_float(
                 raw.get("hold_sec"), settings["default_hold_sec"]))
@@ -480,41 +494,38 @@ def default_config() -> dict:
     }
 
 
-def fallback_config() -> dict:
-    """The minimum safe binding used when the config cannot be read.
+def empty_config() -> dict:
+    """A config with no bindings at all.
 
-    Deliberately one rule.  A config that failed to parse is a config whose
-    contents are unknown, and quietly installing a large default scheme
-    would hand the user a set of bindings they never chose.
+    This is what an unreadable or absent file becomes.  It used to be one
+    hardcoded point -> grip click, on the reasoning that a controller which
+    does nothing is indistinguishable from a broken one — but injecting a
+    binding the user never chose is its own kind of wrong, and it made a
+    deliberately empty scheme impossible to keep.  A blank slate is now a
+    supported state; the console says so loudly instead.
     """
     return {
-        "version": 1,
+        "version": 2,
         "settings": dict(DEFAULT_SETTINGS),
-        "transitions": [
-            # 0.15 for the same reason default_config() uses it: a cooldown
-            # above ~0.2 s outlasts a real double-click cycle and would stop
-            # promote_double from ever firing.
-            {"id": "fallback-click", "name": "Left click (fallback)",
-             "from_state": "point", "to_state": "grip",
-             "action": LEFT_CLICK, "max_time_sec": 0.8,
-             "cooldown_sec": 0.15, "promote_double": True},
-        ],
-        "holds": [],
+        "geometry_bindings": [],
+        "yolo_bindings": [],
+        "deleted_bindings": [],
     }
 
 
 def load_config(path: str = CONFIG_PATH, *, quiet: bool = False) -> dict:
     """Read a config, never raising.
 
-    Every failure downgrades to fallback_config() with a console warning:
-    a gesture controller that refuses to start because a JSON file has a
-    trailing comma is worse than one that starts with one known-good rule.
+    Every failure downgrades to an EMPTY config with a console warning: a
+    gesture controller that refuses to start because a JSON file has a
+    trailing comma is worse than one that starts with nothing bound, and
+    nothing bound is exactly what the file said.
     """
     if not os.path.exists(path):
         if not quiet:
             print(f"[config] {os.path.basename(path)} not found — "
-                  f"falling back to point -> grip = LEFT_CLICK")
-        return fallback_config()
+                  f"starting with no bindings")
+        return empty_config()
 
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -522,18 +533,24 @@ def load_config(path: str = CONFIG_PATH, *, quiet: bool = False) -> dict:
     except (OSError, ValueError) as exc:
         if not quiet:
             print(f"[config] {os.path.basename(path)} unreadable ({exc}) — "
-                  f"falling back to point -> grip = LEFT_CLICK")
-        return fallback_config()
+                  f"starting with no bindings")
+        return empty_config()
 
     if not isinstance(data, dict):
         if not quiet:
             print(f"[config] {os.path.basename(path)} is not an object — "
-                  f"falling back to point -> grip = LEFT_CLICK")
-        return fallback_config()
+                  f"starting with no bindings")
+        return empty_config()
 
+    # Every list the callers index into is guaranteed present, so a config
+    # written by an older version — or hand-edited down to just "settings"
+    # — still answers .get()/[] for all of them rather than raising.
     data.setdefault("settings", {})
-    data.setdefault("transitions", [])
-    data.setdefault("holds", [])
+    for key in ("transitions", "holds", "geometry_bindings",
+                "yolo_bindings", "deleted_bindings"):
+        value = data.get(key)
+        if not isinstance(value, list):
+            data[key] = []
     return data
 
 
@@ -593,25 +610,25 @@ class GestureFSM:
         self._stabilizer = stabilizer or MajorityStabilizer(
             int(settings["window_size"]), int(settings["stability_threshold"]))
 
-        raw_count = (len(config.get("transitions") or [])
-                     + len(config.get("holds") or [])
-                     + len(config.get("mappings") or []))
+        raw_count = sum(len(config.get(key) or []) for key in
+                        ("transitions", "holds", "mappings",
+                         "geometry_bindings", "yolo_bindings"))
         self._transitions, self._holds = self._compile(config, settings)
 
-        # A config that parses but yields nothing is as useless as one that
-        # did not parse at all, and far more confusing: the tracker starts,
-        # the cursor moves, and no gesture ever does anything.  Which of the
-        # two cases it is decides whether falling back is right.
+        # An empty rule set is a supported state, not an error to paper
+        # over: the tracker still moves the cursor, it just has nothing
+        # bound.  Nothing is injected here — the two cases are only told
+        # apart so the message can say which one happened, because "I wrote
+        # rules and none loaded" needs a different fix from "I wrote none".
         if not self._transitions and not self._holds:
             if raw_count:
-                print(f"[config] all {raw_count} rule(s) were unusable — "
-                      f"falling back to point -> grip = LEFT_CLICK")
-                self._transitions, self._holds = self._compile(
-                    fallback_config(), settings)
+                print(f"[config] all {raw_count} rule(s) in the config were "
+                      f"unusable — see the reasons above. No gesture is "
+                      f"bound; the cursor will still move.")
             else:
-                print("[config] no bindings in gesture_config.json — the "
-                      "cursor will move but no gesture will act. Run "
-                      "app.py, press Load Defaults, then Save Config.")
+                print("[config] no bindings configured — the cursor will "
+                      "move but no gesture will act. Add mappings in "
+                      "app.py, then press Save Config.")
 
         # A rule cannot promote a double it is not allowed to fire.  The
         # two guards are independently sensible and silently incompatible,
@@ -673,8 +690,23 @@ class GestureFSM:
         """
         transitions, holds = [], []
 
-        raw_transitions = config.get("transitions") or []
-        raw_holds = config.get("holds") or []
+        raw_transitions = list(config.get("transitions") or [])
+        raw_holds = list(config.get("holds") or [])
+
+        # Accepted aliases.  A hand-written config that groups rules by
+        # which classifier feeds them reads naturally, and refusing it would
+        # be a silent empty-config start rather than an error anyone sees.
+        # "deleted_bindings" is deliberately NOT among these: the GUI's
+        # recycle bin lives in the same file and must never compile.
+        for key in ("geometry_bindings", "yolo_bindings", "bindings"):
+            for entry in (config.get(key) or []):
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("trigger", "")).lower() == "hold" \
+                        or entry.get("pose"):
+                    raw_holds.append(entry)
+                else:
+                    raw_transitions.append(entry)
 
         # A single "mappings" list with a "trigger" discriminator is also
         # accepted, because that is the shape a GUI naturally produces.
@@ -1005,7 +1037,8 @@ class GestureFSM:
         promote = getattr(rule, "promote_double", False)
         if promote:
             pending = self._pending_click.get(rule.id)
-            if pending is not None and 0.0 <= (now - pending) <= self._double_click_sec:
+            gap = now - pending if pending is not None else None
+            if gap is not None and 0.0 <= gap <= self._double_click_sec:
                 self._pending_click.pop(rule.id, None)
                 self.double_click_count += 1
                 return self._event(rule, DOUBLE_CLICK, now)
@@ -1200,7 +1233,7 @@ def validate_macro(spec: str) -> bool:
     try:
         from pynput.keyboard import Key
     except Exception:
-        return True                       # cannot check; assume the user is right
+        return True          # cannot check; assume the user is right
     for token in tokens:
         token = _KEY_ALIASES.get(token, token)
         if len(token) == 1:

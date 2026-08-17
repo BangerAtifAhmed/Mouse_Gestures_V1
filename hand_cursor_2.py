@@ -223,7 +223,7 @@ IS_MIRRORED = True
 # cursor runs backwards under a preview that looks correct.  Only one of the
 # two may be on at a time —
 #
-#   IS_MIRRORED=True,  INVERT_CURSOR_X=False  → mirror preview, correct    ← default
+#   IS_MIRRORED=True,  INVERT_CURSOR_X=False  → mirror, correct  ← default
 #   IS_MIRRORED=False, INVERT_CURSOR_X=True   → raw preview,    correct
 #   both on / both off                        → cursor runs backwards
 INVERT_CURSOR_X = False
@@ -432,9 +432,13 @@ YOLO_LOG_CHANGES = True
 # hang off the network and the mouse hangs off the geometry.
 #
 # Keys are raw HaGRIDv2 class names, as reported by the model.
-YOLO_MACROS = {
-    "timeout": "show_desktop",
-}
+# EMPTY BY DEFAULT, and it must stay that way.  This dict binds gestures to
+# keyboard macros entirely outside gesture_config.json, so anything listed
+# here fires on a blank-slate install with no rule to explain it — which is
+# exactly the surprise the zero-defaults policy exists to prevent.  Bind
+# SHOW_DESKTOP to a hold in the GUI instead; that path is visible, editable
+# and deletable.  Populate this only to hardcode a macro on purpose.
+YOLO_MACROS = {}
 
 # Two independent guards, because a cooldown alone does not do what it
 # sounds like.  At 18 Hz a 2 s cooldown still fires five times if the hand is
@@ -454,39 +458,20 @@ YOLO_MACRO_ENABLED = True
 # frame, so its rate is the camera's, against the network's measured 4.7 Hz.
 FPS_NOTE = "30 Hz"
 
-# ── Click arbitration: the 30 Hz geometric path, not the 4.7 Hz network ────
+# ── Rule source: gesture_config.json, and nothing else ────────────────────
+# There are deliberately NO binding constants here.  Every transition, hold,
+# action and timing value is read from gesture_config.json at start-up by
+# HandTrackerEngine._apply_config(); an empty config means an empty rule set
+# and no gesture does anything.
 #
-# Clicking is latency-critical, so it is driven by detect_gesture(), which
-# runs on every frame.  The YOLO branch stays alive beside it, logging what
-# it sees, reserved for semantic macros where a quarter-second of lag is
-# irrelevant.
+# This block used to hardcode point->grip = click and open->grip = drag as
+# fallbacks.  They were already dead — the engine stopped reading them when
+# it became config-driven — but leaving them here advertised defaults the
+# program no longer has, which is worse than not having them.
 #
-# A 3-frame/2-vote window is 100 ms at 30 Hz.  Measured end to end, the
-# click lands 33 ms after the grip settles.
-FSM_CLICK_TRANSITION = ("point", "grip")
-
-# Drag shares its target with the click — both end in "grip" — and is told
-# apart by where it came from.  "open" → "grip" is the hand closing on
-# something, which is the gesture the action already resembles.
-#
-# drag_release is left at None, meaning any stable state other than the drag
-# target ends the drag: opening the hand drops what you are holding, and so
-# does the FSM seeing NO_GESTURE.  Naming one specific release state instead
-# would leave the button held for every other way out.
-FSM_DRAG_TRANSITION = ("open", "grip")
-FSM_DRAG_RELEASE = None
-
-FSM_WINDOW = 3
-FSM_THRESHOLD = 2
-
-# gesture_fsm's own default is 0.4 s, which is right for a mouse button but
-# not for a pose cycle: a double here is point→grip→point→grip, and all four
-# poses have to clear the stability window.  Swept across curl speeds of
-# 33–150 ms and holds of 66–200 ms, the gap between the two clicks ranges
-# 0.200–0.667 s, so 0.4 s misses 6 of those 16 combinations.  0.8 s covers
-# every one with headroom, and is still shorter than the ~0.4 s a single
-# deliberate click cycle takes, so separate clicks do not merge.
-FSM_DOUBLE_CLICK_SECONDS = 0.8
+# The stability window and double-click timing that used to live here are
+# now "window_size" / "stability_threshold" / "double_click_sec" under
+# "settings" in the config, so the GUI can reach them too.
 
 # detect_gesture returns "idle" for anything half-curled, and curling from
 # point to grip physically passes through one.  "idle" is the classifier
@@ -2804,898 +2789,748 @@ class OneEuroFilter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RUNTIME SETUP
+#  TRACKING ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
-
-# Pin OpenCV's internal thread pool before anything uses it.
-if OPENCV_THREADS:
-    cv2.setNumThreads(OPENCV_THREADS)
-
-backend = make_backend()
-cursor = make_cursor(backend)
-
-# Keyboard output is entirely optional: it drives the semantic macros and
-# nothing else, so it must never be able to stop the cursor from working.
-macros = None
-macro_status = "disabled"
-if YOLO_MACRO_ENABLED and YOLO_MACROS:
-    try:
-        macros = MacroDispatcher(YOLO_MACROS)
-        macro_status = "running"
-    except Exception as exc:
-        macros = None
-        macro_status = f"unavailable ({exc.__class__.__name__}: {exc})"
-
-if macros is not None:
-    print(f"[macro] keyboard macros armed — "
-          f"{', '.join(f'{g} -> {m}' for g, m in YOLO_MACROS.items())} "
-          f"(edge-triggered, {YOLO_MACRO_COOLDOWN:.1f}s cooldown, "
-          f"score >= {YOLO_MACRO_MIN_SCORE:.2f})")
-else:
-    print(f"[macro] keyboard macros {macro_status} — everything else "
-          f"unaffected")
-
-# ─── Camera selection and open ──────────────────────────────────────────────
-# Both happen before MediaPipe loads: the model takes a moment to initialise
-# and would delay the prompt, and its loader writes to stderr, which would
-# scroll the question the user is meant to answer.
 #
-# Opening is retried rather than fatal.  Since an index the scan never
-# confirmed can be typed on purpose, "that one does not work" is an ordinary
-# outcome here, and the right response is another prompt — not a stack trace
-# and a re-run of the whole scan.
-if CAM_INDEX is None:
-    print(f"[camera] scanning indices 0–{CAM_SCAN_MAX}, backend "
-          f"{describe_api(backend.camera_api)} "
-          f"({CAM_SCAN_READ_TRIES} read attempts each)…\n")
-    _available = scan_cameras(CAM_SCAN_MAX, backend.camera_api)
-
-    while True:
-        camera_index = choose_camera(_available)
-        try:
-            stream = WebcamStream(camera_index, CAM_WIDTH, CAM_HEIGHT,
-                                  CAM_FPS, api=backend.camera_api)
-            break
-        except RuntimeError as exc:
-            print(f"[camera] index {camera_index} could not be opened: {exc}")
-            print("         pick a different one.")
-else:
-    camera_index = CAM_INDEX
-    print(f"[camera] CAM_INDEX pinned to {camera_index}, skipping scan\n")
-    stream = WebcamStream(camera_index, CAM_WIDTH, CAM_HEIGHT, CAM_FPS,
-                          api=backend.camera_api)
-
-# ─── Resource monitor ───────────────────────────────────────────────────────
-# Launched here, where both the scanned and the pinned camera paths have
-# converged on a stream that really opened — so the window never appears for
-# a camera that then fails.
+# Everything above this line is definitions and costs nothing to import.
+# Everything below is the runtime, and it used to run at module scope: the
+# camera opened, MediaPipe loaded and a blocking `while True` with
+# cv2.imshow took the thread, so `import hand_cursor_2` from a GUI would
+# never return.
 #
-# Its own process, not a thread: GPUtil shells out to nvidia-smi, ~157 ms a
-# poll measured here, and Tk insists on owning the thread it was created on.
-# Neither belongs anywhere near the 30 Hz cursor loop.
+# It is now a class.  The loop body is unchanged — same anchor, same
+# gesture classifier, same FSM arbitration, same 1€ filter, same overlays —
+# but it lives on a background thread and publishes its frame instead of
+# showing it.  cv2.imshow and cv2.waitKey are gone entirely; a host that
+# wants a preview asks for get_latest_frame() and draws it however it likes.
 #
-# The path is resolved against this file rather than the working directory,
-# so launching from anywhere still finds the script.
-monitor_process = None
-if SYSTEM_MONITOR_ENABLED:
-    _monitor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "system_monitor.py")
-    try:
-        monitor_process = subprocess.Popen(
-            [sys.executable, _monitor_script, str(os.getpid())])
-        print(f"[monitor] resource window started (pid "
-              f"{monitor_process.pid}, watching {os.getpid()})")
-    except Exception as exc:
-        monitor_process = None
-        print(f"[monitor] could not start: {exc.__class__.__name__}: {exc}")
+# The standalone script still exists, at the bottom, and behaves as it
+# always did: it drives the same engine and does the imshow/waitKey itself.
 
-# Rebind the camera constants to the size frames will REALLY have after any
-# downscale.  Nothing left in the file reads them for geometry — the box and
-# the landmark scaling both go through ScreenGeometry — but leaving them at
-# the requested 640×480 would be a loaded gun for the next person who does.
-CAM_WIDTH, CAM_HEIGHT = stream.width, stream.height
-
-if stream.downscaled:
-    print(f"[camera] native {stream.native_width}×{stream.native_height} "
-          f"→ processing at {stream.width}×{stream.height} "
-          f"({stream.scale:.2f}× scale, full field of view kept)")
-    _kept = ((stream.width * stream.height)
-             / (stream.native_width * stream.native_height))
-    print(f"         {(1 - _kept) * 100:.0f}% "
-          f"fewer pixels per frame for MediaPipe to chew through\n")
-else:
-    print(f"[camera] {stream.width}×{stream.height} native, "
-          f"no rescale needed\n")
-
-# ─── MediaPipe setup ────────────────────────────────────────────────────────
-
+# Attribute lookups on an already-imported package: no graph is built and
+# no model is loaded here, so these stay at module scope where both the
+# engine and any external caller can reach them.  The expensive part —
+# mp_hands.Hands(...) — happens in _ensure_mediapipe(), on start().
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
-_hand_kwargs = dict(
-    static_image_mode=False,        # video stream mode (faster, uses tracking)
-    max_num_hands=MAX_NUM_HANDS,    # 2 for the two-handed YOLO vocabulary
-    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-    min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
-)
 
-# model_complexity arrived partway through the 0.8.x line.  Falling back
-# rather than crashing keeps every 0.8.x build usable; on 0.8.11 the Lite
-# graph is selected normally.
-#
-# Wrapped in quiet_stderr(): this is the ONE noisy moment in the program.
-# Four TFLite/absl lines are written straight to fd 2 by C++, and measured
-# here they appear during the FIRST process() call rather than the
-# constructor — MediaPipe's graph builds lazily on worker threads, so the
-# constructor returns before they are flushed.  Suppressing around the
-# constructor alone therefore does nothing; the warm-up call below is what
-# holds the window open long enough to catch them, deterministically.
-#
-# The warm-up earns its place anyway: it builds the graph here instead of
-# stalling the first real frame.  The frame size is arbitrary — landmarks
-# are normalised, and this result is discarded.
-#
-# The window closes before the YOLO worker exists, so no other thread's
-# output can be swallowed by it.
-with quiet_stderr():
-    try:
-        hands = mp_hands.Hands(model_complexity=MODEL_COMPLEXITY,
-                               **_hand_kwargs)
-        _complexity_note = f"model_complexity={MODEL_COMPLEXITY} (Lite)"
-    except TypeError:
-        hands = mp_hands.Hands(**_hand_kwargs)
-        _complexity_note = "model_complexity unsupported by this build"
-    hands.process(np.zeros((INFER_WARMUP_H, INFER_WARMUP_W, 3), np.uint8))
+class HandTrackerEngine:
+    """The tracking pipeline, on its own thread, with no window of its own.
 
-# ─── YOLO gesture branch ────────────────────────────────────────────────────
+    Lifecycle:
 
-fsm = None
-fsm_status = "unavailable (gesture_fsm.py not importable)"
+        engine = HandTrackerEngine()
+        engine.start(camera_index=0)     # opens hardware, starts the thread
+        frame = engine.get_latest_frame()  # newest BGR frame, or None
+        engine.stop()                    # releases the camera, keeps the rest
+        engine.close()                   # releases everything
 
-if _FSM_AVAILABLE:
-    # Every binding now comes from gesture_config.json, which app.py writes.
-    # The FSM_* constants above are no longer the source of truth; they are
-    # kept only because other parts of this file still print them.
-    _cfg = load_config()
-    fsm = GestureFSM(_cfg)
-    fsm_status = "running"
+    start() is safe to call again with a different index — it stops the
+    current capture first — which is what makes camera switching from a GUI
+    work without leaking a device.
 
-    # The same file also carries the cursor settings the GUI edits.  They
-    # are applied here, after the module defaults above and before anything
-    # reads them: CURSOR_SENSITIVITY is looked up fresh by to_screen(), and
-    # the two direction flags are latched into was_mirrored/was_inverted
-    # further down.  Absent keys leave the module default in place, so an
-    # old config still starts.
-    _settings = _cfg.get("settings") or {}
+    The three direction/speed settings stay MODULE-level globals because
+    ScreenGeometry.to_screen() reads them by name on every call; the setter
+    methods below rebind them, which is what makes a change take effect on
+    the very next frame with no object to keep in sync.
+    """
 
-    try:
-        CURSOR_SENSITIVITY = clamp(
-            float(_settings.get("cursor_sensitivity", CURSOR_SENSITIVITY)),
-            SENS_MIN, SENS_MAX)
-    except (TypeError, ValueError):
-        print("[config] cursor_sensitivity is not a number — keeping "
-              f"{CURSOR_SENSITIVITY}")
+    def __init__(self, *, enable_yolo=YOLO_ENABLED,
+                 enable_macros=YOLO_MACRO_ENABLED,
+                 enable_monitor=False, verbose=True):
+        self.verbose = bool(verbose)
+        self._enable_yolo = bool(enable_yolo)
+        self._enable_macros = bool(enable_macros)
+        self._enable_monitor = bool(enable_monitor)
 
-    IS_MIRRORED = bool(_settings.get("is_mirrored", IS_MIRRORED))
-    INVERT_CURSOR_X = bool(_settings.get("invert_cursor_x", INVERT_CURSOR_X))
+        # Pin OpenCV's internal thread pool before anything uses it.
+        if OPENCV_THREADS:
+            cv2.setNumThreads(OPENCV_THREADS)
 
-    # Two reflections cancel; so does neither.  Refusing to start with a
-    # backwards cursor is not an option — the user may have meant it — but
-    # saying so is, because the symptom (picture right, cursor wrong) does
-    # not point at its cause.
-    if IS_MIRRORED == INVERT_CURSOR_X:
-        print(f"[config] is_mirrored and invert_cursor_x are both "
-              f"{str(IS_MIRRORED).upper()} — these cancel out and the cursor "
-              f"will run backwards. Turn exactly one on, in app.py or with "
-              f"'m'/'i' at runtime.")
+        # Cheap, hardware-free setup.  Constructing the engine must not
+        # open a camera, so a GUI can build one before the user has chosen
+        # which device to connect to.
+        self.backend = make_backend()
+        self.cursor = make_cursor(self.backend)
+        self.actions = ActionDispatcher(self.cursor)
 
-if fsm is not None:
-    print(f"[action] config-driven FSM running — {fsm.describe()}")
-    for _rule in fsm.rules:
-        print(f"          {_rule.name:<28} -> {_rule.action}")
-else:
-    print(f"[action] {fsm_status} — movement only")
+        self.stream = None
+        self.screen = None
+        self.hands = None
+        self.fsm = None
+        self.macros = None
+        self.yolo_worker = None
+        self.monitor_process = None
+        self.camera_index = None
 
-yolo_worker = None
-yolo_status = "disabled"
+        self._thread = None
+        self._stop_event = threading.Event()
 
-if YOLO_ENABLED:
-    if not os.path.exists(YOLO_MODEL_PATH):
-        yolo_status = f"model not found at {YOLO_MODEL_PATH}"
-    else:
+        # Published by the loop, read by whoever wants a preview.  A single
+        # attribute rebind is atomic under the GIL, so a reader gets either
+        # the previous frame or the new one and never a half-written array
+        # — the same lock-free arrangement WebcamStream uses.
+        self._latest_frame = None
+
+        self.status = {
+            "running": False, "camera_index": None, "fps": 0.0,
+            "gesture": None, "stable_gesture": None, "dragging": False,
+            "clicks": 0, "drags": 0, "yolo": None, "yolo_score": 0.0,
+            "yolo_ms": 0.0, "error": None,
+        }
+
+        self._apply_config()
+
+    # ── configuration ───────────────────────────────────────────────────
+
+    def _apply_config(self) -> None:
+        """Build the FSM and adopt the cursor settings from the config."""
+        global CURSOR_SENSITIVITY, IS_MIRRORED, INVERT_CURSOR_X
+
+        if not _FSM_AVAILABLE:
+            self._log("[action] gesture_fsm.py not importable — movement only")
+            return
+
+        cfg = load_config()
+        self.fsm = GestureFSM(cfg)
+
+        settings = cfg.get("settings") or {}
         try:
-            yolo_worker = YoloWorker(YOLO_MODEL_PATH, YOLO_CLASS_NAMES,
-                                     fsm=None)
-            yolo_worker.start()
-            yolo_status = "running"
+            CURSOR_SENSITIVITY = clamp(
+                float(settings.get("cursor_sensitivity", CURSOR_SENSITIVITY)),
+                SENS_MIN, SENS_MAX)
+        except (TypeError, ValueError):
+            self._log("[config] cursor_sensitivity is not a number — keeping "
+                      f"{CURSOR_SENSITIVITY}")
+
+        IS_MIRRORED = bool(settings.get("is_mirrored", IS_MIRRORED))
+        INVERT_CURSOR_X = bool(settings.get("invert_cursor_x",
+                                            INVERT_CURSOR_X))
+
+        if IS_MIRRORED == INVERT_CURSOR_X:
+            self._log(f"[config] is_mirrored and invert_cursor_x are both "
+                      f"{str(IS_MIRRORED).upper()} — these cancel out and the "
+                      f"cursor will run backwards. Turn exactly one on.")
+
+        self._log("[action] config-driven FSM running — "
+                  f"{self.fsm.describe()}")
+        for rule in self.fsm.rules:
+            self._log(f"          {rule.name:<28} -> {rule.action}")
+
+    def reload_config(self) -> None:
+        """Re-read gesture_config.json without restarting the camera."""
+        self._apply_config()
+
+    # ── lifecycle ───────────────────────────────────────────────────────
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, camera_index: int = 0) -> bool:
+        """Open the camera and begin tracking.  True if the thread started.
+
+        Stops any capture already running first, so switching cameras from
+        a GUI cannot leave the previous device held open.
+        """
+        self.stop()
+        self._stop_event.clear()
+        self.status["error"] = None
+
+        try:
+            self.stream = WebcamStream(int(camera_index), CAM_WIDTH,
+                                       CAM_HEIGHT, CAM_FPS,
+                                       api=self.backend.camera_api)
         except Exception as exc:
-            yolo_worker = None
-            yolo_status = f"unavailable ({exc.__class__.__name__}: {exc})"
+            self.stream = None
+            message = f"{exc.__class__.__name__}: {exc}"
+            self.status["error"] = message
+            self._log(f"[camera] index {camera_index} could not be opened: "
+                      f"{message}")
+            return False
 
-if yolo_status == "running":
-    print(f"[yolo] semantic branch starting — loading ultralytics in the "
-          f"background, ~11s to first prediction")
-else:
-    print(f"[yolo] semantic branch {yolo_status} — cursor unaffected")
+        self.camera_index = int(camera_index)
+        self.status["camera_index"] = self.camera_index
 
-# ─── State variables ────────────────────────────────────────────────────────
+        if self.stream.downscaled:
+            self._log(f"[camera] native {self.stream.native_width}×"
+                      f"{self.stream.native_height} → processing at "
+                      f"{self.stream.width}×{self.stream.height}")
+        else:
+            self._log(f"[camera] {self.stream.width}×{self.stream.height} "
+                      f"native, no rescale needed")
 
-screen = ScreenGeometry(backend, stream.width, stream.height, POLL_INTERVAL)
+        self.screen = ScreenGeometry(self.backend, self.stream.width,
+                                     self.stream.height, POLL_INTERVAL)
+        self._ensure_mediapipe()
+        self._ensure_macros()
+        self._ensure_yolo()
+        self._ensure_monitor()
 
-# Create separate One Euro Filters for X and Y axes.
-_oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
-                       d_cutoff=D_CUTOFF)
-_oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
-                       d_cutoff=D_CUTOFF)
+        self._thread = threading.Thread(target=self._run, name="HandTracker",
+                                        daemon=True)
+        self._thread.start()
+        self.status["running"] = True
+        return True
 
-# Tracks whether a hand was visible on the *previous* frame.  A False → True
-# transition means the hand just re-entered the frame, which is when the
-# filters must be reset.  A display change also lowers this flag, reusing the
-# same snap-to-target path (see the main loop).
-hand_present = False
+    def stop(self) -> None:
+        """Release the camera and stop the loop.  Safe to call any time.
 
-# Mirror state as of the previous frame, so a mid-run 'm' can be spotted and
-# the filters reset before the cursor tries to glide to the mirrored position.
-was_mirrored = IS_MIRRORED
+        The mouse button is dropped FIRST.  A drag interrupted by a camera
+        switch has no gesture left to end it, and a button still held after
+        the loop exits leaves the desktop selecting text.
+        """
+        self._stop_event.set()
 
-# The same, for the control-only reflection behind 'i'.  Both toggles move
-# the mapped position discontinuously, so both need the snap.
-was_inverted = INVERT_CURSOR_X
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
 
-# ── Gesture state ──────────────────────────────────────────────────────────
-# gesture_state is the pose as of the last frame; a mismatch is a transition
-# and starts the freeze.  None means "no hand yet", which is distinct from
-# "idle" (a hand present in no recognised pose).
-gesture_state = None
-gesture = "idle"
-fingers_ext = (False, False, False, False)
-thumb_out = False
-frozen_target = None
-freeze_until = 0.0
-gesture_changes = 0
+        if self.actions.release():
+            self._log("[action] DRAG_STOP (engine stopped)")
+        if self.fsm is not None:
+            self.fsm.reset()
 
-actions = ActionDispatcher(cursor)
-stable_gesture = None
-primary_anchor = None
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+            except Exception:
+                pass
+            self.stream = None
 
-yolo_action_count = 0
-last_yolo_action = None
-last_yolo_action_time = 0.0
+        self._latest_frame = None
+        self.status["running"] = False
+        self.status["camera_index"] = None
+        self.status["fps"] = 0.0
 
-# Sequence number of the last frame actually processed, so duplicates can be
-# skipped instead of re-running inference on data we already consumed.
-last_seq = -1
+    def close(self) -> None:
+        """Full teardown: camera, model, worker, monitor, cursor, backend."""
+        self.stop()
 
-# Reusable frame buffers.  cv2.flip() and cv2.cvtColor() each allocate a
-# fresh array when given no destination; writing into preallocated buffers
-# instead removes two full-frame allocations per frame (~1.8 MB at 640×480×3,
-# roughly 55 MB/s of churn at 30 FPS) along with the matching GC pressure.
-# Allocated lazily because the camera may not honour the requested size.
-bgr_buf = None      # mirrored frame: drawn on and displayed, full size
-infer_bgr = None    # downscaled BGR staging buffer (None when fed 1:1)
-rgb_buf = None      # colour-converted copy handed to MediaPipe
-infer_w = infer_h = 0
-infer_div = 1
-infer_interp = cv2.INTER_AREA
+        if self.yolo_worker is not None:
+            try:
+                self.yolo_worker.stop()
+            except Exception:
+                pass
+            self.yolo_worker = None
 
-# Last smoothed position — retained only for the on-screen jump readout.
-prev_x, prev_y = screen.center
+        if self.hands is not None:
+            try:
+                self.hands.close()
+            except Exception:
+                pass
+            self.hands = None
 
-# perf_counter() is monotonic and sub-microsecond.  time.time() on Windows
-# is backed by GetSystemTimeAsFileTime, whose ~15.6 ms granularity would
-# badly quantise the dt estimate the 1€ filter depends on at 60 FPS.
-prev_time = time.perf_counter()
+        if self.monitor_process is not None and \
+                self.monitor_process.poll() is None:
+            try:
+                self.monitor_process.terminate()
+                self.monitor_process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.monitor_process.kill()
+            except Exception:
+                pass
+            self.monitor_process = None
 
-# ─── Main loop ──────────────────────────────────────────────────────────────
+        for closer in (self.cursor, self.backend):
+            try:
+                closer.close()
+            except Exception:
+                pass
 
-print(f"Platform    : {backend.name}")
-print(f"Cursor out  : {cursor.name}"
-      + ("  (one API for Windows+Linux; click ready for gestures)"
-         if cursor.name == "pynput"
-         else "  (ctypes fallback — pynput not importable)"))
-print(f"Screen src  : {screen.source}"
-      + ("  (ctypes virtual desktop — origin, monitor count, hot-plug)"
-         if screen.source == "native"
-         else "  (tkinter vroot — no negative origin, no hot-plug)"))
-print(f"Virtual desk: {screen.describe()}")
-print(f"DPI         : {getattr(backend, 'dpi_awareness', 'not-windows')} "
-      f"— metrics are true pixels, not scaled")
-print(f"Webcam      : index {camera_index}, native {stream.native_width}×"
-      f"{stream.native_height} @ {CAM_FPS} FPS requested")
-print(f"Processing  : {stream.width} × {stream.height} "
-      f"({stream.width / stream.height:.2f}:1)"
-      + ("  [downscaled, aspect preserved]" if stream.downscaled
-         else "  [native, no rescale]"))
-if stream.size_mismatch:
-    print(f"              driver reports {stream.reported_width}×"
-          f"{stream.reported_height}; using the delivered frame size")
-print(f"Active box  : {screen.box_w} × {screen.box_h} px  "
-      f"x[{screen.box_left}–{screen.box_right}]  "
-      f"y[{screen.box_top}–{screen.box_bottom}]")
-print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
-      f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
-_mx, _mt, _mb = sanitise_margins()
-print(f"Edge margins: x {_mx:.0%} each side; "
-      f"y {_mt:.0%} top / {_mb:.0%} bottom")
-print(f"              → live band is x[{_mx:.0%}–{1 - _mx:.0%}] "
-      f"y[{_mt:.0%}–{1 - _mb:.0%}] of the frame "
-      f"({1 - 2 * _mx:.0%}×{1 - _mt - _mb:.0%})")
-print(f"              screen bottom is reached at {1 - _mb:.0%} down the "
-      f"frame, not {100:.0f}% — no need to drop the hand past the desk")
-_gx = screen.width / max(1, screen.box_w)
-_gy = screen.height / max(1, screen.box_h)
-print(f"Gain        : {_gx:.1f} screen px per camera px horizontally, "
-      f"{_gy:.1f} vertically  (ratio {_gx / _gy:.2f})")
-if abs(_gx / _gy - 1.0) > 0.15:
-    print(f"              anisotropic — a diagonal sweep will not trace a "
-          f"straight diagonal.")
-    # Equal gain needs the vertical band to be this fraction of the frame.
-    _want_band = ((1 - 2 * _mx) * (screen.height / screen.width)
-                  * (stream.width / stream.height))
-    if 0.05 < _want_band < 1.0:
-        # Shrink the current top/bottom split to that band, keeping its ratio.
-        _shrink = (1 - _want_band) / max(1e-6, _mt + _mb)
-        print(f"              MARGIN_TOP ≈ {_mt * _shrink:.2f} / "
-              f"MARGIN_BOTTOM ≈ {_mb * _shrink:.2f} would equalise it "
-              f"(at the cost of vertical room)")
-print(f"Mirroring   : {'ON' if IS_MIRRORED else 'OFF'} — press 'm' to flip "
-      f"the picture AND the control direction together")
-print(f"Invert X    : {'ON' if INVERT_CURSOR_X else 'OFF'} — press 'i' for "
-      f"control-only inversion (picture unchanged)")
-print(f"Anchor      : landmark {LM_MIDDLE_MCP} (middle-finger MCP) — the "
-      f"knuckle, not the index tip")
-print(f"              it barely moves when fingers bend, so gesturing does "
-      f"not drag the cursor")
-print(f"Gestures    : point / peace / grip / open / idle, from finger "
-      f"geometry only")
-print(f"              transitions freeze the target for {STATE_FREEZE_MS} ms "
-      f"to absorb the hand twitch")
-if fsm is not None:
-    print(f"Clicking    : '{FSM_CLICK_TRANSITION[0]}' → "
-          f"'{FSM_CLICK_TRANSITION[1]}' on the {FPS_NOTE} geometric path, "
-          f"double within {FSM_DOUBLE_CLICK_SECONDS}s")
-    print(f"              {FSM_WINDOW}/{FSM_THRESHOLD} stability window; "
-          f"{'/'.join(FSM_IGNORED_STATES)} is an abstention and never "
-          f"reaches the FSM")
-else:
-    print(f"Clicking    : {fsm_status}")
-if yolo_worker is not None:
-    print(f"YOLO branch : {os.path.basename(YOLO_MODEL_PATH)} on a worker "
-          f"thread, {YOLO_INPUT_SIZE}×{YOLO_INPUT_SIZE} input")
-    print(f"              OBSERVING ONLY — logs what it sees, bound to no "
-          f"action yet")
-    print(f"              depth-1 queue, newest crop wins — the main loop "
-          f"never waits on inference")
-else:
-    print(f"YOLO branch : {yolo_status}")
-print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  d_cutoff={D_CUTOFF}")
-print(f"MediaPipe   : {_complexity_note}, "
-      f"det={MIN_DETECTION_CONFIDENCE} track={MIN_TRACKING_CONFIDENCE}")
-_iw, _ih, _idiv, _iint = pick_infer_size(stream.width, stream.height)
-if _idiv > 1:
-    print(f"Inference at: {_iw}×{_ih} (1/{_idiv} of the preview) — preview "
-          f"stays {stream.width}×{stream.height}")
-    print(f"              landmarks are normalised, so no coordinate "
-          f"correction is applied or needed")
-else:
-    print(f"Inference at: {_iw}×{_ih} — same as the preview")
-print(f"Backend     : {describe_api(backend.camera_api)}"
-      f"  (set CAMERA_API to pin one)")
-_buf_note = ("accepted" if stream.buffersize_accepted else
-             "refused — harmless, the capture thread already drops "
-             "stale frames")
-print(f"OpenCV      : {cv2.getNumThreads()} thread(s), "
-      f"buffersize=1 {_buf_note}")
-print(f"Frame bufs  : preallocated (no per-frame flip/convert allocation)")
-print(f"Display poll: every {POLL_INTERVAL}s (hot-plug aware)")
-print("Controls    : '+'/'=' faster   '-'/'_' slower   'q' quit")
-print("(the preview window must have focus for keys to register)\n")
+    def __enter__(self):
+        return self
 
-try:
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+    # ── frame hand-off ──────────────────────────────────────────────────
+
+    def get_latest_frame(self):
+        """Newest BGR frame with overlays drawn, or None before the first.
+
+        Thread-safe without a lock: the loop publishes by rebinding one
+        attribute, which is atomic under the GIL, and the array it points
+        at is never written to again.
+        """
+        return self._latest_frame
+
+    # ── runtime controls (the keys the standalone preview binds) ────────
+
+    def adjust_sensitivity(self, delta: float) -> float:
+        global CURSOR_SENSITIVITY
+        CURSOR_SENSITIVITY = round(
+            clamp(CURSOR_SENSITIVITY + delta, SENS_MIN, SENS_MAX), 2)
+        return CURSOR_SENSITIVITY
+
+    def set_sensitivity(self, value: float) -> float:
+        global CURSOR_SENSITIVITY
+        CURSOR_SENSITIVITY = round(clamp(float(value), SENS_MIN, SENS_MAX), 2)
+        return CURSOR_SENSITIVITY
+
+    def toggle_mirror(self) -> bool:
+        global IS_MIRRORED
+        IS_MIRRORED = not IS_MIRRORED
+        self._log(f"[mirror] preview {'MIRRORED' if IS_MIRRORED else 'RAW'}")
+        return IS_MIRRORED
+
+    def toggle_invert(self) -> bool:
+        global INVERT_CURSOR_X
+        INVERT_CURSOR_X = not INVERT_CURSOR_X
+        self._log(f"[invert] control-only X inversion "
+                  f"{'ON' if INVERT_CURSOR_X else 'OFF'}")
+        return INVERT_CURSOR_X
+
+    def handle_key(self, key: int) -> bool:
+        """Route one cv2.waitKey code.  True means 'quit' was pressed."""
+        return handle_key(key)
+
+    # ── subsystem construction ──────────────────────────────────────────
+
+    def _ensure_mediapipe(self) -> None:
+        if self.hands is not None:
+            return
+        kwargs = dict(
+            static_image_mode=False,
+            max_num_hands=MAX_NUM_HANDS,
+            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+        )
+        # The noisy moment: four TFLite/absl lines are written to fd 2 by
+        # C++ during the FIRST process() call, not the constructor, so the
+        # warm-up below is what holds the suppression window open long
+        # enough to catch them.  It earns its place anyway by building the
+        # graph here instead of stalling the first real frame.
+        with quiet_stderr():
+            try:
+                self.hands = mp_hands.Hands(
+                    model_complexity=MODEL_COMPLEXITY, **kwargs)
+            except TypeError:
+                self.hands = mp_hands.Hands(**kwargs)
+            self.hands.process(
+                np.zeros((INFER_WARMUP_H, INFER_WARMUP_W, 3), np.uint8))
+
+    def _ensure_macros(self) -> None:
+        if self.macros is not None or not self._enable_macros:
+            return
+        if not YOLO_MACROS:
+            return
+        try:
+            self.macros = MacroDispatcher(YOLO_MACROS)
+        except Exception as exc:
+            self.macros = None
+            self._log(f"[macro] keyboard macros unavailable "
+                      f"({exc.__class__.__name__}: {exc})")
+
+    def _ensure_yolo(self) -> None:
+        if self.yolo_worker is not None or not self._enable_yolo:
+            return
+        if not os.path.exists(YOLO_MODEL_PATH):
+            self._log(f"[yolo] model not found at {YOLO_MODEL_PATH} — "
+                      f"cursor unaffected")
+            return
+        try:
+            self.yolo_worker = YoloWorker(YOLO_MODEL_PATH, YOLO_CLASS_NAMES,
+                                          fsm=None)
+            self.yolo_worker.start()
+            self._log("[yolo] semantic branch starting in the background")
+        except Exception as exc:
+            self.yolo_worker = None
+            self._log(f"[yolo] unavailable ({exc.__class__.__name__}: {exc})")
+
+    def _ensure_monitor(self) -> None:
+        if self.monitor_process is not None or not self._enable_monitor:
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "system_monitor.py")
+        try:
+            self.monitor_process = subprocess.Popen(
+                [sys.executable, script, str(os.getpid())])
+            self._log(f"[monitor] resource window started "
+                      f"(pid {self.monitor_process.pid})")
+        except Exception as exc:
+            self.monitor_process = None
+            self._log(f"[monitor] could not start: "
+                      f"{exc.__class__.__name__}: {exc}")
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(message)
+
+    # ── the loop ────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        """The tracking loop.  Identical to the original, minus the window.
+
+        Everything here is what the module-level `while True` used to do.
+        The two differences are at the ends: there is no cv2.waitKey to
+        pump a GUI or yield the CPU, so a duplicate frame sleeps briefly
+        instead; and the finished frame is published rather than shown.
+        """
+        stream = self.stream
+        screen = self.screen
+        hands = self.hands
+        fsm = self.fsm
+        actions = self.actions
+        yolo_worker = self.yolo_worker
+        macros = self.macros
+
+        oef_x = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
+                              d_cutoff=D_CUTOFF)
+        oef_y = OneEuroFilter(freq=30.0, min_cutoff=MIN_CUTOFF, beta=BETA,
+                              d_cutoff=D_CUTOFF)
+
+        hand_present = False
+        was_mirrored = IS_MIRRORED
+        was_inverted = INVERT_CURSOR_X
+
+        gesture_state = None
+        gesture = "idle"
+        fingers_ext = (False, False, False, False)
+        thumb_out = False
+        frozen_target = None
+        freeze_until = 0.0
+        gesture_changes = 0
+        stable_gesture = None
+        primary_anchor = None
+
+        yolo_action_count = 0
+        last_seq = -1
+
+        bgr_buf = None
+        infer_bgr = None
+        rgb_buf = None
+        infer_w = infer_h = 0
+        infer_div = 1
+        infer_interp = cv2.INTER_AREA
+        frame_h = frame_w = 0
+
+        prev_x, prev_y = screen.center
+        prev_time = time.perf_counter()
+
+        try:
+            while not self._stop_event.is_set():
+                success, raw_frame, seq = stream.read()
+                if not success:
+                    time.sleep(0.001)
+                    continue
+
+                # ── Duplicate frame guard ───────────────────────────────
+                # The loop can outrun the camera.  Re-running MediaPipe on
+                # a frame already processed costs a full inference for an
+                # identical answer.  The original yielded here through
+                # cv2.waitKey(1); with no window there is nothing to pump,
+                # so the sleep is what keeps this from spinning a core.
+                if seq == last_seq:
+                    time.sleep(0.001)
+                    continue
+                last_seq = seq
+
+                now_ts = time.perf_counter()
+
+                # ── Display hot-plug polling ────────────────────────────
+                if screen.poll(now_ts):
+                    self._log(f"[display] geometry changed → "
+                              f"{screen.describe()}")
+                    hand_present = False
+
+                # ── Buffer preparation (allocation-free steady state) ───
+                if bgr_buf is None or bgr_buf.shape != raw_frame.shape:
+                    bgr_buf = np.empty_like(raw_frame)
+                    frame_h, frame_w = raw_frame.shape[:2]
+
+                    infer_w, infer_h, infer_div, infer_interp = \
+                        pick_infer_size(frame_w, frame_h)
+                    if infer_div > 1:
+                        infer_bgr = np.empty((infer_h, infer_w, 3),
+                                             raw_frame.dtype)
+                        rgb_buf = np.empty((infer_h, infer_w, 3),
+                                           raw_frame.dtype)
+                        self._log(f"[infer] MediaPipe fed {infer_w}×{infer_h} "
+                                  f"(1/{infer_div} of {frame_w}×{frame_h})")
+                    else:
+                        infer_bgr = None
+                        rgb_buf = np.empty_like(raw_frame)
+                        self._log(f"[infer] MediaPipe fed the full "
+                                  f"{frame_w}×{frame_h} frame")
+
+                    if screen.set_camera_size(frame_w, frame_h):
+                        self._log(f"[camera] frame size now {frame_w}×"
+                                  f"{frame_h} → box rebuilt to "
+                                  f"{screen.box_w}×{screen.box_h}")
+                        hand_present = False
+
+                # ── Mirror, or don't ────────────────────────────────────
+                if IS_MIRRORED:
+                    cv2.flip(raw_frame, 1, dst=bgr_buf)
+                else:
+                    np.copyto(bgr_buf, raw_frame)
+
+                # Either toggle reflects the mapped position instantly, so
+                # both route the next frame through the re-entry reset and
+                # the cursor snaps rather than gliding across the desktop.
+                if IS_MIRRORED != was_mirrored or \
+                        INVERT_CURSOR_X != was_inverted:
+                    was_mirrored = IS_MIRRORED
+                    was_inverted = INVERT_CURSOR_X
+                    hand_present = False
+
+                # ── Feed MediaPipe ──────────────────────────────────────
+                if infer_bgr is not None:
+                    cv2.resize(bgr_buf, (infer_w, infer_h), dst=infer_bgr,
+                               interpolation=infer_interp)
+                    cv2.cvtColor(infer_bgr, cv2.COLOR_BGR2RGB, dst=rgb_buf)
+                else:
+                    cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
+
+                rgb_buf.flags.writeable = False
+                results = hands.process(rgb_buf)
+                rgb_buf.flags.writeable = True
+
+                if results.multi_hand_landmarks:
+                    detected_hands = results.multi_hand_landmarks
+                    hand = pick_primary_hand(detected_hands, primary_anchor)
+
+                    anchor = hand.landmark[LM_MIDDLE_MCP]
+                    primary_anchor = (anchor.x, anchor.y)
+
+                    raw_x = anchor.x * screen.cam_w
+                    raw_y = anchor.y * screen.cam_h
+
+                    gesture, fingers_ext, thumb_out = detect_gesture(
+                        hand, screen.cam_w, screen.cam_h)
+
+                    if yolo_worker is not None:
+                        yolo_worker.submit(bgr_buf.copy())
+
+                    target_x, target_y = screen.to_screen(raw_x, raw_y)
+
+                    if not hand_present:
+                        oef_x.reset()
+                        oef_y.reset()
+                        prev_x, prev_y = target_x, target_y
+                        hand_present = True
+                        gesture_state = None
+                        frozen_target = None
+                        freeze_until = 0.0
+
+                    if gesture != gesture_state:
+                        previous = gesture_state
+                        gesture_state = gesture
+                        frozen_target = (target_x, target_y)
+                        freeze_until = now_ts + STATE_FREEZE_MS / 1000.0
+                        gesture_changes += 1
+                        self._log(f"[gesture] {previous or '-'} -> {gesture}"
+                                  f"   (hold {STATE_FREEZE_MS} ms)")
+
+                    if fsm is not None and gesture not in FSM_IGNORED_STATES:
+                        stable_gesture, action = fsm.update_pair(gesture,
+                                                                 now_ts)
+                        if action is not None:
+                            actions.dispatch(action, now_ts)
+
+                    if frozen_target is not None:
+                        if now_ts < freeze_until:
+                            target_x, target_y = frozen_target
+                        else:
+                            frozen_target = None
+
+                    smooth_x = oef_x(target_x, timestamp=now_ts)
+                    smooth_y = oef_y(target_y, timestamp=now_ts)
+
+                    self.cursor.move(int(smooth_x), int(smooth_y))
+
+                    # Kept as the reference point the re-entry reset snaps
+                    # to; the per-frame travel readout it used to feed was
+                    # part of the removed text block.
+                    prev_x = smooth_x
+                    prev_y = smooth_y
+
+                    # ── Overlays ────────────────────────────────────────
+                    mp_draw.draw_landmarks(bgr_buf, hand,
+                                           mp_hands.HAND_CONNECTIONS)
+
+                    cx, cy = int(raw_x), int(raw_y)
+                    _frozen = (frozen_target is not None
+                               and now_ts < freeze_until)
+                    _anchor_col = (0, 165, 255) if _frozen else (0, 255, 0)
+                    cv2.circle(bgr_buf, (cx, cy), 11, _anchor_col, cv2.FILLED)
+                    cv2.circle(bgr_buf, (cx, cy), 15, _anchor_col, 2)
+
+                    _it = hand.landmark[LM_INDEX_TIP]
+                    cv2.circle(bgr_buf,
+                               (int(_it.x * screen.cam_w),
+                                int(_it.y * screen.cam_h)),
+                               5, (200, 200, 200), 1)
+
+                else:
+                    hand_present = False
+                    # FAILSAFE, and the order matters: drop the button
+                    # BEFORE clearing the FSM.  The hand is gone, so no
+                    # further transition is coming to end the drag.
+                    if actions.release():
+                        self._log("[action] DRAG_STOP (hand lost)")
+                    if fsm is not None:
+                        fsm.reset()
+                    stable_gesture = None
+                    primary_anchor = None
+                    if yolo_worker is not None:
+                        yolo_worker.request_reset()
+                    if gesture_state is not None:
+                        self._log(f"[gesture] {gesture_state} -> (hand lost)")
+                    gesture_state = None
+                    gesture = "idle"
+                    fingers_ext = (False, False, False, False)
+                    thumb_out = False
+                    frozen_target = None
+                    freeze_until = 0.0
+
+                # ── YOLO output drain (non-blocking) ────────────────────
+                if yolo_worker is not None:
+                    while True:
+                        queued = yolo_worker.poll()
+                        if queued is None:
+                            break
+                        yolo_action_count += 1
+
+                # ── Semantic macros (slow path, edge-triggered) ─────────
+                if macros is not None and yolo_worker is not None:
+                    _mg, _ms, _ = yolo_worker.current_state
+                    macros.update(_mg, _ms, now_ts)
+
+                # ── Boxes ───────────────────────────────────────────────
+                cv2.rectangle(bgr_buf,
+                              (screen.box_left, screen.box_top),
+                              (screen.box_right, screen.box_bottom),
+                              (255, 0, 255), 2)
+
+                _eff = screen.effective_box
+                if _eff is not None:
+                    cv2.rectangle(bgr_buf, (_eff[0], _eff[1]),
+                                  (_eff[2], _eff[3]), (0, 165, 255), 1)
+
+                # ── Per-frame state, no longer drawn on the frame ───────
+                # The debug text block that used to live here (FPS, speed,
+                # mirror state, gesture, stability, YOLO label, desktop
+                # size, key hints) is gone: the GUI shows all of it in real
+                # widgets, so burning it into the pixels only made the
+                # preview messy and cost a putText per line per frame.
+                # The landmarks, the anchor markers and the two boxes stay
+                # — those are the parts you cannot read off a label.
+                fps = 1.0 / (now_ts - prev_time) if now_ts > prev_time else 0.0
+                prev_time = now_ts
+
+                if yolo_worker is not None:
+                    _yg, _ys, _yms = yolo_worker.current_state
+                    self.status["yolo"] = _yg
+                    self.status["yolo_score"] = _ys
+                    self.status["yolo_ms"] = _yms
+
+                # ── Publish, instead of cv2.imshow ──────────────────────
+                # A copy, because bgr_buf is reused in place next frame and
+                # a consumer holding a view would watch it change mid-draw.
+                # The rebind itself is atomic, so no lock is needed.
+                self._latest_frame = bgr_buf.copy()
+
+                self.status.update({
+                    "fps": fps, "gesture": gesture,
+                    "stable_gesture": stable_gesture,
+                    "dragging": actions.dragging,
+                    "clicks": actions.click_count,
+                    "drags": actions.drag_count,
+                    "gesture_changes": gesture_changes,
+                    "frozen": frozen_target is not None
+                    and now_ts < freeze_until,
+                    "last_action": actions.last_action,
+                })
+
+        except Exception as exc:                # pragma: no cover - runtime
+            self.status["error"] = f"{exc.__class__.__name__}: {exc}"
+            self._log(f"[engine] loop stopped: {self.status['error']}")
+        finally:
+            # The button must not outlive the loop, whatever ended it.
+            if self.actions.release():
+                self._log("[action] DRAG_STOP (loop exit)")
+            self.status["running"] = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STANDALONE SCRIPT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Unchanged behaviour: scan, prompt, open a preview window, drive the same
+# engine, and honour the same keys.  The imshow/waitKey pair lives here now
+# rather than inside the loop, which is exactly what lets a GUI host the
+# engine without inheriting a window it did not ask for.
+
+def _choose_camera_interactively(backend):
+    if CAM_INDEX is not None:
+        print(f"[camera] CAM_INDEX pinned to {CAM_INDEX}, skipping scan\n")
+        return CAM_INDEX
+    print(f"[camera] scanning indices 0–{CAM_SCAN_MAX}, backend "
+          f"{describe_api(backend.camera_api)} "
+          f"({CAM_SCAN_READ_TRIES} read attempts each)…\n")
+    return choose_camera(scan_cameras(CAM_SCAN_MAX, backend.camera_api))
+
+
+def main() -> None:
+    engine = HandTrackerEngine(enable_monitor=SYSTEM_MONITOR_ENABLED)
+
     while True:
-        success, raw_frame, seq = stream.read()
-        if not success:
-            continue
+        index = _choose_camera_interactively(engine.backend)
+        if engine.start(index):
+            break
+        print("         pick a different one.")
+        if CAM_INDEX is not None:
+            engine.close()
+            return
 
-        # ── Duplicate frame guard ───────────────────────────────────────
-        # The main loop can outrun the camera.  Re-running MediaPipe on a
-        # frame already processed costs a full inference and returns an
-        # identical answer, delaying the next *real* frame by that much.
-        # Skip it, but keep pumping the GUI — this branch is where most
-        # keypresses actually land, so it must handle them too.
-        if seq == last_seq:
+    screen = engine.screen
+    stream = engine.stream
+
+    print(f"Platform    : {engine.backend.name}")
+    print(f"Cursor out  : {engine.cursor.name}")
+    print(f"Screen src  : {screen.source}")
+    print(f"Virtual desk: {screen.describe()}")
+    print(f"Webcam      : index {engine.camera_index}, native "
+          f"{stream.native_width}×{stream.native_height}")
+    print(f"Processing  : {stream.width} × {stream.height}")
+    print(f"Active box  : {screen.box_w} × {screen.box_h} px")
+    print(f"Sensitivity : {CURSOR_SENSITIVITY}× start value, "
+          f"adjustable {SENS_MIN}–{SENS_MAX} in steps of {SENS_STEP}")
+    print(f"Mirroring   : {'ON' if IS_MIRRORED else 'OFF'}  |  "
+          f"Invert X: {'ON' if INVERT_CURSOR_X else 'OFF'}")
+    print(f"1€ Filter   : min_cutoff={MIN_CUTOFF}  β={BETA}  "
+          f"d_cutoff={D_CUTOFF}")
+    print("Controls    : '+'/'=' faster   '-'/'_' slower   "
+          "'m' mirror   'i' invert-x   'q' quit")
+    print("(the preview window must have focus for keys to register)\n")
+
+    try:
+        while engine.running:
+            frame = engine.get_latest_frame()
+            if frame is not None:
+                cv2.imshow("Hand Cursor Control", frame)
             if handle_key(cv2.waitKey(1) & 0xFF):
                 break
-            continue
-        last_seq = seq
+    finally:
+        engine.close()
+        if engine.actions.dragging:
+            print("[action] WARNING: could not release the mouse button")
+        if engine.fsm is not None:
+            print(f"[action] {engine.fsm.click_count} single, "
+                  f"{engine.fsm.double_click_count} double, "
+                  f"{engine.fsm.drag_start_count} drags — "
+                  f"{engine.actions.click_count} clicks and "
+                  f"{engine.actions.drag_count} presses reached the OS")
+        if engine.yolo_worker is not None:
+            print(f"[yolo] {engine.yolo_worker.inference_count} inferences, "
+                  f"{engine.yolo_worker.dropped_count} crops dropped")
+        cv2.destroyAllWindows()
+        print("Shutdown complete.")
 
-        # One timestamp per iteration, shared by the display poll, the 1€
-        # filter and the FPS counter so they cannot disagree about "now".
-        now_ts = time.perf_counter()
 
-        # ── Display hot-plug polling ────────────────────────────────────
-        # Cheap rate-limited check; returns True only on a real change.
-        # Lowering hand_present routes the next frame through the existing
-        # re-entry reset, so the filters snap into the new coordinate space
-        # instead of gliding from a position that may no longer exist.
-        if screen.poll(now_ts):
-            print(f"[display] geometry changed → {screen.describe()}")
-            hand_present = False
-
-        # ── Buffer preparation (allocation-free steady state) ───────────
-        # The capture thread owns raw_frame, so it is never written to in
-        # place; both transforms write into buffers this loop owns.
-        if bgr_buf is None or bgr_buf.shape != raw_frame.shape:
-            bgr_buf = np.empty_like(raw_frame)
-            frame_h, frame_w = raw_frame.shape[:2]
-
-            # ── Decoupled inference resolution ──────────────────────────
-            # bgr_buf stays at the full processing size: it is what gets
-            # drawn on and shown.  MediaPipe gets its own smaller pair of
-            # buffers, so the preview quality is independent of how hard
-            # the model is being pushed.
-            infer_w, infer_h, infer_div, infer_interp = pick_infer_size(
-                frame_w, frame_h)
-            if infer_div > 1:
-                # Two buffers: resize lands in BGR, colour conversion in RGB.
-                # Both preallocated once, so the steady state still allocates
-                # nothing per frame.
-                infer_bgr = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
-                rgb_buf = np.empty((infer_h, infer_w, 3), raw_frame.dtype)
-                _infer_kind = ("exact" if infer_interp == cv2.INTER_AREA
-                               else "fractional")
-                print(f"[infer] MediaPipe fed {infer_w}×{infer_h} "
-                      f"(1/{infer_div} of the {frame_w}×{frame_h} preview, "
-                      f"{_infer_kind})")
-            else:
-                infer_bgr = None
-                rgb_buf = np.empty_like(raw_frame)
-                print(f"[infer] MediaPipe fed the full {frame_w}×{frame_h} "
-                      f"frame (INFER_MAX_WIDTH disabled or already small)")
-            # The frame size is the canvas the box is drawn on, so a change
-            # here invalidates the box.  Rebuilding from the same numbers the
-            # buffers were sized with is what keeps the two in step.
-            if screen.set_camera_size(frame_w, frame_h):
-                print(f"[camera] frame size now {frame_w}×{frame_h} → "
-                      f"box rebuilt to {screen.box_w}×{screen.box_h} "
-                      f"at x[{screen.box_left}–{screen.box_right}] "
-                      f"y[{screen.box_top}–{screen.box_bottom}]")
-                # Snap rather than glide into the new box.
-                hand_present = False
-
-        # ── Mirror, or don't ────────────────────────────────────────────
-        # This one buffer is both what gets displayed and what MediaPipe
-        # reads, so the choice here sets the control direction as well as
-        # the picture.  np.copyto keeps the un-mirrored path allocation-free
-        # too, rather than dropping the preallocated buffer on the floor.
-        if IS_MIRRORED:
-            cv2.flip(raw_frame, 1, dst=bgr_buf)
-        else:
-            np.copyto(bgr_buf, raw_frame)
-
-        # A toggle mirrors the hand's mapped position instantly.  Route the
-        # next frame through the re-entry reset so the cursor snaps to the
-        # new spot rather than sweeping across the desktop to reach it.
-        # 'i' needs exactly the same treatment as 'm', and for exactly the
-        # same reason: it reflects the mapped position about the screen
-        # centre, so without the reset the 1€ filter *glides* the cursor
-        # across the whole desktop to the new target.  At low hand speed the
-        # filter is at its heaviest, so that glide takes long enough to read
-        # as "pressing i did nothing" while you fight it with the hand that
-        # is still being tracked.
-        if IS_MIRRORED != was_mirrored or INVERT_CURSOR_X != was_inverted:
-            was_mirrored = IS_MIRRORED
-            was_inverted = INVERT_CURSOR_X
-            hand_present = False
-
-        # ── Feed MediaPipe ──────────────────────────────────────────────
-        # Downscale first, then convert colour: cvtColor on the small image
-        # is a quarter of the work it would be on the large one, so this
-        # ordering is cheaper than converting and then shrinking.
-        #
-        # NO COORDINATE CORRECTION IS NEEDED after this, and adding one
-        # would break the mapping.  MediaPipe returns landmarks normalised
-        # to [0, 1] of the image it was handed; because the small copy is an
-        # exact rescale of the preview, "40% across" means the same place in
-        # both.  Multiplying by screen.cam_w below therefore lands in the
-        # PREVIEW's pixel space regardless of what size the model saw.
-        if infer_bgr is not None:
-            cv2.resize(bgr_buf, (infer_w, infer_h), dst=infer_bgr,
-                       interpolation=infer_interp)
-            cv2.cvtColor(infer_bgr, cv2.COLOR_BGR2RGB, dst=rgb_buf)
-        else:
-            cv2.cvtColor(bgr_buf, cv2.COLOR_BGR2RGB, dst=rgb_buf)
-
-        # Mark the buffer read-only so MediaPipe borrows it rather than
-        # defensively copying a full frame.  process() is synchronous and
-        # does not retain the array, so reusing it next iteration is safe —
-        # but the flag MUST be cleared afterwards, otherwise the cvtColor
-        # above would fail on a read-only destination on the next frame.
-        rgb_buf.flags.writeable = False
-        results = hands.process(rgb_buf)
-        rgb_buf.flags.writeable = True
-
-        if results.multi_hand_landmarks:
-            # Both hands go to the network; exactly one drives the cursor.
-            # Which one is decided by continuity rather than list position,
-            # because MediaPipe may reorder the list between frames and the
-            # mouse must not follow that.
-            detected_hands = results.multi_hand_landmarks
-            hand = pick_primary_hand(detected_hands, primary_anchor)
-
-            # ── Cursor anchor: landmark 9, the middle-finger knuckle ────
-            # Not the index tip.  A fingertip is the most mobile point on
-            # the hand: every gesture moves it by design, so pointing with
-            # it means the cursor lurches whenever the pose changes.  The
-            # MCP knuckle barely moves when fingers bend — it is carried by
-            # the palm, not the finger — so the tracking signal stays put
-            # while the fingers do the signalling.  Landmark 8 is still
-            # read below, but only as gesture input.
-            anchor = hand.landmark[LM_MIDDLE_MCP]
-            primary_anchor = (anchor.x, anchor.y)
-
-            # MediaPipe returns normalised coords [0, 1]; convert to pixels
-            # of the REAL frame.  Scaling by a hardcoded 640×480 here would
-            # place the anchor at a fraction of its true position on any
-            # other sensor, and the overlay would drift away from the hand.
-            raw_x = anchor.x * screen.cam_w
-            raw_y = anchor.y * screen.cam_h
-
-            # ── Gesture classification (geometry only) ──────────────────
-            gesture, fingers_ext, thumb_out = detect_gesture(
-                hand, screen.cam_w, screen.cam_h)
-
-            # ── YOLO branch hand-off (non-blocking) ─────────────────────
-            # Cropped here, before any overlay is drawn, so the network sees
-            # clean pixels rather than the skeleton.  The crop is COPIED:
-            # bgr_buf is a preallocated buffer the next frame overwrites in
-            # place, and handing the worker a view would let it read pixels
-            # being rewritten mid-inference.
-            # The whole frame, exactly as ptmodel.py feeds it.  Still copied:
-            # bgr_buf is a preallocated buffer the next frame overwrites in
-            # place, so a view would let the worker read pixels being
-            # rewritten mid-inference.  The copy is now full-size, which
-            # costs more than the old crop did — see the note in the header.
-            if yolo_worker is not None:
-                yolo_worker.submit(bgr_buf.copy())
-
-            # Clamp into the active box, map onto the virtual desktop, and
-            # apply centre-scaled sensitivity — all inside to_screen().
-            target_x, target_y = screen.to_screen(raw_x, raw_y)
-
-            # ── Re-entry / geometry reset ────────────────────────────────
-            # Either the hand was absent last frame, or the desktop just
-            # changed shape.  Without this the filters would still hold a
-            # position from the old situation and the cursor would slide
-            # across the screen from that stale point.  Clearing them makes
-            # the very next filter call adopt the raw target verbatim.
-            if not hand_present:
-                _oef_x.reset()
-                _oef_y.reset()
-                prev_x, prev_y = target_x, target_y
-                hand_present = True
-                # A hand that just arrived carries no gesture history, and
-                # a stale freeze would pin the cursor to coordinates from
-                # the previous appearance.
-                gesture_state = None
-                frozen_target = None
-                freeze_until = 0.0
-
-            # ── State-transition freeze ─────────────────────────────────
-            # Changing pose moves the whole hand slightly.  Capturing the
-            # target on the transition frame and holding it for
-            # STATE_FREEZE_MS absorbs that twitch, then movement resumes so
-            # the pose can still be dragged around once settled.
-            if gesture != gesture_state:
-                previous = gesture_state
-                gesture_state = gesture
-                frozen_target = (target_x, target_y)
-                freeze_until = now_ts + STATE_FREEZE_MS / 1000.0
-                gesture_changes += 1
-                print(f"[gesture] {previous or '-'} -> {gesture}"
-                      f"   (hold {STATE_FREEZE_MS} ms)")
-
-            # ── Action arbitration (pure computation, never blocks) ──────
-            # The FSM now reports the stabilised gesture on every call, not
-            # only when something fires, so the HUD can show what the system
-            # actually believes rather than the raw per-frame guess.
-            if fsm is not None and gesture not in FSM_IGNORED_STATES:
-                stable_gesture, action = fsm.update_pair(gesture, now_ts)
-                if action is not None:
-                    actions.dispatch(action, now_ts)
-
-            if frozen_target is not None:
-                if now_ts < freeze_until:
-                    # The frozen point is fed THROUGH the filter rather than
-                    # bypassing it, so the filter stays settled there; on
-                    # release it glides back to the hand instead of jumping.
-                    target_x, target_y = frozen_target
-                else:
-                    frozen_target = None
-
-            # ── One Euro Filter smoothing ────────────────────────────────
-            # The filter is the *only* smoothing stage.  It internally tracks
-            # time and speed to compute a dynamic cutoff: still → heavy
-            # smoothing, fast → light.  Nothing here blocks the loop, so the
-            # next camera sample arrives as soon as the hardware has it.
-            smooth_x = _oef_x(target_x, timestamp=now_ts)
-            smooth_y = _oef_y(target_y, timestamp=now_ts)
-
-            cursor.move(int(smooth_x), int(smooth_y))
-
-            # Per-frame travel, kept purely as a tuning readout.
-            jump = math.hypot(smooth_x - prev_x, smooth_y - prev_y)
-            prev_x = smooth_x
-            prev_y = smooth_y
-
-            # ── Visualisation overlays (drawn on the writeable BGR buffer)
-            mp_draw.draw_landmarks(bgr_buf, hand, mp_hands.HAND_CONNECTIONS)
-
-            # Marker on the ANCHOR — the middle-finger knuckle the cursor
-            # actually follows, not the index tip.  Uses the UNREFLECTED
-            # coordinate so it sits on the hand as the preview shows it,
-            # whatever the control path did.  Amber while frozen.
-            cx, cy = int(raw_x), int(raw_y)
-            _frozen = frozen_target is not None and now_ts < freeze_until
-            _anchor_col = (0, 165, 255) if _frozen else (0, 255, 0)
-            cv2.circle(bgr_buf, (cx, cy), 11, _anchor_col, cv2.FILLED)
-            cv2.circle(bgr_buf, (cx, cy), 15, _anchor_col, 2)
-
-            # The index tip is still drawn, small and hollow, to make the
-            # anchor change legible: it moves when gesturing, the anchor
-            # does not.
-            _it = hand.landmark[LM_INDEX_TIP]
-            cv2.circle(bgr_buf,
-                       (int(_it.x * screen.cam_w), int(_it.y * screen.cam_h)),
-                       5, (200, 200, 200), 1)
-
-            # Per-finger verdicts, in the order the classifier sees them.
-            # Indexing a precomputed char pair beats building a generator
-            # and calling .upper() four times a frame; the resulting string
-            # is identical.
-            _flags = (_FINGER_CHARS[0][fingers_ext[0]]
-                      + _FINGER_CHARS[1][fingers_ext[1]]
-                      + _FINGER_CHARS[2][fingers_ext[2]]
-                      + _FINGER_CHARS[3][fingers_ext[3]]
-                      + ("T" if thumb_out else "t"))
-            cv2.putText(
-                bgr_buf, _flags, (cx + 20, cy - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
-            )
-
-            # Show how far the cursor moved this frame.
-            cv2.putText(
-                bgr_buf, f"j={jump:.0f}", (cx + 15, cy - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1,
-            )
-        else:
-            # No hand this frame — arm the reset for whenever it returns.
-            hand_present = False
-            # FAILSAFE, and the order matters: drop the button BEFORE
-            # clearing the FSM.  The hand is gone, so no further transition
-            # is coming to end the drag, and a held button with no hand to
-            # steer it leaves the desktop selecting text until the process
-            # dies.  release() is idempotent, so this costs nothing on the
-            # overwhelming majority of frames where no drag is in progress.
-            if actions.release():
-                print("[action] DRAG_STOP (hand lost)")
-            if fsm is not None:
-                fsm.reset()
-            stable_gesture = None
-            # Nothing to be continuous with any more; the next appearance
-            # takes list position 0 rather than chasing a stale anchor.
-            primary_anchor = None
-            if yolo_worker is not None:
-                yolo_worker.request_reset()
-            # Drop the gesture too.  A hand that leaves mid-freeze would
-            # otherwise keep the cursor pinned, and the next appearance
-            # would not register as a transition if the pose happened to
-            # match the stale one.
-            if gesture_state is not None:
-                print(f"[gesture] {gesture_state} -> (hand lost)")
-            gesture_state = None
-            gesture = "idle"
-            fingers_ext = (False, False, False, False)
-            thumb_out = False
-            frozen_target = None
-            freeze_until = 0.0
-
-        # ── YOLO output drain (non-blocking) ────────────────────────────
-        # The worker runs with fsm=None, so nothing is queued today — it
-        # observes and logs while the geometric path does the clicking.
-        # Drained anyway, and drained in a loop rather than read once, so
-        # that binding semantic macros here later cannot start with a
-        # backlog that accumulated while the loop was busy.
-        if yolo_worker is not None:
-            while True:
-                action = yolo_worker.poll()
-                if action is None:
-                    break
-                yolo_action_count += 1
-                last_yolo_action = action
-                last_yolo_action_time = now_ts
-
-        # ── Semantic macros (slow path, edge-triggered) ──────────────────
-        # Sited here, beside the YOLO drain and well clear of the cursor
-        # block, because nothing above this line may depend on it.  One
-        # atomic read of the worker's published triple, then pure
-        # comparisons; the keyboard chord itself is microseconds and only
-        # runs on the frame a macro actually fires.
-        if macros is not None and yolo_worker is not None:
-            _macro_gesture, _macro_score, _ = yolo_worker.current_state
-            macros.update(_macro_gesture, _macro_score, now_ts)
-
-        # Draw the active bounding box on the preview.  Read from `screen`
-        # so it follows the box when a display is plugged or unplugged.
-        cv2.rectangle(
-            bgr_buf,
-            (screen.box_left,  screen.box_top),
-            (screen.box_right, screen.box_bottom),
-            (255, 0, 255), 2,
-        )
-
-        # With sensitivity > 1 only an inner region still reaches the desktop
-        # edges; everything outside it is clamped flat.  Drawn every frame so
-        # it shrinks and grows live as '+' / '-' are pressed.
-        _eff = screen.effective_box
-        if _eff is not None:
-            cv2.rectangle(bgr_buf, (_eff[0], _eff[1]), (_eff[2], _eff[3]),
-                          (0, 165, 255), 1)
-
-        # ── HUD ─────────────────────────────────────────────────────────
-        # FPS counter — counts only frames that were really processed.
-        fps = 1.0 / (now_ts - prev_time) if now_ts > prev_time else 0.0
-        prev_time = now_ts
-        cv2.putText(
-            bgr_buf, f"FPS: {int(fps)}", (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-        )
-
-        # Current sensitivity, directly below the FPS readout, rounded to one
-        # decimal place.  Amber to match the live-region rectangle it controls.
-        cv2.putText(
-            bgr_buf, f"Speed: {CURSOR_SENSITIVITY:.1f}x", (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2,
-        )
-
-        # Mirror / inversion state — the two things 'm' and 'i' change.
-        # Green when mirrored (the usual webcam case), red when raw, so a
-        # glance is enough to tell which mode is live.
-        cv2.putText(
-            bgr_buf,
-            f"Mirror: {'ON' if IS_MIRRORED else 'OFF'}"
-            f"{'  invX' if INVERT_CURSOR_X else ''}",
-            (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-            (0, 220, 0) if IS_MIRRORED else (0, 80, 255), 2,
-        )
-
-        # Gesture state, and whether the transition freeze is holding the
-        # cursor right now.  Amber while frozen so the lock is unmistakable.
-        _held = frozen_target is not None and now_ts < freeze_until
-        if _held:
-            _left_ms = (freeze_until - now_ts) * 1000.0
-            cv2.putText(
-                bgr_buf, f"{gesture.upper()}  LOCK {_left_ms:3.0f}ms",
-                (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2,
-            )
-        else:
-            cv2.putText(
-                bgr_buf, f"{gesture.upper()}  ({gesture_changes})",
-                (10, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-            )
-
-        # The action line flashes what just fired, then falls back to the
-        # STABILISED gesture — what the FSM believes, which is the thing
-        # that decides whether an action fires.  The raw per-frame verdict
-        # is on the line above; showing only that one hid the disagreement
-        # between the two whenever a gesture was flickering.
-        if fsm is not None:
-            if (actions.last_action is not None
-                    and now_ts - actions.last_action_time < 0.6):
-                cv2.putText(
-                    bgr_buf,
-                    f"{actions.last_action}  ({actions.click_count}c "
-                    f"{actions.drag_count}d)",
-                    (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 80, 255), 2,
-                )
-            else:
-                _held_note = "  HOLD" if actions.dragging else ""
-                cv2.putText(
-                    bgr_buf,
-                    f"stable {stable_gesture or '--'}{_held_note}",
-                    (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (0, 200, 120) if actions.dragging else (180, 180, 180), 2,
-                )
-
-        # The semantic branch, in its own colour.  Light blue rather than
-        # magenta because the active box is already magenta and a matching
-        # HUD line reads as if the two were related.
-        #
-        # One property read, not three: current_state hands back a single
-        # tuple published atomically by the worker, so the label and the
-        # score on this line always come from the same inference.
-        if yolo_worker is not None:
-            _yolo_gesture, _yolo_score, _yolo_ms = yolo_worker.current_state
-            if not yolo_worker.ready:
-                _yolo_text = ("YOLO: loading..."
-                              if yolo_worker.load_error is None
-                              else "YOLO: unavailable")
-            elif _yolo_gesture is None:
-                _yolo_text = f"YOLO: none  {_yolo_ms:.0f}ms"
-            else:
-                _yolo_text = (f"YOLO: {_yolo_gesture} ({_yolo_score:.2f})"
-                              f"  {_yolo_ms:.0f}ms")
-
-            # Bright green for a second after a macro fires, so the moment
-            # the cooldown was bypassed is visible on the recording as well
-            # as in the console.
-            _macro_hot = (macros is not None
-                          and macros.last_macro is not None
-                          and now_ts - macros.last_macro_time < 1.0)
-            if _macro_hot:
-                _yolo_text = (f"MACRO: {macros.last_macro}  "
-                              f"({macros.fired_count})")
-
-            cv2.putText(
-                bgr_buf, _yolo_text,
-                (10, 166), cv2.FONT_HERSHEY_SIMPLEX,
-                0.8 if _macro_hot else 0.7,
-                (0, 255, 0) if _macro_hot else (255, 200, 100), 2,
-            )
-
-        # Desktop summary underneath.
-        cv2.putText(
-            bgr_buf, f"{screen.width}x{screen.height} ({screen.monitors} mon)",
-            (10, 192), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
-        )
-
-        # Key hints along the bottom edge of the real frame.  The text is a
-        # module-level constant rather than a literal rebuilt each frame.
-        cv2.putText(
-            bgr_buf, _HINT_TEXT, (10, frame_h - 12),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1,
-        )
-
-        cv2.imshow("Hand Cursor Control", bgr_buf)
-
-        # Sensitivity keys and quit, same handler as the skip path above.
-        if handle_key(cv2.waitKey(1) & 0xFF):
-            break
-
-finally:
-    stream.stop()
-    # LAST LINE OF DEFENCE.  Whatever brought us here — 'q', an exception,
-    # a closed window — the button must not outlive the process.
-    if actions.release():
-        print("[action] DRAG_STOP (shutdown)")
-    if actions.dragging:
-        print("[action] WARNING: could not release the mouse button")
-    if fsm is not None:
-        print(f"[action] {fsm.click_count} single, {fsm.double_click_count} "
-              f"double, {fsm.drag_start_count} drags — "
-              f"{actions.click_count} clicks and {actions.drag_count} presses "
-              f"reached the OS")
-    if yolo_worker is not None:
-        yolo_worker.stop()
-        print(f"[yolo] {yolo_worker.inference_count} inferences, "
-              f"{yolo_worker.dropped_count} crops dropped, "
-              f"observing only")
-    # The monitor is a child process, so it outlives us unless it is told
-    # otherwise — terminate then reap, with a kill as the backstop so a
-    # wedged Tk loop cannot leave a window on screen after we are gone.
-    if monitor_process is not None and monitor_process.poll() is None:
-        try:
-            monitor_process.terminate()
-            monitor_process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            monitor_process.kill()
-        except Exception as exc:
-            print(f"[monitor] could not stop: {exc.__class__.__name__}: {exc}")
-        else:
-            print("[monitor] resource window closed")
-
-    cv2.destroyAllWindows()
-    hands.close()
-    cursor.close()
-    backend.close()
-    print("Shutdown complete.")
+if __name__ == "__main__":
+    main()

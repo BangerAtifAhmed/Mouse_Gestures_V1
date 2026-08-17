@@ -29,6 +29,22 @@ try:
 except ImportError:                                       # pragma: no cover
     sys.exit("Pillow is required:  pip install Pillow")
 
+# Optional, and each degrades to a dash on the diagnostics tab rather than
+# stopping the window from opening: psutil is a third-party package and
+# pynvml only exists where an NVIDIA driver does.
+try:
+    import psutil
+except ImportError:                                       # pragma: no cover
+    psutil = None
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_READY = True
+except Exception:                                         # pragma: no cover
+    pynvml = None
+    _NVML_READY = False
+
 import gesture_fsm
 from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
@@ -60,6 +76,10 @@ ON_ACCENT = "#0b0f0d"
 PAD = 14
 THUMB = 76
 SLOT = 84
+
+MIB = 1024 ** 2
+GIB = 1024 ** 3
+CPU_MODE_NOTE = "N/A (CPU)"
 
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gestures")
@@ -125,7 +145,7 @@ def source_of(label: str) -> str:
 
 def rule_source(labels) -> str:
     """The source a rule should declare, given the poses it uses."""
-    kinds = {source_of(l) for l in labels if l}
+    kinds = {source_of(name) for name in labels if name}
     if kinds == {"geometry"} or kinds == {"geometry", "any"}:
         return "geometry"
     if kinds == {"semantic"} or kinds == {"semantic", "any"}:
@@ -144,6 +164,26 @@ class GestureLibrary:
     because those may only be created on the thread running the mainloop.
     """
 
+    # Poses hidden from the UI: two-handed or awkward to hold, so there is
+    # no point offering them as bindings.  THIS IS A GUI FILTER ONLY — the
+    # model still recognises every one of them and the FSM still executes
+    # any rule already bound to one; they simply cannot be picked here any
+    # more, so no new mapping can be built on them.
+    #
+    # Both spellings are listed for three of them on purpose.  The
+    # classifier reports "take_picture", "hand_heart" and "hand_heart2", so
+    # listing only the informal "take_photo", "heart" and "heart2" would
+    # match nothing and leave three of the seven still on screen.
+    EXCLUDED_GESTURES = {
+        "thumb_index2",
+        "holy",
+        "timeout",
+        "take_photo", "take_picture",
+        "xsign", "x_sign",
+        "heart", "hand_heart",
+        "heart2", "hand_heart2",
+    }
+
     def __init__(self, directory: str = GESTURE_DIR) -> None:
         self.directory = directory
         self.labels = []              # canonical, sorted
@@ -151,6 +191,22 @@ class GestureLibrary:
         self._path_for = {}           # canonical -> full path
         self._results = queue.Queue()
         self._scan()
+
+    @classmethod
+    def is_excluded(cls, *names) -> bool:
+        """True if any spelling of this pose is blacklisted.
+
+        Every name a pose is known by is checked, because the file stem and
+        the canonical label can differ and only one of them may be listed.
+        Case, spaces and hyphens are all normalised away first.
+        """
+        for name in names:
+            if not name:
+                continue
+            key = str(name).strip().lower().replace(" ", "_").replace("-", "_")
+            if key in cls.EXCLUDED_GESTURES:
+                return True
+        return False
 
     def _scan(self) -> None:
         found = {}
@@ -160,18 +216,23 @@ class GestureLibrary:
                 if ext.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                     continue
                 label = canonical(stem)
+                if self.is_excluded(stem, label):
+                    continue
                 found[label] = os.path.join(self.directory, name)
                 self._stem_for[label] = stem
 
         # Every pose either classifier can emit belongs in the catalog,
         # with or without artwork.  The folder ships 25 PNGs against a
         # 34-class model plus the geometric set, and seeding from the
-        # vocabularies rather than the directory is what keeps the missing
-        # nine — "timeout" among them, which the default config binds —
-        # bindable instead of invisible.  They draw as lettered tiles.
+        # vocabularies rather than the directory is what keeps the ones
+        # with no PNG bindable instead of invisible.  They draw as
+        # lettered tiles.  Blacklisted poses are skipped here too, or the
+        # vocabulary would put back what the directory scan just removed.
         for label in GEOMETRIC + SEMANTIC:
             if label == "no_gesture":
                 continue          # the absence sentinel, not a pose
+            if self.is_excluded(label):
+                continue
             found.setdefault(label, None)
 
         self._path_for = found
@@ -455,7 +516,7 @@ class GestureStudio(tk.Tk):
 
         self.library = GestureLibrary()
         self.thumbs = {}              # label -> PhotoImage (kept alive here)
-        self.rules = []               # list of rule dicts, GUI's source of truth
+        self.rules = []               # rule dicts; the source of truth
         self.settings = dict(gesture_fsm.DEFAULT_SETTINGS)
         self.editing_id = None
         self.armed_slot = None
@@ -464,7 +525,21 @@ class GestureStudio(tk.Tk):
         self._dirty = False
         self._loading = False         # suppresses builder auto-defaults
         self._booting = True          # suppresses dirty-marking until shown
-        self._undo_stack = []         # deletions, newest last
+
+        # The recycle bin is the single store behind both the Ctrl+Z undo
+        # on Tab 1 and the Restore button on Tab 3.  _undo_stack holds
+        # batches of ids that point into it, so the two can never disagree
+        # about what was deleted.
+        self.deleted = []
+        self._undo_stack = []         # lists of binned rule ids, newest last
+
+        self.engine = None
+        self._engine_busy = False
+        self._engine_result = queue.Queue()
+        self._video_job = None
+        self._monitor_job = None
+        self._proc = None
+        self._scrollers = []       # (canvas, inner frame) pairs for the wheel
 
         self._init_fonts()
         self._init_styles()
@@ -475,12 +550,14 @@ class GestureStudio(tk.Tk):
 
         self._load_from_disk()
         self._booting = False
+        self._refresh_metrics()       # self-rescheduling, every 1000 ms
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── chrome ──────────────────────────────────────────────────────────
 
     def _init_fonts(self) -> None:
-        family = "Segoe UI" if "Segoe UI" in tkfont.families() else "TkDefaultFont"
+        family = ("Segoe UI" if "Segoe UI" in tkfont.families()
+                  else "TkDefaultFont")
         self.f_title = (family, 17, "bold")
         self.f_sub = (family, 9)
         self.f_head = (family, 10, "bold")
@@ -535,6 +612,21 @@ class GestureStudio(tk.Tk):
         style.map("Dark.Vertical.TScrollbar",
                   background=[("active", FAINT)])
 
+        # The notebook's own frame is drawn behind the tab strip, so it has
+        # to lose its border and take the window colour or a pale seam
+        # appears under every tab.
+        style.configure("Dark.TNotebook", background=BG, borderwidth=0,
+                        tabmargins=(2, 6, 2, 0))
+        style.configure("Dark.TNotebook.Tab", background=CARD,
+                        foreground=MUTED,
+                        bordercolor=BORDER, lightcolor=CARD, darkcolor=CARD,
+                        padding=(20, 9), font=(self.f_body[0], 9, "bold"))
+        style.map("Dark.TNotebook.Tab",
+                  background=[("selected", ACCENT), ("active", HOVER)],
+                  foreground=[("selected", ON_ACCENT), ("active", TEXT)],
+                  lightcolor=[("selected", ACCENT)],
+                  bordercolor=[("selected", ACCENT)])
+
         style.configure("Dark.Treeview", background=FIELD,
                         fieldbackground=FIELD, foreground=TEXT,
                         bordercolor=BORDER, lightcolor=FIELD,
@@ -543,7 +635,8 @@ class GestureStudio(tk.Tk):
                         foreground=MUTED, relief="flat", font=self.f_body,
                         padding=6)
         style.map("Dark.Treeview.Heading",
-                  background=[("active", HOVER)], foreground=[("active", TEXT)])
+                  background=[("active", HOVER)],
+                  foreground=[("active", TEXT)])
         style.map("Dark.Treeview",
                   background=[("selected", "#14532d")],
                   foreground=[("selected", TEXT)])
@@ -552,20 +645,45 @@ class GestureStudio(tk.Tk):
         ])
 
     def _build(self) -> None:
-        self.rowconfigure(1, weight=1)
-        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self.notebook = ttk.Notebook(self, style="Dark.TNotebook")
+        self.notebook.grid(row=0, column=0, sticky="nsew",
+                           padx=PAD, pady=(PAD, 0))
+
+        # Tab 1 is the original window, moved wholesale into a frame.  Its
+        # internals are untouched: every widget below still grids into the
+        # same rows and columns it always did, the only difference being
+        # that the container is this page rather than the toplevel.
+        self._page = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self._page, text="  Mapping Studio  ")
+
+        self._tab_camera = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self._tab_camera,
+                          text="  Live Camera & Diagnostics  ")
+
+        self._tab_bin = tk.Frame(self.notebook, bg=BG)
+        self.notebook.add(self._tab_bin, text="  Recycle Bin  ")
+
+        self._build_page()
+        self._build_camera_tab(self._tab_camera)
+        self._build_bin_tab(self._tab_bin)
+
+    def _build_page(self) -> None:
+        """The original single-window layout, verbatim, inside Tab 1."""
+        self._page.rowconfigure(1, weight=1)
+        self._page.columnconfigure(1, weight=1)
 
         self._build_header()
 
-        left = tk.Frame(self, bg=BG)
-        left.grid(row=1, column=0, sticky="ns", padx=(PAD, 0), pady=(0, 0))
-        # Settings first, against the bottom: the catalog is the expanding
-        # half, and anything packed after an expanding widget loses its
-        # space on a short window.
-        self._build_settings(left)
+        left = tk.Frame(self._page, bg=BG)
+        left.grid(row=1, column=0, sticky="nsew", padx=(PAD, 0), pady=(0, 0))
+        # The catalog is now the only thing in this column, so it takes the
+        # whole height that Cursor Settings used to share with it.
         self._build_catalog(left)
 
-        right = tk.Frame(self, bg=BG)
+        right = tk.Frame(self._page, bg=BG)
         right.grid(row=1, column=1, sticky="nsew", padx=PAD)
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
@@ -579,13 +697,14 @@ class GestureStudio(tk.Tk):
 
     def _build_settings(self, master) -> None:
         card = Card(master)
-        card.pack(side="bottom", fill="x", pady=(PAD, 0))
+        card.pack(fill="x", pady=(PAD, 0))
 
         tk.Label(card, text="CURSOR SETTINGS", bg=CARD, fg=TEXT,
                  font=self.f_head).pack(anchor="w", padx=PAD, pady=(PAD, 2))
-        tk.Label(card, text="Read by hand_cursor_2.py at startup.",
-                 bg=CARD, fg=FAINT, font=("Segoe UI", 8)).pack(
-            anchor="w", padx=PAD)
+        tk.Label(card, text="Saved to gesture_config.json; the engine reads "
+                            "them when it starts.",
+                 bg=CARD, fg=FAINT, font=("Segoe UI", 8), wraplength=232,
+                 justify="left").pack(anchor="w", padx=PAD)
 
         # ── sensitivity ────────────────────────────────────────────────
         row = tk.Frame(card, bg=CARD)
@@ -676,7 +795,7 @@ class GestureStudio(tk.Tk):
         tracker's preview window, so they do nothing while this window has
         focus.  The panel above is how you set the same things from here.
         """
-        bar = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
+        bar = tk.Frame(self._page, bg=CARD, highlightbackground=BORDER,
                        highlightthickness=1)
         bar.grid(row=2, column=0, columnspan=2, sticky="ew",
                  padx=PAD, pady=(PAD, 0))
@@ -702,7 +821,7 @@ class GestureStudio(tk.Tk):
                      font=("Segoe UI", 9)).pack(side="left", padx=(5, 0))
 
     def _build_header(self) -> None:
-        bar = tk.Frame(self, bg=BG)
+        bar = tk.Frame(self._page, bg=BG)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew",
                  padx=PAD, pady=(PAD, 10))
         bar.columnconfigure(0, weight=1)
@@ -773,16 +892,22 @@ class GestureStudio(tk.Tk):
             "<Configure>",
             lambda e: self.canvas.itemconfigure(self._grid_window,
                                                 width=e.width))
+        self._scrollers.append((self.canvas, self.grid_frame))
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
 
     def _on_wheel(self, event) -> None:
+        """Route the wheel to whichever scrolling column is under the pointer.
+
+        The binding is global (bind_all), so without the containment walk
+        the wheel would scroll the catalog while the pointer sat over the
+        mappings table or the diagnostics column.
+        """
         widget = self.winfo_containing(event.x_root, event.y_root)
-        # Only scroll the catalog when the pointer is actually over it;
-        # otherwise the wheel would hijack the mappings table too.
         while widget is not None:
-            if widget is self.canvas or widget is self.grid_frame:
-                self.canvas.yview_scroll(-int(event.delta / 120), "units")
-                return
+            for canvas, frame in self._scrollers:
+                if widget is canvas or widget is frame:
+                    canvas.yview_scroll(-int(event.delta / 120), "units")
+                    return
             widget = getattr(widget, "master", None)
 
     def _pump_thumbnails(self) -> None:
@@ -806,9 +931,9 @@ class GestureStudio(tk.Tk):
             child.destroy()
 
         needle = self.search_var.get().strip().lower()
-        labels = [l for l in self.library.labels
-                  if not needle or needle in l.replace("_", " ")
-                  or needle in l]
+        labels = [name for name in self.library.labels
+                  if not needle or needle in name.replace("_", " ")
+                  or needle in name]
 
         columns = 2
         for index, label in enumerate(labels):
@@ -848,7 +973,8 @@ class GestureStudio(tk.Tk):
 
         widgets = (tile, image, name, dot)
         for widget in widgets:
-            widget.bind("<Button-1>", lambda _e, l=label: self._pick(l))
+            widget.bind("<Button-1>",
+                        lambda _e, name=label: self._pick(name))
             widget.bind("<Enter>", lambda _e, w=widgets: [
                 x.configure(bg=HOVER) for x in w])
             widget.bind("<Leave>", lambda _e, w=widgets: [
@@ -941,7 +1067,8 @@ class GestureStudio(tk.Tk):
         # would leave the preview showing the previous number.  The trace
         # catches both routes.
         self.timing_var.trace_add("write", lambda *_: self._refresh_preview())
-        self.timing_box = ttk.Spinbox(fields, from_=0.0, to=10.0, increment=0.05,
+        self.timing_box = ttk.Spinbox(fields, from_=0.0, to=10.0,
+                                      increment=0.05,
                                       textvariable=self.timing_var, width=8,
                                       style="Dark.TSpinbox", font=self.f_body)
         self.timing_box.grid(row=3, column=0, sticky="w")
@@ -971,7 +1098,8 @@ class GestureStudio(tk.Tk):
         toggles = tk.Frame(fields, bg=CARD)
         toggles.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
         self.promote_toggle = Toggle(
-            toggles, "Repeat inside the double-click window fires DOUBLE_CLICK",
+            toggles,
+            "Repeat inside the double-click window fires DOUBLE_CLICK",
             command=self._on_promote_toggle)
         self.promote_toggle.pack(anchor="w")
         self.repeat_toggle = Toggle(
@@ -1161,7 +1289,8 @@ class GestureStudio(tk.Tk):
                 if validate:
                     self._toast("Pick a pose to hold.", DANGER)
                 return None
-            rule.update({"pose": pose, "hold_sec": number(self.timing_var, 0.4)})
+            rule.update({"pose": pose,
+                         "hold_sec": number(self.timing_var, 0.4)})
             if self.repeat_toggle.get():
                 rule["repeat"] = True
                 rule["repeat_sec"] = 0.25
@@ -1213,7 +1342,7 @@ class GestureStudio(tk.Tk):
         self._render_table()
 
     def _conflict(self, rule):
-        """Two rules on the same trigger would both fire.  Refuse the second."""
+        """Two rules on one trigger both fire.  Refuse the second."""
         for existing in self.rules:
             if existing["id"] == rule["id"]:
                 continue
@@ -1395,7 +1524,8 @@ class GestureStudio(tk.Tk):
             self.timing_var.set(f"{rule.get('max_time_sec', 0.8):.2f}")
             self.promote_toggle.set(bool(rule.get("promote_double")))
         else:
-            self.slot_pose.set_pose(rule["pose"], self.thumbs.get(rule["pose"]))
+            self.slot_pose.set_pose(rule["pose"],
+                                    self.thumbs.get(rule["pose"]))
             self.timing_var.set(f"{rule.get('hold_sec', 0.4):.2f}")
             self.repeat_toggle.set(bool(rule.get("repeat")))
 
@@ -1475,53 +1605,84 @@ class GestureStudio(tk.Tk):
             (rule_id for rule_id in order[order.index(doomed[-1]["id"]) + 1:]
              if rule_id not in doomed_ids), None)
 
-        # Positions are recorded alongside the rules: undo should restore
-        # the list as it was, not append the survivors to the bottom.
-        self._undo_stack.append(
-            [(order.index(rule["id"]), dict(rule)) for rule in doomed])
+        # SOFT DELETE.  The rule is popped out of the active list and
+        # appended to the bin, carrying the index it came from so a restore
+        # rebuilds the original order rather than appending to the bottom.
+        #
+        # Popped highest-index-first so the remaining indices stay valid
+        # mid-loop, then reversed so the bin keeps the table's order.
+        positions = {rule["id"]: index
+                     for index, rule in enumerate(self.rules)}
+        moved = []
+        targets = sorted((positions[r["id"]] for r in doomed), reverse=True)
+        for index in targets:
+            try:
+                entry = self.rules.pop(index)
+            except IndexError:                        # pragma: no cover
+                continue
+            entry["_origin_index"] = index
+            entry["_deleted_at"] = time.time()
+            moved.append(entry)
+        moved.reverse()
+
+        if not moved:
+            self._toast("Nothing was deleted.", AMBER)
+            return
+
+        self.deleted.extend(moved)
+        self._undo_stack.append([entry["id"] for entry in moved])
         self.undo_button.set_enabled(True)
 
-        self.rules = [r for r in self.rules if r["id"] not in doomed_ids]
         if self.editing_id in doomed_ids:
             self._clear_builder()
 
-        self._mark_dirty()
         self._render_table()
+        self._render_bin()
 
-        if successor is not None:
+        if successor is not None and successor in self.table.get_children():
             self.table.selection_set(successor)
             self.table.focus(successor)
         self.table.focus_set()
 
-        plural = "s" if len(doomed) > 1 else ""
-        self._toast(f"Deleted {len(doomed)} mapping{plural} — Ctrl+Z to "
-                    f"undo, Save Config to make it permanent.", MUTED)
+        plural = "s" if len(moved) > 1 else ""
+        saved = self.save_config()
+        self._toast(
+            f"Moved {len(moved)} mapping{plural} to the Recycle Bin"
+            + (" and saved." if saved else " — but the config could NOT be "
+                                           "written.")
+            + "  Ctrl+Z to undo, or restore it from the Recycle Bin tab.",
+            MUTED if saved else DANGER)
 
     # Shorter alias, so either name resolves to the same implementation.
     delete_mapping = delete_selected_mapping
 
     def undo_delete(self) -> None:
-        """Restore the most recent deletion to its original position."""
+        """Pull the most recent deletion back out of the recycle bin."""
         if not self._undo_stack:
             self._toast("Nothing to undo.", AMBER)
             return
 
-        restored = self._undo_stack.pop()
-        for index, rule in sorted(restored, key=lambda item: item[0]):
-            self.rules.insert(min(index, len(self.rules)), rule)
+        ids = self._undo_stack.pop()
+        count, disabled = self._restore_ids(ids)
 
         if not self._undo_stack:
             self.undo_button.set_enabled(False)
 
-        self._mark_dirty()
         self._render_table()
+        self._render_bin()
 
-        ids = [rule["id"] for _index, rule in restored]
-        self.table.selection_set(*ids)
+        present = [i for i in ids if i in self.table.get_children()]
+        if present:
+            self.table.selection_set(*present)
         self.table.focus_set()
 
-        plural = "s" if len(restored) > 1 else ""
-        self._toast(f"Restored {len(restored)} mapping{plural}.", ACCENT)
+        saved = self.save_config()
+        plural = "s" if count != 1 else ""
+        note = f"Restored {count} mapping{plural}"
+        if disabled:
+            note += f" — {disabled} came back disabled (trigger already bound)"
+        note += "." if saved else " but the config could NOT be written."
+        self._toast(note, AMBER if disabled or not saved else ACCENT)
 
     # ── test runner ─────────────────────────────────────────────────────
 
@@ -1596,7 +1757,8 @@ class GestureStudio(tk.Tk):
             sens = max(SENSITIVITY_MIN, min(SENSITIVITY_MAX, round(sens, 1)))
             self.sensitivity_var.set(sens)
             self.sens_readout.configure(text=f"{sens:.1f}×")
-            self.mirror_toggle.set(bool(self.settings.get("is_mirrored", True)))
+            self.mirror_toggle.set(
+                bool(self.settings.get("is_mirrored", True)))
             self.invert_toggle.set(
                 bool(self.settings.get("invert_cursor_x", False)))
             self._on_direction()
@@ -1613,47 +1775,130 @@ class GestureStudio(tk.Tk):
         self.settings["invert_cursor_x"] = bool(self.invert_toggle.get())
 
     def _rules_to_config(self) -> dict:
+        """Serialise the model, split by which classifier feeds each rule.
+
+        Every entry keeps its `trigger` key, which is what lets the engine
+        route a list that mixes transitions and holds back into the right
+        rule class.  `deleted_bindings` is never read by the engine, so a
+        binned rule cannot be mistaken for an active one.
+        """
         self._widgets_to_settings()
-        transitions, holds = [], []
+
+        geometry, semantic = [], []
         for rule in self.rules:
-            entry = {k: v for k, v in rule.items() if k != "trigger"}
-            (transitions if rule["trigger"] == TRANSITION else holds).append(
-                entry)
+            entry = dict(rule)
+            target = (semantic if entry.get("source") == "semantic"
+                      else geometry)
+            target.append(entry)
+
         return {
-            "version": 1,
-            "settings": self.settings,
-            "transitions": transitions,
-            "holds": holds,
+            "version": 2,
+            "settings": dict(self.settings),
+            "geometry_bindings": geometry,
+            "yolo_bindings": semantic,
+            "deleted_bindings": [dict(entry) for entry in self.deleted],
         }
 
+    def save_config(self, message: str = "") -> bool:
+        """Write the whole model to gesture_config.json.  Never raises.
+
+        Called after every bin operation, so the file always matches what
+        the two tables show: a delete or a restore cannot be lost by a
+        crash, or by quitting without pressing Save.
+        """
+        try:
+            payload = self._rules_to_config()
+        except Exception as exc:                      # pragma: no cover
+            self._toast(f"Could not assemble the config: "
+                        f"{exc.__class__.__name__}: {exc}", DANGER)
+            return False
+
+        try:
+            gesture_fsm.save_config(payload, CONFIG_PATH)
+        except (OSError, TypeError, ValueError) as exc:
+            self._toast(f"Could not write "
+                        f"{os.path.basename(CONFIG_PATH)}: {exc}", DANGER)
+            return False
+
+        self._clear_dirty()
+        if message:
+            self._toast(message, ACCENT)
+        return True
+
+    @staticmethod
+    def _normalise_rule(entry, trigger=None):
+        """One config entry → one in-memory rule, or None if unusable.
+
+        Tolerant on purpose: this parses a file a human may have edited,
+        so a missing id, cooldown or source is filled in rather than
+        rejected.  Only an entry with no action at all is dropped, because
+        there is nothing to bind it to.
+        """
+        if not isinstance(entry, dict):
+            return None
+
+        rule = dict(entry)
+        kind = trigger or rule.get("trigger")
+        if kind not in (TRANSITION, HOLD):
+            kind = HOLD if rule.get("pose") else TRANSITION
+        rule["trigger"] = kind
+
+        if not str(rule.get("action", "")).strip():
+            return None
+
+        rule.setdefault("id", f"r{uuid.uuid4().hex[:8]}")
+        rule.setdefault("enabled", True)
+        rule.setdefault("cooldown_sec", 0.35)
+
+        poses = ([rule.get("from_state"), rule.get("to_state")]
+                 if kind == TRANSITION else [rule.get("pose")])
+        rule.setdefault("source", rule_source([p for p in poses if p]))
+        return rule
+
     def _config_to_rules(self, config: dict) -> None:
+        """Load the model, accepting both the current and legacy shapes."""
         self.settings = dict(gesture_fsm.DEFAULT_SETTINGS)
         self.settings.update(config.get("settings") or {})
 
-        rules = []
-        for kind, key in ((TRANSITION, "transitions"), (HOLD, "holds")):
-            for entry in (config.get(key) or []):
-                if not isinstance(entry, dict):
+        rules, seen = [], set()
+
+        def take(entries, trigger=None):
+            for entry in (entries or []):
+                rule = self._normalise_rule(entry, trigger)
+                # Ids are how every table row, undo batch and bin entry
+                # refers to a rule, so a duplicate would make two rows
+                # indistinguishable.  First one wins.
+                if rule is None or rule["id"] in seen:
                     continue
-                rule = dict(entry)
-                rule["trigger"] = kind
-                rule.setdefault("id", f"r{uuid.uuid4().hex[:8]}")
-                rule.setdefault("enabled", True)
-                rule.setdefault("cooldown_sec", 0.35)
-                poses = ([rule.get("from_state"), rule.get("to_state")]
-                         if kind == TRANSITION else [rule.get("pose")])
-                rule.setdefault("source", rule_source([p for p in poses if p]))
+                seen.add(rule["id"])
                 rules.append(rule)
+
+        take(config.get("geometry_bindings"))
+        take(config.get("yolo_bindings"))
+        take(config.get("transitions"), TRANSITION)      # legacy
+        take(config.get("holds"), HOLD)                  # legacy
+        take(config.get("mappings"))                     # legacy
         self.rules = rules
+
+        binned = []
+        for entry in (config.get("deleted_bindings") or []):
+            item = self._normalise_rule(entry)
+            if item is None or item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            binned.append(item)
+        self.deleted = binned
+
         self._settings_to_widgets()
         self._forget_undo()
+        self._render_bin()
 
     def _forget_undo(self) -> None:
         """Swapping the whole list out invalidates any pending restore.
 
-        Undo replays a rule at a recorded index; after Load Defaults or a
-        reload those indices point into a list that no longer exists, and
-        replaying them would inject rules from a config the user has left.
+        Only the undo *stack* is cleared, not the bin itself: the bin is
+        part of the config being loaded, whereas the stack's ids point at
+        positions in a list that no longer exists.
         """
         self._undo_stack.clear()
         if hasattr(self, "undo_button"):
@@ -1671,11 +1916,15 @@ class GestureStudio(tk.Tk):
         self._render_table()
         self._clear_builder()
         self._clear_dirty()
-        self._toast(
-            f"Loaded {len(self.rules)} mapping(s) from "
-            f"{os.path.basename(CONFIG_PATH)}." if exists
-            else "No config yet — showing the safe fallback binding.",
-            MUTED if exists else AMBER)
+        if not exists:
+            self._toast("No config yet — starting with a blank slate. "
+                        "Build a mapping, or press Load Defaults.", AMBER)
+        elif not self.rules:
+            self._toast(f"{os.path.basename(CONFIG_PATH)} has no mappings — "
+                        f"nothing is bound.", AMBER)
+        else:
+            self._toast(f"Loaded {len(self.rules)} mapping(s) from "
+                        f"{os.path.basename(CONFIG_PATH)}.", MUTED)
 
     def _load_defaults(self) -> None:
         if not messagebox.askokcancel(
@@ -1691,30 +1940,21 @@ class GestureStudio(tk.Tk):
         self._toast("Default scheme loaded — not yet saved.", AMBER)
 
     def _save(self) -> None:
-        # Defaults to Cancel, because saving an empty list is the one action
-        # here that silently disables the whole tracker: it starts, the
-        # cursor moves, and no gesture ever fires.  Easy to reach by
-        # clearing the table to start over, and hard to diagnose afterwards.
-        if not self.rules and not messagebox.askokcancel(
-                "Save an empty config?",
-                "There are no mappings.\n\nSaving now leaves the tracker "
-                "with no bindings at all — the cursor will still move, but "
-                "no gesture will click, drag or fire a macro.\n\n"
-                "Press Load Defaults first if you wanted the standard "
-                "scheme.",
-                parent=self, icon=messagebox.WARNING,
-                default=messagebox.CANCEL):
-            self._toast("Nothing saved — the config on disk is unchanged.",
-                        AMBER)
+        # No confirmation on an empty list any more.  Nothing regenerates
+        # bindings behind the user's back now, so an empty scheme is a
+        # choice the tool has to be able to express — warning about it on
+        # every save would fight the blank slate rather than protect it.
+        # The status line still says plainly that nothing is bound.
+        binned = f", {len(self.deleted)} in the bin" if self.deleted else ""
+        if not self.rules:
+            if self.save_config():
+                self._toast(f"Saved an empty scheme{binned} — no gesture is "
+                            f"bound, so the cursor will move but not act.",
+                            AMBER)
             return
-        try:
-            save_config(self._rules_to_config(), CONFIG_PATH)
-        except OSError as exc:
-            self._toast(f"Could not write the config: {exc}", DANGER)
-            return
-        self._clear_dirty()
-        self._toast(f"Saved {len(self.rules)} mapping(s) to "
-                    f"{os.path.basename(CONFIG_PATH)}.", ACCENT)
+
+        self.save_config(f"Saved {len(self.rules)} mapping(s){binned} to "
+                         f"{os.path.basename(CONFIG_PATH)}.")
 
     def _mark_dirty(self) -> None:
         # The settings widgets fire their callbacks while the window is
@@ -1730,10 +1970,729 @@ class GestureStudio(tk.Tk):
         self._dirty = False
         self.save_button.configure(text="Save Config")
 
+    # ══ TAB 2 — live camera and diagnostics ═════════════════════════════
+
+    def _build_camera_tab(self, master) -> None:
+        master.rowconfigure(0, weight=1)
+        master.columnconfigure(1, weight=1)
+
+        # Three fixed-height cards stack to more than a laptop screen once
+        # Cursor Settings joins them, and the last one packed would simply
+        # be clipped.  A scrolling column keeps all three reachable at any
+        # window size instead of picking one to lose.
+        column = tk.Frame(master, bg=BG)
+        column.grid(row=0, column=0, sticky="ns", pady=(PAD, PAD))
+
+        side_canvas = tk.Canvas(column, bg=BG, highlightthickness=0,
+                                width=262, bd=0)
+        side_scroll = ttk.Scrollbar(column, orient="vertical",
+                                    style="Dark.Vertical.TScrollbar",
+                                    command=side_canvas.yview)
+        side_canvas.configure(yscrollcommand=side_scroll.set)
+        side_canvas.pack(side="left", fill="both", expand=True)
+        side_scroll.pack(side="right", fill="y")
+
+        side = tk.Frame(side_canvas, bg=BG)
+        window = side_canvas.create_window((0, 0), window=side, anchor="nw")
+        side.bind("<Configure>",
+                  lambda _e: side_canvas.configure(
+                      scrollregion=side_canvas.bbox("all")))
+        side_canvas.bind("<Configure>",
+                         lambda e: side_canvas.itemconfigure(window,
+                                                             width=e.width))
+        self._scrollers.append((side_canvas, side))
+
+        self._build_camera_controls(side)
+        # Sited between the camera and the meters because that is the order
+        # you use them in: connect, tune the feel, watch the cost.  The
+        # widgets and their config bindings are unchanged by the move.
+        self._build_settings(side)
+        self._build_diagnostics(side)
+
+        stage = Card(master)
+        stage.grid(row=0, column=1, sticky="nsew", padx=(PAD, 0),
+                   pady=(PAD, PAD))
+        stage.rowconfigure(1, weight=1)
+        stage.columnconfigure(0, weight=1)
+
+        head = tk.Frame(stage, bg=CARD)
+        head.grid(row=0, column=0, sticky="ew", padx=PAD, pady=(PAD, 6))
+        tk.Label(head, text="LIVE PREVIEW", bg=CARD, fg=TEXT,
+                 font=self.f_head).pack(side="left")
+        self.preview_meta = tk.Label(head, text="not connected", bg=CARD,
+                                     fg=FAINT, font=self.f_sub)
+        self.preview_meta.pack(side="left", padx=8)
+
+        # The frame is rendered into a Label rather than a Canvas: there is
+        # exactly one image, it fills the widget, and nothing is drawn on
+        # top of it — the overlays are already burned in by the engine.
+        self.video_label = tk.Label(
+            stage, bg=FIELD, fg=FAINT, font=self.f_body,
+            text="Choose a camera index and press Connect.\n\n"
+                 "The tracker runs on its own thread; this tab only "
+                 "displays what it produces.")
+        self.video_label.grid(row=1, column=0, sticky="nsew",
+                              padx=PAD, pady=(0, PAD))
+        self._video_photo = None
+
+    def _build_camera_controls(self, master) -> None:
+        card = Card(master)
+        card.pack(fill="x")
+
+        tk.Label(card, text="CAMERA", bg=CARD, fg=TEXT,
+                 font=self.f_head).pack(anchor="w", padx=PAD, pady=(PAD, 2))
+        tk.Label(card, text="Starts the tracking engine in the background.",
+                 bg=CARD, fg=FAINT, font=("Segoe UI", 8)).pack(
+            anchor="w", padx=PAD)
+
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=PAD, pady=(10, 0))
+        tk.Label(row, text="INDEX", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.camera_var = tk.StringVar(value="0")
+        ttk.Combobox(row, textvariable=self.camera_var,
+                     values=[str(i) for i in range(6)], width=5,
+                     style="Dark.TCombobox", font=self.f_body).pack(
+            side="right")
+
+        buttons = tk.Frame(card, bg=CARD)
+        buttons.pack(fill="x", padx=PAD, pady=(12, 0))
+        self.connect_button = FlatButton(buttons, "Connect", self._connect,
+                                         kind="accent")
+        self.connect_button.pack(side="left")
+        self.disconnect_button = FlatButton(buttons, "Disconnect",
+                                            self._disconnect)
+        self.disconnect_button.pack(side="left", padx=(8, 0))
+        self.disconnect_button.set_enabled(False)
+
+        self.camera_status = tk.Label(card, text="Idle.", bg=CARD, fg=FAINT,
+                                      font=("Segoe UI", 8), wraplength=232,
+                                      justify="left", anchor="w")
+        self.camera_status.pack(fill="x", padx=PAD, pady=(10, PAD))
+
+    def _build_diagnostics(self, master) -> None:
+        card = Card(master)
+        card.pack(fill="x", pady=(PAD, 0))
+
+        tk.Label(card, text="RESOURCES", bg=CARD, fg=TEXT,
+                 font=self.f_head).pack(anchor="w", padx=PAD, pady=(PAD, 2))
+        note = ("psutil + NVML, refreshed every second."
+                if psutil is not None else
+                "psutil is not installed — pip install psutil")
+        tk.Label(card, text=note, bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8), wraplength=232, justify="left").pack(
+            anchor="w", padx=PAD)
+
+        self.metrics = {}
+
+        def section(title, rows):
+            tk.Label(card, text=title, bg=CARD, fg=FAINT,
+                     font=("Segoe UI", 8, "bold")).pack(
+                anchor="w", padx=PAD, pady=(10, 2))
+            for key, label in rows:
+                line = tk.Frame(card, bg=CARD)
+                line.pack(fill="x", padx=PAD)
+                tk.Label(line, text=label, bg=CARD, fg=MUTED,
+                         font=("Segoe UI", 8)).pack(side="left")
+                value = tk.Label(line, text="—", bg=CARD, fg=TEXT,
+                                 font=("Consolas", 9))
+                value.pack(side="right")
+                self.metrics[key] = value
+
+        section("SYSTEM TOTALS", (("cpu", "CPU"), ("ram", "RAM"),
+                                  ("gpu", "GPU"), ("vram", "VRAM")))
+        section("THIS APP & MODEL", (("app_cpu", "App CPU"),
+                                     ("app_ram", "App RAM"),
+                                     ("model_vram", "Model VRAM"),
+                                     ("fps", "Tracker FPS")))
+
+        tk.Frame(card, bg=CARD, height=PAD).pack()
+
+    # ── engine glue ─────────────────────────────────────────────────────
+
+    def _connect(self) -> None:
+        """Start the tracker, importing it off the GUI thread.
+
+        `import hand_cursor_2` pulls in mediapipe and costs seconds, and
+        opening a camera costs more.  Doing either inline would freeze the
+        window mid-click, so both happen on a worker and the result comes
+        back through `after`.
+        """
+        if self._engine_busy:
+            return
+        try:
+            index = int(self.camera_var.get())
+        except (TypeError, ValueError):
+            self._camera_note("Camera index must be a number.", DANGER)
+            return
+
+        self._engine_busy = True
+        self.connect_button.set_enabled(False)
+        self._camera_note(f"Starting the engine on index {index}…", CYAN)
+
+        def work():
+            try:
+                if self.engine is None:
+                    import hand_cursor_2
+                    self.engine = hand_cursor_2.HandTrackerEngine(
+                        enable_monitor=False, verbose=True)
+                ok = self.engine.start(index)
+                error = self.engine.status.get("error")
+            except Exception as exc:
+                ok, error = False, f"{exc.__class__.__name__}: {exc}"
+            # Tk is not thread-safe, and `after` is no exception — calling
+            # it from here raises "main thread is not in main loop".  The
+            # result goes on a queue instead, and the main thread collects
+            # it from the poller below.
+            self._engine_result.put((ok, index, error))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_engine_result)
+
+    def _poll_engine_result(self) -> None:
+        """Main-thread half of the connect hand-off."""
+        try:
+            ok, index, error = self._engine_result.get_nowait()
+        except queue.Empty:
+            if self._engine_busy:
+                self.after(100, self._poll_engine_result)
+            return
+        self._connected(ok, index, error)
+
+    def _connected(self, ok: bool, index: int, error) -> None:
+        self._engine_busy = False
+        self.connect_button.set_enabled(True)
+        if ok:
+            self.disconnect_button.set_enabled(True)
+            self._camera_note(f"Connected to camera {index}.", ACCENT)
+            self._toast(f"Tracker running on camera {index}.", ACCENT)
+            self._schedule_video()
+        else:
+            self.disconnect_button.set_enabled(False)
+            self._camera_note(f"Could not open camera {index}. {error or ''}",
+                              DANGER)
+
+    def _disconnect(self) -> None:
+        if self.engine is None:
+            return
+        self.engine.stop()
+        self.disconnect_button.set_enabled(False)
+        self._video_photo = None
+        self.video_label.configure(
+            image="", text="Disconnected. Press Connect to resume.")
+        self.video_label.image = None
+        self.preview_meta.configure(text="not connected")
+        self._camera_note("Camera released.", MUTED)
+
+    def _camera_note(self, message: str, colour: str = FAINT) -> None:
+        self.camera_status.configure(text=message, fg=colour)
+
+    def _schedule_video(self) -> None:
+        if self._video_job is None:
+            self._video_job = self.after(30, self.update_video_feed)
+
+    def update_video_feed(self) -> None:
+        """Draw the newest engine frame, at ~33 Hz."""
+        self._video_job = None
+        engine = self.engine
+
+        if engine is None or not engine.running:
+            return
+
+        frame = engine.get_latest_frame()
+        if frame is not None:
+            width = max(160, self.video_label.winfo_width())
+            height = max(120, self.video_label.winfo_height())
+            # [:, :, ::-1] is the BGR→RGB swap; done with a numpy view so
+            # the GUI needs no OpenCV import of its own.
+            image = Image.fromarray(frame[:, :, ::-1])
+            image.thumbnail((width, height), Image.BILINEAR)
+            self._video_photo = ImageTk.PhotoImage(image)
+            self.video_label.configure(image=self._video_photo, text="")
+            self.video_label.image = self._video_photo
+            self.preview_meta.configure(
+                text=f"{frame.shape[1]}×{frame.shape[0]}  "
+                     f"{engine.status.get('fps', 0.0):.0f} fps")
+
+        self._schedule_video()
+
+    def _refresh_metrics(self) -> None:
+        """One pass over psutil and NVML.  Never raises, never blocks."""
+        self._monitor_job = self.after(1000, self._refresh_metrics)
+
+        def put(key, text):
+            widget = self.metrics.get(key)
+            if widget is not None:
+                widget.configure(text=text)
+
+        if psutil is not None:
+            try:
+                put("cpu", f"{psutil.cpu_percent(interval=None):5.1f} %")
+                memory = psutil.virtual_memory()
+                put("ram", f"{memory.used / GIB:.1f} / "
+                           f"{memory.total / GIB:.1f} GiB")
+                if self._proc is None:
+                    self._proc = psutil.Process(os.getpid())
+                # cpu_percent is relative to the last call on this object,
+                # so the first reading is always 0.0 and the rest are real.
+                share = self._proc.cpu_percent(interval=None) / max(
+                    1, psutil.cpu_count())
+                put("app_cpu", f"{share:5.1f} %")
+                put("app_ram", f"{self._proc.memory_info().rss / MIB:.0f} MiB")
+            except Exception:
+                for key in ("cpu", "ram", "app_cpu", "app_ram"):
+                    put(key, "n/a")
+        else:
+            for key in ("cpu", "ram", "app_cpu", "app_ram"):
+                put(key, "psutil?")
+
+        if _NVML_READY:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                put("gpu", f"{util.gpu:5d} %")
+                put("vram", f"{info.used / MIB:.0f} / "
+                            f"{info.total / MIB:.0f} MiB")
+
+                # Our own slice of VRAM, which is what the YOLO weights
+                # actually occupy — the total above includes every other
+                # process on the card.
+                mine = 0
+                running = pynvml.nvmlDeviceGetComputeRunningProcesses(
+                    handle)
+                for proc in running:
+                    if proc.pid == os.getpid() and proc.usedGpuMemory:
+                        mine = proc.usedGpuMemory
+                put("model_vram", f"{mine / MIB:.0f} MiB" if mine
+                    else CPU_MODE_NOTE)
+            except Exception:
+                for key in ("gpu", "vram", "model_vram"):
+                    put(key, "n/a")
+        else:
+            for key in ("gpu", "vram", "model_vram"):
+                put(key, CPU_MODE_NOTE)
+
+        engine = self.engine
+        put("fps", f"{engine.status.get('fps', 0.0):5.1f}"
+            if engine is not None and engine.running else "—")
+
+    # ══ TAB 3 — recycle bin ═════════════════════════════════════════════
+
+    def _build_bin_tab(self, master) -> None:
+        master.rowconfigure(1, weight=1)
+        master.columnconfigure(0, weight=1)
+
+        head = tk.Frame(master, bg=BG)
+        head.grid(row=0, column=0, sticky="ew", pady=(PAD, 8))
+        tk.Label(head, text="Recycle Bin", bg=BG, fg=TEXT,
+                 font=self.f_title).pack(anchor="w")
+        tk.Label(head,
+                 text="Deleted mappings are kept here and saved to "
+                      "gesture_config.json, so nothing is lost until you "
+                      "delete it permanently.",
+                 bg=BG, fg=MUTED, font=self.f_sub).pack(anchor="w")
+
+        body = tk.Frame(master, bg=BG)
+        body.grid(row=1, column=0, sticky="nsew", pady=(0, PAD))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+
+        # ── list ───────────────────────────────────────────────────────
+        left = Card(body)
+        left.grid(row=0, column=0, sticky="nsew")
+
+        bar = tk.Frame(left, bg=CARD)
+        bar.pack(fill="x", padx=PAD, pady=(PAD, 8))
+        tk.Label(bar, text="DELETED MAPPINGS", bg=CARD, fg=TEXT,
+                 font=self.f_head).pack(side="left")
+        self.bin_count = tk.Label(bar, text="", bg=CARD, fg=FAINT,
+                                  font=self.f_sub)
+        self.bin_count.pack(side="left", padx=8)
+
+        # Only the list-wide action stays here; the per-mapping pair lives
+        # at the bottom of the details card, next to what they act on.
+        buttons = tk.Frame(left, bg=CARD)
+        buttons.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
+        FlatButton(buttons, "Empty Bin", self.empty_bin,
+                   kind="danger").pack(side="left")
+        tk.Label(buttons, text="Select a row to see it on the right.",
+                 bg=CARD, fg=FAINT, font=("Segoe UI", 8)).pack(side="left",
+                                                               padx=10)
+
+        holder = tk.Frame(left, bg=CARD)
+        holder.pack(side="top", fill="both", expand=True, padx=PAD)
+
+        columns = ("trigger", "gestures", "action", "when")
+        self.bin_table = ttk.Treeview(holder, columns=columns,
+                                      show="headings", style="Dark.Treeview",
+                                      selectmode="extended", height=6)
+        for key, title, width in (("trigger", "Trigger", 90),
+                                  ("gestures", "Gestures", 200),
+                                  ("action", "Action", 170),
+                                  ("when", "Deleted", 90)):
+            self.bin_table.heading(key, text=title)
+            self.bin_table.column(key, width=width,
+                                  stretch=key == "gestures")
+        scroll = ttk.Scrollbar(holder, orient="vertical",
+                               style="Dark.Vertical.TScrollbar",
+                               command=self.bin_table.yview)
+        self.bin_table.configure(yscrollcommand=scroll.set)
+        self.bin_table.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.bin_table.tag_configure("odd", background="#232327")
+        self.bin_table.bind("<<TreeviewSelect>>",
+                            lambda _e: self._show_bin_details())
+        self.bin_table.bind("<Double-1>", lambda _e: self.restore_selected())
+
+        # ── details ────────────────────────────────────────────────────
+        right = Card(body)
+        right.grid(row=0, column=1, sticky="nsew", padx=(PAD, 0))
+        self._build_bin_details(right)
+
+        self._render_bin()
+
+    def _build_bin_details(self, card) -> None:
+        """The details card: poses as pictures, then the numbers, then act.
+
+        Built once and repopulated on selection.  The two per-mapping
+        buttons sit at the bottom of this card rather than under the list,
+        so the thing being restored or destroyed is on screen beside them.
+        """
+        tk.Label(card, text="DETAILS", bg=CARD, fg=TEXT,
+                 font=self.f_head).pack(anchor="w", padx=PAD, pady=(PAD, 2))
+        self.bin_subtitle = tk.Label(card, text="", bg=CARD, fg=FAINT,
+                                     font=("Segoe UI", 8))
+        self.bin_subtitle.pack(anchor="w", padx=PAD)
+
+        # Buttons first, against the bottom: the panels above expand, and
+        # whatever is packed after an expanding widget loses its space.
+        actions = tk.Frame(card, bg=CARD)
+        actions.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
+        self.bin_restore_button = FlatButton(
+            actions, "Restore Mapping", self.restore_selected, kind="accent")
+        self.bin_restore_button.pack(side="left")
+        self.bin_purge_button = FlatButton(
+            actions, "Permanently Delete", self.purge_selected,
+            kind="danger-solid")
+        self.bin_purge_button.pack(side="right")
+
+        # The pose strip: one tile for a hold, two and an arrow for a
+        # transition.  Rebuilt per selection because the shape changes.
+        self.bin_poses = tk.Frame(card, bg=CARD)
+        self.bin_poses.pack(fill="x", padx=PAD, pady=(12, 0))
+
+        self.bin_fields = tk.Frame(card, bg=CARD)
+        self.bin_fields.pack(fill="both", expand=True, padx=PAD, pady=(14, 0))
+        self.bin_fields.columnconfigure(1, weight=1)
+
+        self.bin_empty = tk.Label(
+            card, text="Select a deleted mapping to see it here.",
+            bg=CARD, fg=FAINT, font=self.f_body)
+        self.bin_empty.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+
+    def _pose_tile(self, parent, label, caption) -> tk.Frame:
+        """One framed gesture image with its name underneath.
+
+        Reuses the catalog's already-decoded PhotoImages: they are the
+        gestures/ PNGs at 76 px, re-inked for the dark theme, with a
+        lettered placeholder standing in for the poses that ship no art.
+        Decoding them a second time here would only add a delay.
+        """
+        tile = tk.Frame(parent, bg=CARD)
+
+        box = tk.Frame(tile, bg=FIELD, width=SLOT, height=SLOT,
+                       highlightbackground=BORDER, highlightthickness=1)
+        box.pack_propagate(False)
+        box.pack()
+
+        photo = self.thumbs.get(label)
+        image = tk.Label(box, bg=FIELD, fg=TEXT, font=("Segoe UI", 14, "bold"))
+        if photo is not None:
+            image.configure(image=photo)
+            image.image = photo
+        else:
+            image.configure(text=pretty(label or "?")[:2].upper())
+        image.pack(expand=True)
+
+        tk.Label(tile, text=caption, bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 7, "bold")).pack(pady=(5, 0))
+        colour = {"geometry": ACCENT, "semantic": CYAN,
+                  "any": ACCENT}.get(source_of(label or ""), AMBER)
+        tk.Label(tile, text=pretty(label or "—"), bg=CARD, fg=colour,
+                 font=("Segoe UI", 8, "bold"),
+                 wraplength=SLOT + 24).pack()
+        return tile
+
+    def _bin_field(self, label: str, value: str,
+                   colour: str = TEXT) -> None:
+        """Append one label/value row.  Owns the counter so callers cannot
+        drift out of step with it."""
+        row = self._bin_row
+        self._bin_row += 1
+        tk.Label(self.bin_fields, text=label, bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).grid(
+            row=row, column=0, sticky="w", pady=2, padx=(0, 12))
+        tk.Label(self.bin_fields, text=value, bg=CARD, fg=colour,
+                 font=("Consolas", 9), anchor="w").grid(
+            row=row, column=1, sticky="ew", pady=2)
+
+    def _render_bin(self) -> None:
+        if not hasattr(self, "bin_table"):
+            return
+        self.bin_table.delete(*self.bin_table.get_children())
+        for index, rule in enumerate(self.deleted):
+            if rule.get("trigger") == TRANSITION:
+                gestures = (f"{pretty(rule.get('from_state', '?'))}  →  "
+                            f"{pretty(rule.get('to_state', '?'))}")
+            else:
+                gestures = f"hold {pretty(rule.get('pose', '?'))}"
+            action = rule.get("action", "?")
+            if action == KEYBOARD_MACRO:
+                action = f"{action}  {rule.get('keys', '')}"
+            stamp = rule.get("_deleted_at")
+            when = (time.strftime("%H:%M:%S", time.localtime(stamp))
+                    if stamp else "—")
+            self.bin_table.insert(
+                "", "end", iid=rule["id"],
+                values=(str(rule.get("trigger", "?")).capitalize(),
+                        gestures, action, when),
+                tags=("odd",) if index % 2 else ())
+        self.bin_count.configure(
+            text=f"{len(self.deleted)} item(s)"
+            + ("" if self.deleted else " — nothing deleted yet"))
+        self._show_bin_details()
+
+    def _show_bin_details(self) -> None:
+        """Repaint the details card for whatever the bin list has selected."""
+        selection = self.bin_table.selection()
+        rule = None
+        for entry in self.deleted:
+            if selection and entry["id"] == selection[0]:
+                rule = entry
+                break
+
+        for child in self.bin_poses.winfo_children():
+            child.destroy()
+        for child in self.bin_fields.winfo_children():
+            child.destroy()
+
+        if rule is None:
+            self.bin_poses.pack_forget()
+            self.bin_fields.pack_forget()
+            self.bin_empty.pack(fill="both", expand=True, padx=PAD, pady=PAD)
+            self.bin_subtitle.configure(text="")
+            self.bin_restore_button.set_enabled(False)
+            self.bin_purge_button.set_enabled(False)
+            return
+
+        self.bin_empty.pack_forget()
+        self.bin_poses.pack(fill="x", padx=PAD, pady=(12, 0))
+        self.bin_fields.pack(fill="both", expand=True, padx=PAD, pady=(14, 0))
+        self.bin_restore_button.set_enabled(True)
+        self.bin_purge_button.set_enabled(True)
+
+        name = rule.get("name") or rule.get("action", "mapping")
+        self.bin_subtitle.configure(text=name)
+
+        strip = tk.Frame(self.bin_poses, bg=CARD)
+        strip.pack()
+
+        if rule.get("trigger") == TRANSITION:
+            self._pose_tile(strip, rule.get("from_state"),
+                            "FROM POSE").pack(side="left")
+            tk.Label(strip, text="→", bg=CARD, fg=ACCENT,
+                     font=("Segoe UI", 18, "bold")).pack(side="left", padx=12,
+                                                         pady=(0, 24))
+            self._pose_tile(strip, rule.get("to_state"),
+                            "TO POSE").pack(side="left")
+        else:
+            self._pose_tile(strip, rule.get("pose"), "POSE").pack(side="left")
+
+        self._bin_row = 0
+        self._bin_field("TRIGGER",
+                        str(rule.get("trigger", "—")).capitalize())
+
+        if rule.get("trigger") == TRANSITION:
+            window = rule.get("max_time_sec", 0.0)
+            self._bin_field("MAX TIME",
+                            f"{window:.2f} s" if window > 0 else "no limit")
+        else:
+            delay = rule.get("hold_sec", 0.0)
+            self._bin_field("HOLD FOR",
+                            f"{delay:.2f} s" if delay > 0 else "instant")
+            self._bin_field("REPEAT",
+                            "yes" if rule.get("repeat") else "no")
+
+        action = rule.get("action", "—")
+        self._bin_field("ACTION", action, ACCENT)
+
+        chord = rule.get("keys") or ACTION_MACROS.get(action, "")
+        self._bin_field("KEYS", chord or "—")
+        self._bin_field("COOLDOWN",
+                        f"{rule.get('cooldown_sec', 0.0):.2f} s")
+
+        if rule.get("trigger") == TRANSITION:
+            self._bin_field("PROMOTE 2×",
+                            "yes" if rule.get("promote_double") else "no")
+
+        path = {"geometry": "30 Hz geometric", "semantic": "YOLO semantic"}
+        self._bin_field("PATH",
+                        path.get(rule.get("source", "any"), "either path"),
+                        CYAN if rule.get("source") == "semantic" else TEXT)
+        self._bin_field("ENABLED",
+                        "yes" if rule.get("enabled", True) else "no")
+
+        stamp = rule.get("_deleted_at")
+        self._bin_field("DELETED",
+                        time.strftime("%H:%M:%S", time.localtime(stamp))
+                        if stamp else "—")
+        self._bin_field("RULE ID", str(rule.get("id", "—")), FAINT)
+
+    def _selected_bin_ids(self) -> list:
+        chosen = set(self.bin_table.selection())
+        return [r["id"] for r in self.deleted if r["id"] in chosen]
+
+    def restore_selected(self) -> None:
+        """Move the selected mappings back into the active list."""
+        ids = self._selected_bin_ids()
+        if not ids:
+            self._toast("Select something in the bin to restore.", AMBER)
+            return
+
+        restored, disabled = self._restore_ids(ids)
+        if not restored:
+            self._toast("Nothing was restored.", AMBER)
+            return
+
+        self._render_table()
+        self._render_bin()
+
+        saved = self.save_config()
+        note = f"Restored {restored} mapping(s)"
+        if disabled:
+            note += (f" — {disabled} came back DISABLED because its trigger "
+                     f"is already bound")
+        note += "." if saved else " but the config could NOT be written."
+        self._toast(note, AMBER if disabled or not saved else ACCENT)
+
+    def _restore_ids(self, ids):
+        """Put binned rules back where they came from.
+
+        Returns (restored, disabled).  Two things make this more than a
+        list move:
+
+        Ascending origin order — each insert shifts everything after it, so
+        restoring high-index rules first would land the rest one slot short
+        of where they started.
+
+        Trigger collisions — the same gesture pair may have been re-bound
+        while the rule sat in the bin.  Two rules on one trigger both fire,
+        which is a broken control scheme rather than a conflict the user
+        can see, so the returning rule comes back disabled and says so.
+        """
+        wanted_ids = set(ids)
+        wanted = [entry for entry in self.deleted
+                  if entry.get("id") in wanted_ids]
+        wanted.sort(key=lambda entry: self._origin_of(entry))
+
+        restored = disabled = 0
+        for entry in wanted:
+            try:
+                self.deleted.remove(entry)
+            except ValueError:                        # pragma: no cover
+                continue
+
+            rule = {key: value for key, value in entry.items()
+                    if key not in ("_origin_index", "_deleted_at")}
+            rule.setdefault("enabled", True)
+
+            if rule.get("enabled", True) and self._conflict(rule) is not None:
+                rule["enabled"] = False
+                disabled += 1
+
+            index = self._origin_of(entry)
+            self.rules.insert(min(max(0, index), len(self.rules)), rule)
+            restored += 1
+
+        self._prune_undo(wanted_ids)
+        return restored, disabled
+
+    def _origin_of(self, entry) -> int:
+        """The index a binned rule should return to, coerced to a sane int."""
+        try:
+            return max(0, int(entry.get("_origin_index", len(self.rules))))
+        except (TypeError, ValueError):
+            return len(self.rules)
+
+    def _prune_undo(self, gone) -> None:
+        """Drop ids that have left the bin from every pending undo batch."""
+        self._undo_stack = [[rule_id for rule_id in batch
+                             if rule_id not in gone]
+                            for batch in self._undo_stack]
+        self._undo_stack = [batch for batch in self._undo_stack if batch]
+        if not self._undo_stack and hasattr(self, "undo_button"):
+            self.undo_button.set_enabled(False)
+
+    def purge_selected(self) -> None:
+        """Hard-delete the selected mappings.  This one is irreversible."""
+        ids = set(self._selected_bin_ids())
+        if not ids:
+            self._toast("Select something in the bin to delete.", AMBER)
+            return
+        if not messagebox.askokcancel(
+                "Delete permanently?",
+                f"Permanently delete {len(ids)} mapping(s)?\n\n"
+                f"This cannot be undone.", parent=self,
+                icon=messagebox.WARNING, default=messagebox.CANCEL):
+            return
+        # HARD DELETE.  Removed by identity from the bin and from every
+        # pending undo batch, so nothing can point at it afterwards.
+        removed = 0
+        for entry in [e for e in self.deleted if e.get("id") in ids]:
+            try:
+                self.deleted.remove(entry)
+                removed += 1
+            except ValueError:                        # pragma: no cover
+                continue
+
+        self._prune_undo(ids)
+        self._render_bin()
+
+        saved = self.save_config()
+        self._toast(
+            f"Permanently deleted {removed} mapping(s)"
+            + ("." if saved else " but the config could NOT be written."),
+            DANGER)
+
+    def empty_bin(self) -> None:
+        if not self.deleted:
+            self._toast("The bin is already empty.", AMBER)
+            return
+        if not messagebox.askokcancel(
+                "Empty the bin?",
+                f"Permanently delete all {len(self.deleted)} mapping(s) in "
+                f"the bin?\n\nThis cannot be undone.", parent=self,
+                icon=messagebox.WARNING, default=messagebox.CANCEL):
+            return
+        count = len(self.deleted)
+        self.deleted.clear()
+        self._undo_stack.clear()
+        if hasattr(self, "undo_button"):
+            self.undo_button.set_enabled(False)
+        self._render_bin()
+
+        saved = self.save_config()
+        self._toast(
+            f"Bin emptied — {count} mapping(s) gone"
+            + ("." if saved else " but the config could NOT be written."),
+            DANGER)
+
     # ── status bar ──────────────────────────────────────────────────────
 
     def _build_status(self) -> None:
-        bar = tk.Frame(self, bg=BG)
+        bar = tk.Frame(self._page, bg=BG)
         bar.grid(row=3, column=0, columnspan=2, sticky="ew",
                  padx=PAD, pady=(8, 10))
         self.status = tk.Label(bar, text="", bg=BG, fg=MUTED,
@@ -1752,6 +2711,25 @@ class GestureStudio(tk.Tk):
                 "Quit without saving?",
                 "You have unsaved mappings. Quit anyway?", parent=self):
             return
+
+        for job in (self._video_job, self._monitor_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._video_job = self._monitor_job = None
+
+        # The engine owns a camera, two worker threads and possibly a held
+        # mouse button.  Closing it before destroy() is what stops the
+        # device staying locked and the button staying down after we exit.
+        if self.engine is not None:
+            try:
+                self.engine.close()
+            except Exception:
+                pass
+            self.engine = None
+
         if self._executor is not None:
             # Never exit holding a button, whatever the Test button did.
             self._executor.release_all()
