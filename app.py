@@ -49,9 +49,10 @@ import gesture_fsm
 from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
                          MIDDLE_CLICK, MOUSE_ACTIONS, RIGHT_CLICK,
+                         AI_CONFIDENCE_DEFAULT, AI_CONFIDENCE_MAX,
+                         AI_CONFIDENCE_MIN,
                          SENSITIVITY_MAX, SENSITIVITY_MIN, SENSITIVITY_STEP,
-                         ActionExecutor, load_config, save_config,
-                         validate_macro)
+                         ActionExecutor, load_config, save_config)
 
 # ─── Palette ────────────────────────────────────────────────────────────────
 
@@ -83,8 +84,10 @@ CPU_MODE_NOTE = "N/A (CPU)"
 
 # The only settings the GUI owns.  Everything else under "settings" is
 # engine tuning, written back only if it was changed from its default.
+SELECTABLE_ACTIONS = [a for a in ACTIONS if a != KEYBOARD_MACRO]
+
 CURSOR_SETTING_KEYS = ("cursor_sensitivity", "is_mirrored",
-                       "invert_cursor_x")
+                       "invert_cursor_x", "ai_confidence")
 
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gestures")
@@ -701,7 +704,36 @@ class GestureStudio(tk.Tk):
         self.direction_note = tk.Label(
             card, text="", bg=CARD, fg=AMBER, font=("Segoe UI", 8),
             wraplength=232, justify="left", anchor="w")
-        self.direction_note.pack(fill="x", padx=PAD, pady=(6, PAD))
+        self.direction_note.pack(fill="x", padx=PAD, pady=(6, 0))
+
+        # ── AI confidence ──────────────────────────────────────────────
+        # One floor for both models.  Low finds a hand in poor light and
+        # invents poses in clutter; high is certain but drops out when you
+        # move.  A custom gesture set is exactly when this needs tuning.
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=PAD, pady=(12, 0))
+        tk.Label(row, text="AI CONFIDENCE", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.confidence_readout = tk.Label(row, text="0.60", bg=CARD,
+                                           fg=CYAN,
+                                           font=("Consolas", 10, "bold"))
+        self.confidence_readout.pack(side="right")
+
+        self.confidence_var = tk.DoubleVar(value=AI_CONFIDENCE_DEFAULT)
+        self.confidence_scale = ttk.Scale(
+            card, from_=AI_CONFIDENCE_MIN, to=AI_CONFIDENCE_MAX,
+            variable=self.confidence_var, orient="horizontal",
+            style="Dark.Horizontal.TScale", command=self._on_confidence)
+        self.confidence_scale.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        ends = tk.Frame(card, bg=CARD)
+        ends.pack(fill="x", padx=PAD)
+        tk.Label(ends, text=f"{AI_CONFIDENCE_MIN:.1f} loose", bg=CARD,
+                 fg=FAINT, font=("Segoe UI", 7)).pack(side="left")
+        tk.Label(ends, text=f"strict {AI_CONFIDENCE_MAX:.1f}", bg=CARD,
+                 fg=FAINT, font=("Segoe UI", 7)).pack(side="right")
+
+        tk.Frame(card, bg=CARD, height=PAD).pack()
 
         self._on_direction()
 
@@ -724,6 +756,7 @@ class GestureStudio(tk.Tk):
                 cursor_speed=float(self.sensitivity_var.get()),
                 is_mirrored=bool(self.mirror_toggle.get()),
                 invert_x=bool(self.invert_toggle.get()),
+                ai_confidence=float(self.confidence_var.get()),
             )
         except (TypeError, ValueError, AttributeError) as exc:
             self._camera_note(f"Could not apply cursor settings: "
@@ -741,6 +774,17 @@ class GestureStudio(tk.Tk):
             self.sensitivity_var.set(value)
         if hasattr(self, "sens_readout"):
             self.sens_readout.configure(text=f"{value:.1f}×")
+            self._mark_dirty()
+        self.update_engine_settings()
+
+    def _on_confidence(self, raw) -> None:
+        """Snap to 0.05, show it, and push it to the live models."""
+        value = round(float(raw) / 0.05) * 0.05
+        value = round(min(AI_CONFIDENCE_MAX, max(AI_CONFIDENCE_MIN, value)), 2)
+        if abs(value - self.confidence_var.get()) > 1e-9:
+            self.confidence_var.set(value)
+        if hasattr(self, "confidence_readout"):
+            self.confidence_readout.configure(text=f"{value:.2f}")
             self._mark_dirty()
         self.update_engine_settings()
 
@@ -1021,7 +1065,7 @@ class GestureStudio(tk.Tk):
         caption("ACTION", 0, 0)
         self.action_var = tk.StringVar(value=LEFT_CLICK)
         self.action_box = ttk.Combobox(
-            fields, textvariable=self.action_var, values=list(ACTIONS),
+            fields, textvariable=self.action_var, values=SELECTABLE_ACTIONS,
             state="readonly", style="Dark.TCombobox", font=self.f_body,
             width=22)
         self.action_box.grid(row=1, column=0, columnspan=2, sticky="ew",
@@ -1061,16 +1105,12 @@ class GestureStudio(tk.Tk):
                     style="Dark.TSpinbox", font=self.f_body).grid(
             row=3, column=1, sticky="w")
 
-        self.keys_caption = tk.Label(fields, text="KEY COMBINATION", bg=CARD,
-                                     fg=FAINT, font=("Segoe UI", 8, "bold"))
-        self.keys_caption.grid(row=2, column=2, columnspan=2, sticky="w",
-                               padx=(12, 0), pady=(0, 2))
-        self.keys_var = tk.StringVar(value="win+d")
-        self.keys_var.trace_add("write", lambda *_: self._refresh_preview())
-        self.keys_box = ttk.Entry(fields, textvariable=self.keys_var,
-                                  style="Dark.TEntry", font=self.f_mono)
-        self.keys_box.grid(row=3, column=2, columnspan=2, sticky="ew",
-                           padx=(12, 0))
+        # No key-combination field.  Every action offered in the dropdown
+        # carries its own chord (ACTION_MACROS), so the box sat reading
+        # "(n/a)" almost all of the time.  keys_var survives as invisible
+        # state only, so a hand-written KEYBOARD_MACRO rule keeps its chord
+        # when it is opened in the editor and saved again.
+        self.keys_var = tk.StringVar(value="")
 
         toggles = tk.Frame(fields, bg=CARD)
         toggles.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
@@ -1137,16 +1177,6 @@ class GestureStudio(tk.Tk):
     def _on_action_change(self) -> None:
         action = self.action_var.get()
         is_transition = self.trigger.value == TRANSITION
-
-        if action == KEYBOARD_MACRO:
-            self.keys_box.configure(state="normal")
-            self.keys_caption.configure(text="KEY COMBINATION", fg=FAINT)
-        else:
-            chord = ACTION_MACROS.get(action)
-            self.keys_box.configure(state="disabled")
-            self.keys_caption.configure(
-                text=f"KEY COMBINATION  ({chord})" if chord
-                else "KEY COMBINATION  (n/a)", fg=FAINT)
 
         # promote_double only means anything for a single-click action on a
         # transition; showing it elsewhere would imply it does something.
@@ -1268,14 +1298,17 @@ class GestureStudio(tk.Tk):
             poses = [pose]
 
         if action == KEYBOARD_MACRO:
+            # Only reachable by editing a rule written straight into the
+            # JSON, since the dropdown no longer offers this action.  The
+            # chord is carried through untouched rather than re-validated:
+            # the editor cannot change it, so it is not the editor's to
+            # reject.
             chord = self.keys_var.get().strip()
             if not chord:
                 if validate:
-                    self._toast("KEYBOARD_MACRO needs a key combination, "
-                                "e.g. ctrl+shift+esc.", DANGER)
-                return None
-            if validate and not validate_macro(chord):
-                self._toast(f"pynput does not recognise '{chord}'.", DANGER)
+                    self._toast("That mapping needs a key combination; "
+                                "set \"keys\" in gesture_config.json.",
+                                DANGER)
                 return None
             rule["keys"] = chord
 
@@ -1337,7 +1370,7 @@ class GestureStudio(tk.Tk):
         self.cooldown_var.set("0.35")
         self.timing_var.set("0.80" if self.trigger.value == TRANSITION
                             else "0.40")
-        self.keys_var.set("win+d")
+        self.keys_var.set("")
         self.promote_toggle.set(False)
         self.repeat_toggle.set(False)
         self.builder_title.configure(text="CREATE MAPPING")
@@ -1502,7 +1535,7 @@ class GestureStudio(tk.Tk):
 
         self.action_var.set(rule["action"])
         self.cooldown_var.set(f"{rule.get('cooldown_sec', 0.35):.2f}")
-        self.keys_var.set(rule.get("keys", "win+d"))
+        self.keys_var.set(rule.get("keys", ""))
         self.name_var.set(rule.get("name", ""))
 
         self.builder_title.configure(text="EDIT MAPPING")
@@ -1728,6 +1761,16 @@ class GestureStudio(tk.Tk):
             sens = max(SENSITIVITY_MIN, min(SENSITIVITY_MAX, round(sens, 1)))
             self.sensitivity_var.set(sens)
             self.sens_readout.configure(text=f"{sens:.1f}×")
+            try:
+                conf = float(self.settings.get("ai_confidence",
+                                               AI_CONFIDENCE_DEFAULT))
+            except (TypeError, ValueError):
+                conf = AI_CONFIDENCE_DEFAULT
+            conf = round(min(AI_CONFIDENCE_MAX,
+                             max(AI_CONFIDENCE_MIN, conf)), 2)
+            self.confidence_var.set(conf)
+            self.confidence_readout.configure(text=f"{conf:.2f}")
+
             self.mirror_toggle.set(
                 bool(self.settings.get("is_mirrored", True)))
             self.invert_toggle.set(
@@ -1745,6 +1788,8 @@ class GestureStudio(tk.Tk):
             float(self.sensitivity_var.get()), 1)
         self.settings["is_mirrored"] = bool(self.mirror_toggle.get())
         self.settings["invert_cursor_x"] = bool(self.invert_toggle.get())
+        self.settings["ai_confidence"] = round(
+            float(self.confidence_var.get()), 2)
 
     def _rules_to_config(self) -> dict:
         """Serialise the model, split by which classifier feeds each rule.

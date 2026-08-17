@@ -77,6 +77,7 @@ __all__ = [
     # Config plumbing
     "CONFIG_PATH", "DEFAULT_SETTINGS",
     "SENSITIVITY_MIN", "SENSITIVITY_MAX", "SENSITIVITY_STEP",
+    "AI_CONFIDENCE_MIN", "AI_CONFIDENCE_MAX", "AI_CONFIDENCE_DEFAULT",
     "load_config", "save_config", "empty_config",
     "normalise_gesture",
 ]
@@ -193,12 +194,20 @@ DEFAULT_SETTINGS = {
     # backwards under a picture that looks correct.
     "is_mirrored": True,
     "invert_cursor_x": False,
+
+    # Shared detection floor for MediaPipe and YOLO.  Worth tuning per
+    # gesture set, which is why the GUI puts it on a slider.
+    "ai_confidence": 0.6,
 }
 
 # Bounds the GUI enforces and hand_cursor clamps to.
 SENSITIVITY_MIN = 1.0
 SENSITIVITY_MAX = 3.0
 SENSITIVITY_STEP = 0.1
+
+AI_CONFIDENCE_MIN = 0.1
+AI_CONFIDENCE_MAX = 0.9
+AI_CONFIDENCE_DEFAULT = 0.6
 
 
 def normalise_gesture(raw_gesture) -> str:
@@ -210,11 +219,49 @@ def normalise_gesture(raw_gesture) -> str:
 
 
 def _as_float(value, fallback: float) -> float:
+    """Coerce to float, never raising — not even on a bad fallback.
+
+    The fallback often comes from the config too ("default_cooldown_sec"),
+    so `float(fallback)` was itself a crash path when a hand-edited file
+    put a string there.  0.0 is the floor of last resort.
+    """
     try:
         out = float(value)
+        if out == out:                                 # reject NaN
+            return out
     except (TypeError, ValueError):
-        return float(fallback)
-    return out if out == out else float(fallback)      # reject NaN
+        pass
+    try:
+        out = float(fallback)
+        return out if out == out else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value, fallback: int, minimum: int = 1) -> int:
+    """Coerce to an int at or above `minimum`, never raising."""
+    for candidate in (value, fallback):
+        try:
+            return max(minimum, int(float(candidate)))
+        except (TypeError, ValueError):
+            continue
+    return minimum
+
+
+def _as_list(value) -> list:
+    """Anything iterable becomes a list; anything else becomes empty.
+
+    Strings are deliberately NOT exploded into characters — a config that
+    says `"ignored_states": "idle"` means one label, not four.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return []
 
 
 # ─── Stabiliser ─────────────────────────────────────────────────────────────
@@ -482,6 +529,7 @@ def empty_config() -> dict:
             # a preview that looks correct.
             "is_mirrored": True,
             "invert_cursor_x": False,
+            "ai_confidence": 0.6,
         },
         "geometry_bindings": [],
         "yolo_bindings": [],
@@ -566,27 +614,39 @@ class GestureFSM:
         elif not isinstance(config, dict):
             raise TypeError("config must be a path, a dict, or None")
 
+        # Every value below is coerced rather than trusted.  A hand-edited
+        # config can put a string where a number belongs, or a number where
+        # a list belongs, and none of that may stop the tracker starting.
         settings = dict(DEFAULT_SETTINGS)
-        settings.update(config.get("settings") or {})
+        try:
+            settings.update(config.get("settings") or {})
+        except (TypeError, ValueError):
+            print("[config] 'settings' is not an object — using defaults")
         settings.update(overrides)
         self._settings = settings
 
         self._ignored = frozenset(
-            normalise_gesture(s) for s in settings["ignored_states"]
+            normalise_gesture(s)
+            for s in _as_list(settings.get("ignored_states"))
             if str(s).strip() != ""
         ) | {""}
 
         self._double_click_sec = max(0.0, _as_float(
-            settings["double_click_sec"], 0.8))
+            settings.get("double_click_sec"), 0.8))
         self._stuck_release_sec = max(0.0, _as_float(
-            settings["stuck_release_sec"], 0.5))
+            settings.get("stuck_release_sec"), 0.5))
         self._drag_timeout_sec = max(0.0, _as_float(
-            settings["drag_timeout_sec"], 30.0))
+            settings.get("drag_timeout_sec"), 30.0))
 
+        window = _as_int(settings.get("window_size"), 3)
+        threshold = _as_int(settings.get("stability_threshold"), 2)
         self._stabilizer = stabilizer or MajorityStabilizer(
-            int(settings["window_size"]), int(settings["stability_threshold"]))
+            window, min(threshold, window))
 
-        raw_count = sum(len(config.get(key) or []) for key in
+        # Never raises: a fault here would leave the engine half-built.
+        self._fault_reported = False
+
+        raw_count = sum(len(_as_list(config.get(key))) for key in
                         ("transitions", "holds", "mappings",
                          "geometry_bindings", "yolo_bindings"))
         self._transitions, self._holds = self._compile(config, settings)
@@ -626,7 +686,8 @@ class GestureFSM:
         self._known |= {r.to_state for r in self._transitions}
         self._known |= {r.pose for r in self._holds}
 
-        memory = max(2, int(_as_float(settings["transition_memory"], 2)) + 1)
+        memory = _as_int(settings.get("transition_memory"), 2,
+                         minimum=1) + 1
         self._recent = deque(maxlen=memory)
 
         self._current = None
@@ -666,8 +727,8 @@ class GestureFSM:
         """
         transitions, holds = [], []
 
-        raw_transitions = list(config.get("transitions") or [])
-        raw_holds = list(config.get("holds") or [])
+        raw_transitions = _as_list(config.get("transitions"))
+        raw_holds = _as_list(config.get("holds"))
 
         # Accepted aliases.  A hand-written config that groups rules by
         # which classifier feeds them reads naturally, and refusing it would
@@ -675,7 +736,7 @@ class GestureFSM:
         # "deleted_bindings" is deliberately NOT among these: the GUI's
         # recycle bin lives in the same file and must never compile.
         for key in ("geometry_bindings", "yolo_bindings", "bindings"):
-            for entry in (config.get(key) or []):
+            for entry in _as_list(config.get(key)):
                 if not isinstance(entry, dict):
                     continue
                 if str(entry.get("trigger", "")).lower() == "hold" \
@@ -686,7 +747,7 @@ class GestureFSM:
 
         # A single "mappings" list with a "trigger" discriminator is also
         # accepted, because that is the shape a GUI naturally produces.
-        for entry in (config.get("mappings") or []):
+        for entry in _as_list(config.get("mappings")):
             if not isinstance(entry, dict):
                 continue
             if str(entry.get("trigger", "")).lower() == "hold":
@@ -699,8 +760,9 @@ class GestureFSM:
                 continue
             try:
                 rule = TransitionRule(raw, index, settings)
-            except (ValueError, TypeError) as exc:
-                print(f"[config] skipping transition #{index}: {exc}")
+            except Exception as exc:
+                print(f"[config] skipping transition #{index}: "
+                      f"{exc.__class__.__name__}: {exc}")
                 continue
             if rule.enabled:
                 transitions.append(rule)
@@ -710,8 +772,9 @@ class GestureFSM:
                 continue
             try:
                 rule = HoldRule(raw, index, settings)
-            except (ValueError, TypeError) as exc:
-                print(f"[config] skipping hold #{index}: {exc}")
+            except Exception as exc:
+                print(f"[config] skipping hold #{index}: "
+                      f"{exc.__class__.__name__}: {exc}")
                 continue
             if rule.enabled:
                 holds.append(rule)
@@ -755,7 +818,10 @@ class GestureFSM:
         The return is an ActionEvent, which *is* a str — compare it to the
         action constants directly.  `.keys` carries the chord for macros.
         """
-        events = self._advance(gesture, float(timestamp), source)
+        try:
+            events = self._advance(gesture, _as_float(timestamp, 0.0), source)
+        except Exception as exc:                      # pragma: no cover
+            events = self._recover(exc, timestamp)
         if events:
             self._queue.extend(events)
         return self._queue.popleft() if self._queue else None
@@ -767,11 +833,73 @@ class GestureFSM:
 
     def poll(self, gesture, timestamp: float, source=None) -> list:
         """Every action this frame produced, in order.  Drains the queue."""
-        events = self._advance(gesture, float(timestamp), source)
+        try:
+            events = self._advance(gesture, _as_float(timestamp, 0.0), source)
+        except Exception as exc:                      # pragma: no cover
+            events = self._recover(exc, timestamp)
         if self._queue:
             events = list(self._queue) + events
             self._queue.clear()
         return events
+
+    def _recover(self, exc, timestamp) -> list:
+        """Fall back to IDLE after an internal fault, without stranding a drag.
+
+        A custom gesture or a half-written rule should never take the
+        tracking thread down, so every path into the rule engine funnels
+        through here.  The state machine is reset — which is the IDLE
+        state — and the reset's own cleanup is RETURNED rather than
+        dropped: if a drag was in progress, the caller still gets its
+        DRAG_STOP and the mouse button is not left held.
+
+        Reported once.  The failure mode is per-frame, so printing every
+        time would bury the first occurrence under thousands of copies.
+        """
+        if not self._fault_reported:
+            self._fault_reported = True
+            print(f"[fsm] internal fault, falling back to idle "
+                  f"({exc.__class__.__name__}: {exc})")
+
+        when = _as_float(timestamp, 0.0)
+        cleanup = []
+
+        # Release FIRST, using the least machinery that can produce the
+        # event.  reset() touches the stabiliser and several collections,
+        # any of which the fault may have broken — and if reset() then
+        # raises, a DRAG_STOP built inside it is lost and the mouse button
+        # stays physically held.  Emitting it here means the caller gets it
+        # whatever happens next.
+        try:
+            if self._dragging:
+                cleanup.append(self._emit_drag_stop(self._drag_rule, when))
+        except Exception:
+            self._dragging = False
+            self._drag_rule = None
+
+        try:
+            cleanup.extend(self.reset(when))
+        except Exception:
+            self._hard_reset()
+        return cleanup
+
+    def _hard_reset(self) -> None:
+        """Last-resort state clear that calls into nothing that can fail."""
+        self._current = None
+        self._previous = None
+        self._entered_at = 0.0
+        self._dragging = False
+        self._drag_rule = None
+        self._drag_lost_since = None
+        self._recent = deque(maxlen=3)
+        self._queue = deque()
+        self._last_fired = {}
+        self._hold_armed = {}
+        self._hold_next = {}
+        self._pending_click = {}
+        try:
+            self._stabilizer.reset()
+        except Exception:
+            self._stabilizer = MajorityStabilizer(3, 2)
 
     def reset(self, timestamp: float = 0.0) -> list:
         """Forget everything, releasing anything still held.

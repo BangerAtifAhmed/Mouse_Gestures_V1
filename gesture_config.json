@@ -2,7 +2,8 @@
   "settings": {
     "cursor_sensitivity": 1.4,
     "is_mirrored": true,
-    "invert_cursor_x": false
+    "invert_cursor_x": false,
+    "ai_confidence": 0.6
   },
   "geometry_bindings": [],
   "yolo_bindings": [],

@@ -299,6 +299,27 @@ SENS_MIN = 1.0
 # region gets too small to aim inside, and key auto-repeat would run away.
 SENS_MAX = 3.0
 
+# ── AI confidence ─────────────────────────────────────────────────────────
+# One number driving both models: MediaPipe's detection/tracking gates and
+# the YOLO score floor.  Low finds a hand in poor light and invents poses
+# in clutter; high is certain and drops out when you move.  A custom
+# gesture set is exactly when this needs tuning, which is why it is on a
+# slider rather than baked in.
+AI_CONFIDENCE_MIN = 0.1
+AI_CONFIDENCE_MAX = 0.9
+AI_CONFIDENCE_DEFAULT = 0.6
+
+# ── Gesture prediction caption ─────────────────────────────────────────────
+# The one overlay left on the frame.  BGR, not RGB: bright green reads as
+# "recognised" against skin, wood and painted walls alike, and grey keeps
+# "none" from competing with it for attention.  The black pass underneath is
+# what makes either legible on a pale background.
+_PREDICT_ORIGIN = (14, 40)
+_PREDICT_SCALE = 0.85
+_PREDICT_COLOUR = (0, 255, 120)        # bright green
+_PREDICT_IDLE_COLOUR = (170, 170, 170)  # grey, for "none" / loading
+_PREDICT_SHADOW = (0, 0, 0)
+
 # ── One Euro Filter: MIN_CUTOFF and BETA ───────────────────────────────────
 # These two decide how the cursor feels.  The filter's smoothing factor is
 #
@@ -2466,6 +2487,20 @@ class YoloWorker(threading.Thread):
         self._dropped_count = 0
 
     @property
+    def score_threshold(self) -> float:
+        """Minimum confidence for a prediction to count as a gesture."""
+        return self._score_threshold
+
+    @score_threshold.setter
+    def score_threshold(self, value) -> None:
+        """Safe to set from any thread: _infer reads it per inference,
+        and a float rebind is atomic under the GIL."""
+        try:
+            self._score_threshold = float(value)
+        except (TypeError, ValueError):
+            pass
+
+    @property
     def current_state(self):
         """(gesture, score, latency_ms) — one consistent snapshot."""
         return self._state
@@ -2867,6 +2902,14 @@ class HandTrackerEngine:
         self._thread = None
         self._stop_event = threading.Event()
 
+        # Set by the ai_confidence setter, consumed by the loop thread.
+        self._ai_confidence = AI_CONFIDENCE_DEFAULT
+        self._mp_rebuild = threading.Event()
+
+        # Keys already reported by _log_once, so a per-frame failure
+        # prints once instead of thousands of times.
+        self._reported = set()
+
         # Published by the loop, read by whoever wants a preview.  A single
         # attribute rebind is atomic under the GIL, so a reader gets either
         # the previous frame or the new one and never a half-written array
@@ -2903,6 +2946,14 @@ class HandTrackerEngine:
         except (TypeError, ValueError):
             self._log("[config] cursor_sensitivity is not a number — keeping "
                       f"{CURSOR_SENSITIVITY}")
+
+        try:
+            self._ai_confidence = round(clamp(
+                float(settings.get("ai_confidence", self._ai_confidence)),
+                AI_CONFIDENCE_MIN, AI_CONFIDENCE_MAX), 2)
+        except (TypeError, ValueError):
+            self._log(f"[config] ai_confidence is not a number — keeping "
+                      f"{self._ai_confidence}")
 
         IS_MIRRORED = bool(settings.get("is_mirrored", IS_MIRRORED))
         INVERT_CURSOR_X = bool(settings.get("invert_cursor_x",
@@ -3071,6 +3122,37 @@ class HandTrackerEngine:
     # and no copy to invalidate.
 
     @property
+    def ai_confidence(self) -> float:
+        """Detection/tracking threshold shared by MediaPipe and YOLO."""
+        return self._ai_confidence
+
+    @ai_confidence.setter
+    def ai_confidence(self, value) -> None:
+        """Apply a new threshold to both models, live.
+
+        YOLO takes it immediately — the worker reads its threshold on
+        every inference.  MediaPipe cannot: min_detection_confidence and
+        min_tracking_confidence are constructor arguments, so the graph
+        has to be rebuilt.  That is flagged here and done at the top of
+        the next loop iteration, on the loop's own thread, because
+        MediaPipe objects are not safe to swap underneath a call in
+        flight.
+        """
+        try:
+            new = float(value)
+        except (TypeError, ValueError):
+            return
+        new = round(clamp(new, AI_CONFIDENCE_MIN, AI_CONFIDENCE_MAX), 2)
+        if abs(new - self._ai_confidence) < 1e-9:
+            return
+
+        self._ai_confidence = new
+        if self.yolo_worker is not None:
+            self.yolo_worker.score_threshold = new
+        self._mp_rebuild.set()
+        self._log(f"[ai] confidence -> {new:.2f}")
+
+    @property
     def cursor_speed(self) -> float:
         """Cursor movement multiplier, clamped to [SENS_MIN, SENS_MAX]."""
         return CURSOR_SENSITIVITY
@@ -3100,7 +3182,7 @@ class HandTrackerEngine:
         INVERT_CURSOR_X = bool(value)
 
     def apply_settings(self, cursor_speed=None, is_mirrored=None,
-                       invert_x=None) -> None:
+                       invert_x=None, ai_confidence=None) -> None:
         """Set any combination of the three in one call.
 
         Each is optional so a caller can push just the one that changed;
@@ -3112,6 +3194,8 @@ class HandTrackerEngine:
             self.is_mirrored = is_mirrored
         if invert_x is not None:
             self.invert_x = invert_x
+        if ai_confidence is not None:
+            self.ai_confidence = ai_confidence
 
     # ── runtime controls (the keys the standalone preview binds) ────────
 
@@ -3148,11 +3232,13 @@ class HandTrackerEngine:
     def _ensure_mediapipe(self) -> None:
         if self.hands is not None:
             return
+        confidence = clamp(float(self._ai_confidence),
+                           AI_CONFIDENCE_MIN, AI_CONFIDENCE_MAX)
         kwargs = dict(
             static_image_mode=False,
             max_num_hands=MAX_NUM_HANDS,
-            min_detection_confidence=MIN_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+            min_detection_confidence=confidence,
+            min_tracking_confidence=confidence,
         )
         # The noisy moment: four TFLite/absl lines are written to fd 2 by
         # C++ during the FIRST process() call, not the constructor, so the
@@ -3167,6 +3253,33 @@ class HandTrackerEngine:
                 self.hands = mp_hands.Hands(**kwargs)
             self.hands.process(
                 np.zeros((INFER_WARMUP_H, INFER_WARMUP_W, 3), np.uint8))
+
+    def _rebuild_mediapipe(self) -> bool:
+        """Swap in a graph built at the current confidence.  True on success.
+
+        Costs the same second the first build does, so it is only reached
+        when the value actually changed.  The old graph is closed after
+        the new one is up: a failed build leaves the working one in place
+        rather than dropping tracking on the floor.
+        """
+        previous = self.hands
+        self.hands = None
+        try:
+            self._ensure_mediapipe()
+        except Exception as exc:
+            self.hands = previous
+            self._log(f"[ai] could not rebuild MediaPipe at "
+                      f"{self._ai_confidence:.2f} ({exc}) — keeping the "
+                      f"previous graph")
+            return False
+
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                pass
+        self._log(f"[ai] MediaPipe rebuilt at {self._ai_confidence:.2f}")
+        return True
 
     def _ensure_macros(self) -> None:
         if self.macros is not None or not self._enable_macros:
@@ -3188,8 +3301,9 @@ class HandTrackerEngine:
                       f"cursor unaffected")
             return
         try:
-            self.yolo_worker = YoloWorker(YOLO_MODEL_PATH, YOLO_CLASS_NAMES,
-                                          fsm=None)
+            self.yolo_worker = YoloWorker(
+                YOLO_MODEL_PATH, YOLO_CLASS_NAMES, fsm=None,
+                score_threshold=self._ai_confidence)
             self.yolo_worker.start()
             self._log("[yolo] semantic branch starting in the background")
         except Exception as exc:
@@ -3214,6 +3328,19 @@ class HandTrackerEngine:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(message)
+
+    def _log_once(self, key: str, message: str) -> None:
+        """Report a recurring per-frame failure exactly once.
+
+        The failures this guards are all per-frame by nature — a macro that
+        cannot be pressed fails on every frame the pose is held — so
+        printing each time would bury the first occurrence under thousands
+        of identical lines and slow the loop doing it.
+        """
+        if key in self._reported:
+            return
+        self._reported.add(key)
+        print(message)
 
     # ── the loop ────────────────────────────────────────────────────────
 
@@ -3285,6 +3412,15 @@ class HandTrackerEngine:
                 last_seq = seq
 
                 now_ts = time.perf_counter()
+
+                # ── Live AI-confidence change ───────────────────────────
+                # Done here, on this thread, because MediaPipe must not
+                # be swapped out from under a process() call in flight.
+                if self._mp_rebuild.is_set():
+                    self._mp_rebuild.clear()
+                    if self._rebuild_mediapipe():
+                        hands = self.hands
+                        hand_present = False
 
                 # ── Display hot-plug polling ────────────────────────────
                 if screen.poll(now_ts):
@@ -3381,11 +3517,27 @@ class HandTrackerEngine:
                         self._log(f"[gesture] {previous or '-'} -> {gesture}"
                                   f"   (hold {STATE_FREEZE_MS} ms)")
 
+                    # ── Gesture actions: FENCED OFF from the cursor ─────
+                    # A custom binding can name a macro pynput cannot
+                    # press, or an action a backend refuses.  That must
+                    # cost the action and nothing else, so the whole
+                    # arbitration block is caught here rather than at the
+                    # loop's outer try — which would end the run.  The
+                    # cursor maths below is deliberately outside it, so a
+                    # broken mapping cannot skip a single frame of
+                    # movement.
                     if fsm is not None and gesture not in FSM_IGNORED_STATES:
-                        stable_gesture, action = fsm.update_pair(gesture,
-                                                                 now_ts)
-                        if action is not None:
-                            actions.dispatch(action, now_ts)
+                        try:
+                            stable_gesture, action = fsm.update_pair(
+                                gesture, now_ts)
+                            if action is not None:
+                                actions.dispatch(action, now_ts)
+                        except Exception as exc:
+                            self._log_once(
+                                "action",
+                                f"[action] binding failed, tracking "
+                                f"continues ({exc.__class__.__name__}: "
+                                f"{exc})")
 
                     if frozen_target is not None:
                         if now_ts < freeze_until:
@@ -3396,7 +3548,16 @@ class HandTrackerEngine:
                     smooth_x = oef_x(target_x, timestamp=now_ts)
                     smooth_y = oef_y(target_y, timestamp=now_ts)
 
-                    self.cursor.move(int(smooth_x), int(smooth_y))
+                    # Cursor output can fail too (a revoked session, no
+                    # libXtst).  Losing a frame of movement is survivable;
+                    # losing the thread is not.
+                    try:
+                        self.cursor.move(int(smooth_x), int(smooth_y))
+                    except Exception as exc:
+                        self._log_once(
+                            "cursor",
+                            f"[cursor] move failed ({exc.__class__.__name__}"
+                            f": {exc})")
 
                     # Kept as the reference point the re-entry reset snaps
                     # to; the per-frame travel readout it used to feed was
@@ -3452,9 +3613,17 @@ class HandTrackerEngine:
                         yolo_action_count += 1
 
                 # ── Semantic macros (slow path, edge-triggered) ─────────
+                # Same fence as the gesture actions: a macro that cannot be
+                # pressed costs the macro, not the run.
                 if macros is not None and yolo_worker is not None:
-                    _mg, _ms, _ = yolo_worker.current_state
-                    macros.update(_mg, _ms, now_ts)
+                    try:
+                        _mg, _ms, _ = yolo_worker.current_state
+                        macros.update(_mg, _ms, now_ts)
+                    except Exception as exc:
+                        self._log_once(
+                            "macro",
+                            f"[macro] failed, tracking continues "
+                            f"({exc.__class__.__name__}: {exc})")
 
                 # ── Boxes ───────────────────────────────────────────────
                 cv2.rectangle(bgr_buf,
@@ -3467,14 +3636,13 @@ class HandTrackerEngine:
                     cv2.rectangle(bgr_buf, (_eff[0], _eff[1]),
                                   (_eff[2], _eff[3]), (0, 165, 255), 1)
 
-                # ── Per-frame state, no longer drawn on the frame ───────
-                # The debug text block that used to live here (FPS, speed,
-                # mirror state, gesture, stability, YOLO label, desktop
-                # size, key hints) is gone: the GUI shows all of it in real
-                # widgets, so burning it into the pixels only made the
-                # preview messy and cost a putText per line per frame.
-                # The landmarks, the anchor markers and the two boxes stay
-                # — those are the parts you cannot read off a label.
+                # ── Per-frame state ─────────────────────────────────────
+                # The old debug block (FPS, speed, mirror state, stability,
+                # desktop size, key hints) stays gone: the GUI shows all of
+                # it in real widgets.  The one line that came back is the
+                # gesture prediction, because that is the only value here
+                # you cannot read off a label — it has to sit next to the
+                # hand that produced it to be worth anything.
                 fps = 1.0 / (now_ts - prev_time) if now_ts > prev_time else 0.0
                 prev_time = now_ts
 
@@ -3483,6 +3651,33 @@ class HandTrackerEngine:
                     self.status["yolo"] = _yg
                     self.status["yolo_score"] = _ys
                     self.status["yolo_ms"] = _yms
+
+                    # ── Gesture prediction overlay ──────────────────────
+                    # Fixed top-left rather than pinned above a box: the
+                    # worker returns a label and a score, not the box
+                    # geometry, so there is nothing on this frame to anchor
+                    # to.  A fixed corner also stops the caption jumping
+                    # around while the hand moves.
+                    if not yolo_worker.ready:
+                        _text = ("Gesture: loading model..."
+                                 if yolo_worker.load_error is None
+                                 else "Gesture: model unavailable")
+                        _colour = _PREDICT_IDLE_COLOUR
+                    elif _yg is None:
+                        _text = "Gesture: none"
+                        _colour = _PREDICT_IDLE_COLOUR
+                    else:
+                        _text = f"Gesture: {_yg} ({_ys:.2f})"
+                        _colour = _PREDICT_COLOUR
+
+                    # Drawn twice — a thick black pass, then the colour on
+                    # top — so the label stays readable over a live camera
+                    # image.  A single pass disappears against a pale wall,
+                    # which is most of the frame most of the time.
+                    for _c, _w in ((_PREDICT_SHADOW, 5), (_colour, 2)):
+                        cv2.putText(bgr_buf, _text, _PREDICT_ORIGIN,
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    _PREDICT_SCALE, _c, _w, cv2.LINE_AA)
 
                 # ── Publish, instead of cv2.imshow ──────────────────────
                 # A copy, because bgr_buf is reused in place next frame and
