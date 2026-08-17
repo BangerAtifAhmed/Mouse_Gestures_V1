@@ -1,82 +1,10 @@
 {
-  "version": 2,
   "settings": {
-    "window_size": 3,
-    "stability_threshold": 2,
-    "ignored_states": [
-      "idle",
-      ""
-    ],
-    "double_click_sec": 0.8,
-    "transition_memory": 2,
-    "stuck_release_sec": 0.5,
-    "drag_timeout_sec": 30.0,
-    "default_cooldown_sec": 0.35,
-    "default_hold_sec": 0.4,
-    "default_max_time_sec": 0.8,
     "cursor_sensitivity": 1.4,
     "is_mirrored": true,
     "invert_cursor_x": false
   },
   "geometry_bindings": [],
   "yolo_bindings": [],
-  "deleted_bindings": [
-    {
-      "id": "click",
-      "name": "Left click",
-      "from_state": "point",
-      "to_state": "grip",
-      "action": "LEFT_CLICK",
-      "max_time_sec": 0.8,
-      "cooldown_sec": 0.15,
-      "promote_double": true,
-      "trigger": "transition",
-      "enabled": true,
-      "source": "any",
-      "_origin_index": 0,
-      "_deleted_at": 1786861979.5999548
-    },
-    {
-      "id": "drag-on",
-      "name": "Grab",
-      "from_state": "open",
-      "to_state": "grip",
-      "action": "DRAG_START",
-      "max_time_sec": 0.8,
-      "cooldown_sec": 0.35,
-      "trigger": "transition",
-      "enabled": true,
-      "source": "geometry",
-      "_origin_index": 0,
-      "_deleted_at": 1786861979.7997434
-    },
-    {
-      "id": "drag-off",
-      "name": "Drop",
-      "from_state": "grip",
-      "to_state": "open",
-      "action": "DRAG_STOP",
-      "max_time_sec": 0.0,
-      "cooldown_sec": 0.0,
-      "trigger": "transition",
-      "enabled": true,
-      "source": "geometry",
-      "_origin_index": 0,
-      "_deleted_at": 1786861979.9748611
-    },
-    {
-      "id": "right-click",
-      "name": "Right click",
-      "from_state": "peace",
-      "to_state": "grip",
-      "action": "RIGHT_CLICK",
-      "max_time_sec": 0.8,
-      "cooldown_sec": 0.35,
-      "trigger": "transition",
-      "enabled": true,
-      "source": "any",
-      "_origin_index": 0,
-      "_deleted_at": 1786861980.1599295
-    }
-  ]
+  "deleted_bindings": []
 }

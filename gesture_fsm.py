@@ -77,7 +77,7 @@ __all__ = [
     # Config plumbing
     "CONFIG_PATH", "DEFAULT_SETTINGS",
     "SENSITIVITY_MIN", "SENSITIVITY_MAX", "SENSITIVITY_STEP",
-    "load_config", "save_config", "default_config", "empty_config",
+    "load_config", "save_config", "empty_config",
     "normalise_gesture",
 ]
 
@@ -458,55 +458,31 @@ class ActionEvent(str):
 
 # ─── Config I/O ─────────────────────────────────────────────────────────────
 
-def default_config() -> dict:
-    """The bindings the GUI's "Load Defaults" button installs."""
-    return {
-        "version": 1,
-        "settings": dict(DEFAULT_SETTINGS),
-        "transitions": [
-            # The cooldown is the floor on how fast two clicks may arrive,
-            # so with promote_double on it must sit below a real double —
-            # a point→grip→point→grip cycle measures 0.20–0.67 s.  At 0.35
-            # the second click would be swallowed and the double could
-            # never happen.
-            {"id": "click", "name": "Left click",
-             "from_state": "point", "to_state": "grip",
-             "action": LEFT_CLICK, "max_time_sec": 0.8,
-             "cooldown_sec": 0.15, "promote_double": True},
-            {"id": "drag-on", "name": "Grab",
-             "from_state": "open", "to_state": "grip",
-             "action": DRAG_START, "max_time_sec": 0.8,
-             "cooldown_sec": 0.35},
-            {"id": "drag-off", "name": "Drop",
-             "from_state": "grip", "to_state": "open",
-             "action": DRAG_STOP, "max_time_sec": 0.0,
-             "cooldown_sec": 0.0},
-            {"id": "right-click", "name": "Right click",
-             "from_state": "peace", "to_state": "grip",
-             "action": RIGHT_CLICK, "max_time_sec": 0.8,
-             "cooldown_sec": 0.35},
-        ],
-        "holds": [
-            {"id": "desktop", "name": "Show desktop",
-             "pose": "timeout", "action": SHOW_DESKTOP,
-             "hold_sec": 0.4, "cooldown_sec": 2.0},
-        ],
-    }
-
-
 def empty_config() -> dict:
-    """A config with no bindings at all.
+    """The one and only default state: three settings and three empty lists.
 
-    This is what an unreadable or absent file becomes.  It used to be one
-    hardcoded point -> grip click, on the reasoning that a controller which
-    does nothing is indistinguishable from a broken one — but injecting a
-    binding the user never chose is its own kind of wrong, and it made a
-    deliberately empty scheme impossible to keep.  A blank slate is now a
-    supported state; the console says so loudly instead.
+    THERE IS NO OTHER CONFIG FACTORY IN THIS CODEBASE.  There used to be
+    two — a fallback that injected point -> grip on a missing file, and a
+    default_config() behind the GUI's Load Defaults button that installed
+    five rules — and both have been deleted.  Nothing in this program can
+    produce a binding any more; only the user can, through the GUI or by
+    editing the JSON.
+
+    The shape is exact and deliberately minimal.  The FSM's tuning knobs
+    are NOT written here: they have working values in DEFAULT_SETTINGS and
+    are merged in at construction, so a fresh file stays readable instead
+    of opening with a dozen numbers nobody asked about.
     """
     return {
-        "version": 2,
-        "settings": dict(DEFAULT_SETTINGS),
+        "settings": {
+            "cursor_sensitivity": 1.4,
+            # Mirroring ON, inversion OFF — exactly one of the two.  They
+            # are both reflections of the same axis, so turning on both
+            # (or neither) cancels out and the cursor runs backwards under
+            # a preview that looks correct.
+            "is_mirrored": True,
+            "invert_cursor_x": False,
+        },
         "geometry_bindings": [],
         "yolo_bindings": [],
         "deleted_bindings": [],

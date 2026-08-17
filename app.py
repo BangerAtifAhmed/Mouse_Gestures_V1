@@ -50,8 +50,8 @@ from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
                          MIDDLE_CLICK, MOUSE_ACTIONS, RIGHT_CLICK,
                          SENSITIVITY_MAX, SENSITIVITY_MIN, SENSITIVITY_STEP,
-                         ActionExecutor, default_config, load_config,
-                         save_config, validate_macro)
+                         ActionExecutor, load_config, save_config,
+                         validate_macro)
 
 # ─── Palette ────────────────────────────────────────────────────────────────
 
@@ -81,39 +81,34 @@ MIB = 1024 ** 2
 GIB = 1024 ** 3
 CPU_MODE_NOTE = "N/A (CPU)"
 
+# The only settings the GUI owns.  Everything else under "settings" is
+# engine tuning, written back only if it was changed from its default.
+CURSOR_SETTING_KEYS = ("cursor_sensitivity", "is_mirrored",
+                       "invert_cursor_x")
+
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gestures")
 
-# ─── Classifier vocabularies ────────────────────────────────────────────────
-# Purely informational: the engine accepts any string, but a rule bound to a
-# pose no classifier emits can never fire, and silently producing one of
-# those is the single most confusing thing this tool could do.  So the
-# catalog labels where each pose comes from.
+# ─── No gesture vocabulary ──────────────────────────────────────────────────
+# There is deliberately no master list of poses here any more.
 #
-# GEOMETRIC is detect_gesture()'s output — one classification per captured
-# frame, which is why clicks hang off it.  SEMANTIC is the YOLO branch's
-# class list, an order of magnitude slower and reserved for macros.
-
-GEOMETRIC = ("point", "peace", "grip", "open")
-
-SEMANTIC = (
-    "grabbing", "grip", "holy", "point", "call", "three3", "timeout",
-    "xsign", "hand_heart", "hand_heart2", "little_finger", "middle_finger",
-    "take_picture", "dislike", "fist", "four", "like", "mute", "ok", "one",
-    "palm", "peace", "peace_inverted", "rock", "stop", "stop_inverted",
-    "three", "three2", "two_up", "two_up_inverted", "three_gun",
-    "thumb_index", "thumb_index2", "no_gesture",
-)
-
-# The gestures/ folder spells three poses with "_inverse" where the model
-# reports "_inverted".  A config carrying the folder's spelling would never
-# match a prediction, so the catalog maps filenames onto the model's names
-# and shows the canonical one.
-_SPELLING = {
-    "peace_inverse": "peace_inverted",
-    "stop_inverse": "stop_inverted",
-    "two_up_inverse": "two_up_inverted",
-}
+# There used to be two — GEOMETRIC for detect_gesture()'s output, SEMANTIC
+# for the YOLO class list — plus an alias table folding the folder's
+# "_inverse" filenames onto the model's "_inverted" labels.  All three
+# assumed the vocabulary was fixed and known at edit time, which is exactly
+# the assumption that blocks a user-supplied gesture: an unknown label was
+# flagged as suspect, and a filename that did not match the table could not
+# be picked at all.
+#
+# The contract is now simply: the PNG's filename IS the label the model
+# emits.  Drop point.png in gestures/, train the model to say "point", and
+# it works — no list to edit, no alias to add, no validation to satisfy.
+#
+# DEFAULT_SOURCE is the stream a rule listens to when it does not say.
+# "any" means the FSM accepts it from whichever stream feeds it; a config
+# may still hand-set "geometry" or "semantic" per rule, which is what keeps
+# the dual-stream split in gesture_config.json working.
+DEFAULT_SOURCE = "any"
 
 TRANSITION = "transition"
 HOLD = "hold"
@@ -122,35 +117,6 @@ HOLD = "hold"
 def pretty(label: str) -> str:
     """'little_finger' -> 'Little Finger'."""
     return " ".join(part.capitalize() for part in str(label).split("_"))
-
-
-def canonical(stem: str) -> str:
-    """Fold a filename stem onto the label a classifier actually emits."""
-    stem = stem.strip().lower()
-    return _SPELLING.get(stem, stem)
-
-
-def source_of(label: str) -> str:
-    """Which classifier can produce this pose."""
-    in_geo = label in GEOMETRIC
-    in_sem = label in SEMANTIC
-    if in_geo and in_sem:
-        return "any"
-    if in_geo:
-        return "geometry"
-    if in_sem:
-        return "semantic"
-    return "unknown"
-
-
-def rule_source(labels) -> str:
-    """The source a rule should declare, given the poses it uses."""
-    kinds = {source_of(name) for name in labels if name}
-    if kinds == {"geometry"} or kinds == {"geometry", "any"}:
-        return "geometry"
-    if kinds == {"semantic"} or kinds == {"semantic", "any"}:
-        return "semantic"
-    return "any"
 
 
 # ─── Gesture catalog ────────────────────────────────────────────────────────
@@ -209,31 +175,28 @@ class GestureLibrary:
         return False
 
     def _scan(self) -> None:
-        found = {}
-        if os.path.isdir(self.directory):
-            for name in sorted(os.listdir(self.directory)):
-                stem, ext = os.path.splitext(name)
-                if ext.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-                    continue
-                label = canonical(stem)
-                if self.is_excluded(stem, label):
-                    continue
-                found[label] = os.path.join(self.directory, name)
-                self._stem_for[label] = stem
+        """The catalog is the directory.  Nothing else decides what exists.
 
-        # Every pose either classifier can emit belongs in the catalog,
-        # with or without artwork.  The folder ships 25 PNGs against a
-        # 34-class model plus the geometric set, and seeding from the
-        # vocabularies rather than the directory is what keeps the ones
-        # with no PNG bindable instead of invisible.  They draw as
-        # lettered tiles.  Blacklisted poses are skipped here too, or the
-        # vocabulary would put back what the directory scan just removed.
-        for label in GEOMETRIC + SEMANTIC:
-            if label == "no_gesture":
-                continue          # the absence sentinel, not a pose
-            if self.is_excluded(label):
+        Whatever image files are in gestures/ become the pose list, minus
+        the blacklist.  There is no vocabulary to check against and no
+        alias table: the filename stem is taken as the exact label the
+        classifier emits, so adding a gesture means adding a PNG.
+        """
+        found = {}
+        if not os.path.isdir(self.directory):
+            self._path_for = found
+            self.labels = []
+            return
+
+        for name in sorted(os.listdir(self.directory)):
+            stem, ext = os.path.splitext(name)
+            if ext.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                 continue
-            found.setdefault(label, None)
+            label = stem.strip().lower()
+            if not label or self.is_excluded(stem, label):
+                continue
+            found[label] = os.path.join(self.directory, name)
+            self._stem_for[label] = stem
 
         self._path_for = found
         self.labels = sorted(found)
@@ -489,10 +452,7 @@ class Slot(tk.Frame):
             self._image.configure(image="", text=pretty(label)[:2].upper(),
                                   fg=TEXT)
             self._image.image = None
-        kind = source_of(label)
-        colour = {"geometry": ACCENT, "semantic": CYAN,
-                  "any": ACCENT}.get(kind, AMBER)
-        self._caption.configure(text=pretty(label), fg=colour)
+        self._caption.configure(text=pretty(label), fg=ACCENT)
 
 
 # ─── The application ────────────────────────────────────────────────────────
@@ -745,6 +705,30 @@ class GestureStudio(tk.Tk):
 
         self._on_direction()
 
+    def update_engine_settings(self) -> None:
+        """Push the panel's three values into the running engine.
+
+        Called from the slider and both toggles, so a change reaches the
+        tracker on its very next frame rather than waiting for a
+        reconnect, and again on connect so the values loaded from
+        gesture_config.json are applied to a freshly started engine.
+
+        A no-op when nothing is running, which is what lets the same call
+        sit unconditionally at the end of every handler.
+        """
+        engine = self.engine
+        if engine is None:
+            return
+        try:
+            engine.apply_settings(
+                cursor_speed=float(self.sensitivity_var.get()),
+                is_mirrored=bool(self.mirror_toggle.get()),
+                invert_x=bool(self.invert_toggle.get()),
+            )
+        except (TypeError, ValueError, AttributeError) as exc:
+            self._camera_note(f"Could not apply cursor settings: "
+                              f"{exc.__class__.__name__}: {exc}", DANGER)
+
     def _on_sensitivity(self, raw) -> None:
         """Snap the slider to the 0.1 step and mirror it into the readout.
 
@@ -758,6 +742,7 @@ class GestureStudio(tk.Tk):
         if hasattr(self, "sens_readout"):
             self.sens_readout.configure(text=f"{value:.1f}×")
             self._mark_dirty()
+        self.update_engine_settings()
 
     def _on_direction(self) -> None:
         """Warn when the two reflections cancel each other out.
@@ -785,6 +770,7 @@ class GestureStudio(tk.Tk):
             self.direction_note.configure(
                 text="✓  Raw preview, cursor follows your hand.", fg=ACCENT)
         self._mark_dirty()
+        self.update_engine_settings()
 
     # ── hotkey footer ───────────────────────────────────────────────────
 
@@ -837,8 +823,6 @@ class GestureStudio(tk.Tk):
 
         buttons = tk.Frame(bar, bg=BG)
         buttons.grid(row=0, column=1, sticky="e")
-        FlatButton(buttons, "Load Defaults", self._load_defaults).pack(
-            side="left", padx=(0, 8))
         FlatButton(buttons, "Reload File", self._load_from_disk).pack(
             side="left", padx=(0, 8))
         self.save_button = FlatButton(buttons, "Save Config", self._save,
@@ -964,14 +948,7 @@ class GestureStudio(tk.Tk):
                         font=("Segoe UI", 8), wraplength=THUMB + 24)
         name.pack(pady=(4, 0))
 
-        kind = source_of(label)
-        colour = {"geometry": ACCENT, "semantic": CYAN,
-                  "any": ACCENT}.get(kind, AMBER)
-        dot = tk.Label(tile, text="●", bg=FIELD, fg=colour,
-                       font=("Segoe UI", 7))
-        dot.pack()
-
-        widgets = (tile, image, name, dot)
+        widgets = (tile, image, name)
         for widget in widgets:
             widget.bind("<Button-1>",
                         lambda _e, name=label: self._pick(name))
@@ -1233,19 +1210,13 @@ class GestureStudio(tk.Tk):
             body = (f"hold {rule['pose']} for {delay:.2f}s" if delay > 0
                     else f"enter {rule['pose']}")
 
-        note = ""
-        source = rule.get("source", "any")
-        if source == "semantic":
-            note = "   • YOLO path (~4.7 Hz)"
-        elif source == "any" and rule["trigger"] == TRANSITION:
-            poses = [rule.get("from_state"), rule.get("to_state")]
-            if any(source_of(p) == "unknown" for p in poses if p):
-                note = "   • pose is not in a known vocabulary"
+        note = ("   • YOLO path (~4.7 Hz)"
+                if rule.get("source") == "semantic" else "")
 
         self.preview.configure(
             text=f"{body}  ⇒  {action}{suffix}"
                  f"   • cooldown {rule['cooldown_sec']:.2f}s{note}",
-            fg=AMBER if "not in a known" in note else MUTED)
+            fg=MUTED)
 
     def _read_builder(self, validate=True):
         """Assemble a rule dict from the form, or None if it is incomplete."""
@@ -1312,7 +1283,7 @@ class GestureStudio(tk.Tk):
         if name:
             rule["name"] = name
 
-        rule["source"] = rule_source(poses)
+        rule["source"] = DEFAULT_SOURCE
         return rule
 
     def _commit(self) -> None:
@@ -1764,6 +1735,7 @@ class GestureStudio(tk.Tk):
             self._on_direction()
         finally:
             self._loading = prior
+        self.update_engine_settings()
 
     def _widgets_to_settings(self) -> None:
         """Fold the panel back into self.settings, which is what gets saved."""
@@ -1791,9 +1763,21 @@ class GestureStudio(tk.Tk):
                       else geometry)
             target.append(entry)
 
+        # Only the three cursor values the panel owns, plus any engine knob
+        # actually retuned away from its default.  Writing the whole
+        # DEFAULT_SETTINGS block instead would bury those three in eleven
+        # internals and make a fresh save stop matching the documented
+        # default shape — the file would grow keys nobody set.
+        settings = {key: self.settings[key] for key in CURSOR_SETTING_KEYS
+                    if key in self.settings}
+        for key, value in self.settings.items():
+            if key in settings:
+                continue
+            if value != gesture_fsm.DEFAULT_SETTINGS.get(key):
+                settings[key] = value
+
         return {
-            "version": 2,
-            "settings": dict(self.settings),
+            "settings": settings,
             "geometry_bindings": geometry,
             "yolo_bindings": semantic,
             "deleted_bindings": [dict(entry) for entry in self.deleted],
@@ -1852,7 +1836,7 @@ class GestureStudio(tk.Tk):
 
         poses = ([rule.get("from_state"), rule.get("to_state")]
                  if kind == TRANSITION else [rule.get("pose")])
-        rule.setdefault("source", rule_source([p for p in poses if p]))
+        rule.setdefault("source", DEFAULT_SOURCE)
         return rule
 
     def _config_to_rules(self, config: dict) -> None:
@@ -1918,26 +1902,14 @@ class GestureStudio(tk.Tk):
         self._clear_dirty()
         if not exists:
             self._toast("No config yet — starting with a blank slate. "
-                        "Build a mapping, or press Load Defaults.", AMBER)
+                        "Pick two poses to build your first mapping.",
+                        AMBER)
         elif not self.rules:
             self._toast(f"{os.path.basename(CONFIG_PATH)} has no mappings — "
                         f"nothing is bound.", AMBER)
         else:
             self._toast(f"Loaded {len(self.rules)} mapping(s) from "
                         f"{os.path.basename(CONFIG_PATH)}.", MUTED)
-
-    def _load_defaults(self) -> None:
-        if not messagebox.askokcancel(
-                "Load defaults?",
-                "This replaces every mapping in the list with the default "
-                "scheme.\n\nNothing is written to disk until you press "
-                "Save Config.", parent=self):
-            return
-        self._config_to_rules(default_config())
-        self._render_table()
-        self._clear_builder()
-        self._mark_dirty()
-        self._toast("Default scheme loaded — not yet saved.", AMBER)
 
     def _save(self) -> None:
         # No confirmation on an empty list any more.  Nothing regenerates
@@ -2164,6 +2136,11 @@ class GestureStudio(tk.Tk):
         self.connect_button.set_enabled(True)
         if ok:
             self.disconnect_button.set_enabled(True)
+            # The engine adopted whatever gesture_config.json held when it
+            # was constructed; the panel may have been changed since, and
+            # on a reconnect it certainly has.  Pushing here makes the
+            # panel authoritative from the first frame.
+            self.update_engine_settings()
             self._camera_note(f"Connected to camera {index}.", ACCENT)
             self._toast(f"Tracker running on camera {index}.", ACCENT)
             self._schedule_video()
@@ -2418,9 +2395,7 @@ class GestureStudio(tk.Tk):
 
         tk.Label(tile, text=caption, bg=CARD, fg=FAINT,
                  font=("Segoe UI", 7, "bold")).pack(pady=(5, 0))
-        colour = {"geometry": ACCENT, "semantic": CYAN,
-                  "any": ACCENT}.get(source_of(label or ""), AMBER)
-        tk.Label(tile, text=pretty(label or "—"), bg=CARD, fg=colour,
+        tk.Label(tile, text=pretty(label or "—"), bg=CARD, fg=ACCENT,
                  font=("Segoe UI", 8, "bold"),
                  wraplength=SLOT + 24).pack()
         return tile

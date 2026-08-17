@@ -3057,6 +3057,62 @@ class HandTrackerEngine:
         """
         return self._latest_frame
 
+    # ── live settings ───────────────────────────────────────────────────
+    # cursor_speed / is_mirrored / invert_x are properties over the
+    # module-level names rather than plain instance state, and that is the
+    # point: ScreenGeometry.to_screen() looks CURSOR_SENSITIVITY and
+    # INVERT_CURSOR_X up by name on EVERY call, the capture loop reads
+    # IS_MIRRORED on every frame, and the standalone preview's
+    # '+'/'-'/'m'/'i' keys rebind the same three names.
+    #
+    # Proxying keeps one source of truth, so a GUI slider and a keypress
+    # can never disagree about the current value.  Assigning any of them
+    # takes effect on the very next frame — there is nothing to restart
+    # and no copy to invalidate.
+
+    @property
+    def cursor_speed(self) -> float:
+        """Cursor movement multiplier, clamped to [SENS_MIN, SENS_MAX]."""
+        return CURSOR_SENSITIVITY
+
+    @cursor_speed.setter
+    def cursor_speed(self, value) -> None:
+        self.set_sensitivity(value)
+
+    @property
+    def is_mirrored(self) -> bool:
+        """Flips the captured frame, and with it the control direction."""
+        return IS_MIRRORED
+
+    @is_mirrored.setter
+    def is_mirrored(self, value) -> None:
+        global IS_MIRRORED
+        IS_MIRRORED = bool(value)
+
+    @property
+    def invert_x(self) -> bool:
+        """Reflects the control path only; the preview is left alone."""
+        return INVERT_CURSOR_X
+
+    @invert_x.setter
+    def invert_x(self, value) -> None:
+        global INVERT_CURSOR_X
+        INVERT_CURSOR_X = bool(value)
+
+    def apply_settings(self, cursor_speed=None, is_mirrored=None,
+                       invert_x=None) -> None:
+        """Set any combination of the three in one call.
+
+        Each is optional so a caller can push just the one that changed;
+        None means "leave this one alone".
+        """
+        if cursor_speed is not None:
+            self.cursor_speed = cursor_speed
+        if is_mirrored is not None:
+            self.is_mirrored = is_mirrored
+        if invert_x is not None:
+            self.invert_x = invert_x
+
     # ── runtime controls (the keys the standalone preview binds) ────────
 
     def adjust_sensitivity(self, delta: float) -> float:
