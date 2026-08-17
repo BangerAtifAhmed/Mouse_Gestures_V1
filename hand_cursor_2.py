@@ -518,6 +518,18 @@ YOLO_CLASS_NAMES = (
     "thumb_index", "thumb_index2", "no_gesture",
 )
 
+# Poses whose orientation is decided by MediaPipe landmarks instead of by
+# the network.  Deliberately tiny: the model already ships trained inverted
+# classes for peace, stop and two_up, and those beat a two-landmark estimate
+# on the poses they cover.  "three_gun" is here because the model has no
+# three_gun_inverted to compete with — the alternative is no verdict at all.
+#
+# Adding a name here silently overrides nothing; it only ever appends
+# "_inverse" to a label the model produced without one.  Adding a name that
+# ALREADY has an inverted twin would put the two verdicts in conflict, which
+# is the one thing this list must not do.
+ORIENTATION_GESTURES = ("three_gun",)
+
 
 # ── OpenCV internal threading ──────────────────────────────────────────────
 # OpenCV farms operations out to a thread pool.  For 640×480 flips and colour
@@ -781,6 +793,7 @@ LM_MIDDLE_PIP = 10
 LM_MIDDLE_TIP = 12
 LM_RING_PIP = 14
 LM_RING_TIP = 16
+LM_PINKY_MCP = 17        # with LM_INDEX_MCP, the palm's left/right axis
 LM_PINKY_PIP = 18
 LM_PINKY_TIP = 20
 
@@ -958,6 +971,122 @@ def handedness_of(results, hand, mirrored: bool) -> str:
     if not mirrored:
         label = "right" if label == "left" else "left"
     return label
+
+
+# How far apart the two knuckles must be, as a fraction of frame width,
+# before the palm/back verdict is trusted.  Edge-on they project onto
+# nearly the same x and the comparison is reading noise, so below this the
+# answer is "don't know" rather than a coin flip that flickers the gesture
+# name every frame.
+PALM_DEADBAND = 0.02
+
+
+def palm_is_facing(hand, side: str, mirrored: bool):
+    """True palm-to-camera, False back-to-camera, None when undecidable.
+
+    The knuckle order along x tells you which way round the hand is.  The
+    base case is calibrated against the camera, not derived from anatomy:
+
+        RIGHT hand, RAW image, palm to camera  ->  x[5] > x[17]
+
+    Turn the hand over and they swap.  A left hand reverses it, and
+    mirroring the buffer reverses it once more, which is why both flags
+    are applied on top of that base case.
+
+    THE SIGN IS EMPIRICAL AND HAS BEEN WRONG TWICE.  Both of the relative
+    corrections below are self-evidently right — mirroring flips it, the
+    other hand flips it — so a test that only checks "mirroring changes the
+    answer" or "the two hands disagree" passes with the base case inverted
+    and every verdict backwards.  Only holding a real palm to a real camera
+    settles it.  If it ever reads backwards again, flip THIS comparison and
+    nothing else: an error here is global, identical for both hands and
+    both mirror states, so one sign fixes all eight permutations.
+
+    `side` must be the TRUE physical hand, which is what handedness_of()
+    returns; without it there is no way to read the order, so an unknown
+    side gives an unknown orientation.
+
+    LIMITATION, stated plainly: this compares x only, so it assumes a
+    roughly upright hand.  Rotate the wrist toward horizontal and the two
+    knuckles line up vertically instead, the deadband trips, and the
+    verdict becomes None rather than wrong.
+    """
+    if side not in ("left", "right"):
+        return None
+    try:
+        landmarks = hand.landmark
+        spread = landmarks[LM_INDEX_MCP].x - landmarks[LM_PINKY_MCP].x
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if not isinstance(spread, float) or spread != spread:
+        return None
+    if abs(spread) < PALM_DEADBAND:
+        return None
+
+    # x[5] > x[17]  ->  palm, for a right hand in a raw image.
+    facing = spread > 0.0
+    if mirrored:
+        facing = not facing
+    if side == "left":
+        facing = not facing
+    return facing
+
+
+# The gun barrel is a far longer baseline than the palm is wide, so it can
+# afford a far wider deadband and still decide.  In a gun pose the wrist and
+# index tip are most of a hand apart (~0.15–0.25 of frame width) while the
+# two knuckles sit within ~0.02 of each other — which is why the knuckle
+# reading flickers on this pose and this one does not.
+GUN_DEADBAND = 0.05
+
+
+def gun_is_facing(hand, side: str, mirrored: bool):
+    """Palm/back for a POINTING hand, read off the barrel instead of the palm.
+
+    palm_is_facing() compares the index and pinky knuckles, which works for
+    an upright hand and fails badly for a gun: the pose is held in profile,
+    the two knuckles project onto nearly the same x, and the verdict becomes
+    a coin flip that changes the gesture name every frame.
+
+    A gun has a much better axis available — wrist (0) to index tip (8), the
+    barrel — and in this pose that axis is nearly horizontal, which is
+    exactly where the knuckle axis is useless.  The trade is one assumption
+    for another, and the new one suits the pose:
+
+        knuckles : needs a roughly UPRIGHT hand
+        barrel   : needs a roughly THUMB-UP gun
+
+    Base case, calibrated the same empirical way as palm_is_facing():
+
+        RIGHT hand, RAW image, palm to camera, thumb up  ->  x[8] > x[0]
+
+    Turn the hand over and the barrel swings across; a left hand reverses
+    it, and mirroring the buffer reverses it once more.
+
+    LIMITATION, stated plainly: roll the wrist until the thumb points down
+    and the verdict inverts, because the barrel swings with it while the
+    palm does not.  A gun held thumb-down is not a pose this reads
+    correctly, and there is no way to tell from x alone that it happened.
+    """
+    if side not in ("left", "right"):
+        return None
+    try:
+        landmarks = hand.landmark
+        reach = landmarks[LM_INDEX_TIP].x - landmarks[LM_WRIST].x
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if not isinstance(reach, float) or reach != reach:
+        return None
+    if abs(reach) < GUN_DEADBAND:
+        return None
+
+    # x[8] > x[0]  ->  palm, for a right hand in a raw image.
+    facing = reach > 0.0
+    if mirrored:
+        facing = not facing
+    if side == "left":
+        facing = not facing
+    return facing
 
 
 def pick_primary_hand(hands, previous_anchor=None):
@@ -3429,6 +3558,8 @@ class HandTrackerEngine:
         stable_gesture = None
         primary_anchor = None
         hand_side = ""            # "left" / "right" / "" when unknown
+        hand_facing = None        # True palm, False back, None unknown
+        gun_facing = None         # same, read off the barrel (three_gun)
 
         yolo_action_count = 0
         last_seq = -1
@@ -3536,6 +3667,13 @@ class HandTrackerEngine:
                     detected_hands = results.multi_hand_landmarks
                     hand = pick_primary_hand(detected_hands, primary_anchor)
                     hand_side = handedness_of(results, hand, IS_MIRRORED)
+                    hand_facing = palm_is_facing(hand, hand_side,
+                                                 IS_MIRRORED)
+                    # Read here, not in the label block: that block sits
+                    # outside this branch and `hand` is stale there on a
+                    # frame with no skeleton.  Two float reads, and only
+                    # three_gun ever looks at the answer.
+                    gun_facing = gun_is_facing(hand, hand_side, IS_MIRRORED)
 
                     anchor = hand.landmark[LM_MIDDLE_MCP]
                     primary_anchor = (anchor.x, anchor.y)
@@ -3647,6 +3785,8 @@ class HandTrackerEngine:
                     stable_gesture = None
                     primary_anchor = None
                     hand_side = ""
+                    hand_facing = None
+                    gun_facing = None
                     if yolo_worker is not None:
                         yolo_worker.request_reset()
                     if gesture_state is not None:
@@ -3703,24 +3843,54 @@ class HandTrackerEngine:
                 if yolo_worker is not None:
                     _yg, _ys, _yms = yolo_worker.current_state
 
-                    # ── Handedness suffix ───────────────────────────────
+                    # ── Label assembly:  name -> _inverse -> _side ──────
                     # YOLO cannot tell the hands apart and we are not
                     # retraining it to; MediaPipe already knows, and is
                     # already running on the same frame.  Gluing the two
                     # gives "three_gun_left" from a model that only ever
                     # learned "three_gun".
                     #
-                    # If the skeleton is missing while YOLO still sees a
-                    # box, hand_side is "" and the bare label is used —
-                    # a rule bound to "three_gun" keeps working, it just
-                    # cannot tell you which hand made it.
-                    _labelled = (f"{_yg}_{hand_side}"
-                                 if _yg and hand_side else _yg)
+                    # ORIENTATION IS APPLIED TO ALMOST NOTHING, on purpose.
+                    # The model already ships its own inverted classes —
+                    # peace_inverted, stop_inverted, two_up_inverted — and
+                    # those are trained verdicts on the real image.  Second-
+                    # guessing them from two landmarks would put our maths
+                    # in competition with the network on poses it already
+                    # handles, and the network wins.  ORIENTATION_GESTURES
+                    # therefore lists only the poses the model has NO
+                    # inverted class for, where the choice is between our
+                    # estimate and nothing at all.
+                    #
+                    # The verdict comes from gun_is_facing() (wrist to index
+                    # tip), NOT palm_is_facing() (knuckle to knuckle).  A
+                    # gun is held in profile, which is precisely where the
+                    # knuckles overlap on x and their reading flickers
+                    # frame to frame; the barrel is the one axis this pose
+                    # keeps wide.
+                    #
+                    # _inverse goes on BEFORE the side, so the pose name and
+                    # its orientation stay one token — "three_gun_inverse"
+                    # is the gesture, "_right" is which hand made it.  A
+                    # rule bound to "three_gun_inverse" then matches both
+                    # hands by prefix.
+                    #
+                    # Each modifier is independent: an unknown side still
+                    # yields "three_gun_inverse", and an undecidable
+                    # orientation still yields "three_gun_right".  Neither
+                    # can produce a double underscore.
+                    _labelled = _yg
+                    if _yg:
+                        if (gun_facing is False
+                                and _yg in ORIENTATION_GESTURES):
+                            _labelled = f"{_labelled}_inverse"
+                        if hand_side:
+                            _labelled = f"{_labelled}_{hand_side}"
 
                     self.status["yolo"] = _labelled
                     self.status["yolo_score"] = _ys
                     self.status["yolo_ms"] = _yms
                     self.status["handedness"] = hand_side
+                    self.status["palm_facing"] = hand_facing
 
                     # ── Semantic stream into its own FSM ────────────────
                     # A SEPARATE instance from the geometric one: the two
