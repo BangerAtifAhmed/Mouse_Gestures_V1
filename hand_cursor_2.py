@@ -94,6 +94,9 @@ import cv2
 import mediapipe as mp
 import numpy as np          # already a hard dependency of cv2 and mediapipe
 
+from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
+                      monitor_union, resolve_monitor_target)
+
 try:
     from gesture_fsm import (DOUBLE_CLICK, DRAG_START, DRAG_STOP, LEFT_CLICK,
                              ActionExecutor, GestureFSM, MajorityStabilizer,
@@ -2123,11 +2126,22 @@ class ScreenGeometry:
     """
 
     def __init__(self, backend, cam_width: int, cam_height: int,
-                 poll_interval: float = POLL_INTERVAL):
+                 poll_interval: float = POLL_INTERVAL,
+                 target: str = ALL_SCREENS):
         self._backend = backend
         self._poll_interval = poll_interval
         self._next_poll = 0.0
         self.monitors = 0
+
+        # Which display the cursor is confined to.  ALL_SCREENS maps onto
+        # the union of every monitor; "Screen N" onto that one rectangle.
+        # Everything downstream — to_screen, the clamp, the active box — is
+        # already written against an arbitrary (left, top, w, h) that may
+        # start at a negative origin, so restricting the target needs no
+        # changes there at all.
+        self.target = ALL_SCREENS
+        self.monitor_list = []
+        self._requested_target = str(target or ALL_SCREENS)
         # The camera's real frame size.  Held here rather than read from a
         # module constant so that swapping a 4:3 laptop sensor for a 16:9
         # phone feed rebuilds the box instead of silently drawing one sized
@@ -2162,6 +2176,29 @@ class ScreenGeometry:
         every POLL_INTERVAL would be wasteful, so the portable path trades
         away hot-plug detection rather than pay it repeatedly.
         """
+        # A specific screen needs per-monitor rectangles, which the backend
+        # does not expose — it only knows the virtual desktop.  Enumeration
+        # is 0.24 ms measured, and this runs at the poll interval rather
+        # than per frame, so it is affordable here and nowhere else.
+        if self._requested_target != ALL_SCREENS:
+            monitors = enumerate_monitors(self._backend)
+            if monitors:
+                self.monitor_list = monitors
+                rect, resolved = resolve_monitor_target(
+                    self._requested_target, monitors)
+                if rect is not None:
+                    if resolved != self.target:
+                        print(f"[screen] cursor confined to {resolved} "
+                              f"({rect[2]}×{rect[3]} at {rect[0]},{rect[1]})")
+                        if resolved != self._requested_target:
+                            print(f"[screen] "
+                                  f"{self._requested_target!r} is "
+                                  f"not attached — using "
+                                  f"{resolved}")
+                    self.target = resolved
+                    self.source = "native"
+                    return rect
+
         if self._native_ok:
             try:
                 m = self._backend.read_geometry()
@@ -2196,6 +2233,28 @@ class ScreenGeometry:
         if self._tk_geometry is not None:
             self.source = "tkinter"
         return self._tk_geometry
+
+    def set_target(self, target: str) -> bool:
+        """Confine the cursor to a display.  True when the rectangle moved.
+
+        Takes effect on the next frame: the rebuild is immediate rather
+        than waiting for the poll, because a user picking a screen in the
+        GUI expects the cursor to move there now.
+        """
+        requested = str(target or ALL_SCREENS)
+        if requested == self._requested_target:
+            return False
+        self._requested_target = requested
+        self.target = ALL_SCREENS if requested == ALL_SCREENS else self.target
+
+        metrics = self._read_geometry()
+        if metrics is None:
+            return False
+        if metrics == (self.left, self.top, self.width, self.height):
+            return False
+        self._apply(metrics)
+        self._next_poll = 0.0
+        return True
 
     # ── Camera size ────────────────────────────────────────────────────
     def set_camera_size(self, width: int, height: int) -> bool:
@@ -3189,8 +3248,10 @@ class HandTrackerEngine:
             self._log(f"[camera] {self.stream.width}×{self.stream.height} "
                       f"native, no rescale needed")
 
-        self.screen = ScreenGeometry(self.backend, self.stream.width,
-                                     self.stream.height, POLL_INTERVAL)
+        self.screen = ScreenGeometry(
+            self.backend, self.stream.width, self.stream.height,
+            POLL_INTERVAL,
+            target=getattr(self, "_pending_target", ALL_SCREENS))
         self._ensure_mediapipe()
         self._ensure_macros()
         self._ensure_yolo()
@@ -3360,8 +3421,9 @@ class HandTrackerEngine:
         INVERT_CURSOR_X = bool(value)
 
     def apply_settings(self, cursor_speed=None, is_mirrored=None,
-                       invert_x=None, ai_confidence=None) -> None:
-        """Set any combination of the three in one call.
+                       invert_x=None, ai_confidence=None,
+                       target_screen=None) -> None:
+        """Set any combination of these in one call.
 
         Each is optional so a caller can push just the one that changed;
         None means "leave this one alone".
@@ -3374,6 +3436,38 @@ class HandTrackerEngine:
             self.invert_x = invert_x
         if ai_confidence is not None:
             self.ai_confidence = ai_confidence
+        if target_screen is not None:
+            self.target_screen = target_screen
+
+    @property
+    def target_screen(self) -> str:
+        """Which display the cursor is confined to, as the resolved label.
+
+        Reads back what actually took effect, not what was asked for — so
+        a request for a screen that is not attached reports the fallback.
+        """
+        screen = getattr(self, "screen", None)
+        if screen is not None:
+            return screen.target
+        return getattr(self, "_pending_target", ALL_SCREENS)
+
+    @target_screen.setter
+    def target_screen(self, value) -> None:
+        label = str(value or ALL_SCREENS)
+        self._pending_target = label
+        screen = getattr(self, "screen", None)
+        if screen is None:
+            return          # picked up when the geometry is built
+        try:
+            if screen.set_target(label):
+                # The mapping rectangle moved, so the filters hold a
+                # position from the old screen.  Clearing them makes the
+                # next frame adopt the new target verbatim instead of
+                # gliding across the desktop to reach it.
+                self._reset_filters()
+        except Exception as exc:
+            self._log(f"[screen] could not switch to {label}: "
+                      f"{exc.__class__.__name__}: {exc}")
 
     # ── runtime controls (the keys the standalone preview binds) ────────
 

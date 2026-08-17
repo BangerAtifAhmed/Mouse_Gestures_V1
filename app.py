@@ -46,6 +46,8 @@ except Exception:                                         # pragma: no cover
     _NVML_READY = False
 
 import gesture_fsm
+from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
+                      monitor_union, resolve_monitor_target)
 from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
                          MIDDLE_CLICK, MOUSE_ACTIONS, RIGHT_CLICK,
@@ -87,7 +89,7 @@ CPU_MODE_NOTE = "N/A (CPU)"
 SELECTABLE_ACTIONS = [a for a in ACTIONS if a != KEYBOARD_MACRO]
 
 CURSOR_SETTING_KEYS = ("cursor_sensitivity", "is_mirrored",
-                       "invert_cursor_x", "ai_confidence")
+                       "invert_cursor_x", "ai_confidence", "target_screen")
 
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gestures")
@@ -706,6 +708,31 @@ class GestureStudio(tk.Tk):
             wraplength=232, justify="left", anchor="w")
         self.direction_note.pack(fill="x", padx=PAD, pady=(6, 0))
 
+        # ── target screen ──────────────────────────────────────────────
+        # Built from the displays attached RIGHT NOW, so the list is
+        # however many there are — one, two or six — and no count is
+        # hard-coded anywhere.  Refreshed when the dropdown is opened,
+        # because monitors get plugged in while the app is running.
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=PAD, pady=(12, 0))
+        tk.Label(row, text="CURSOR AREA", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(side="left")
+
+        self.screen_var = tk.StringVar(value=ALL_SCREENS)
+        self.screen_box = ttk.Combobox(
+            card, textvariable=self.screen_var, state="readonly",
+            font=("Segoe UI", 9))
+        self.screen_box.pack(fill="x", padx=PAD, pady=(4, 0))
+        self.screen_box.bind("<<ComboboxSelected>>", self._on_screen_target)
+        self.screen_box.bind("<Button-1>", lambda _e: self._refresh_screens())
+
+        self.screen_note = tk.Label(
+            card, text="", bg=CARD, fg=FAINT, font=("Segoe UI", 8),
+            wraplength=232, justify="left", anchor="w")
+        self.screen_note.pack(fill="x", padx=PAD, pady=(4, 0))
+
+        self._refresh_screens()
+
         # ── AI confidence ──────────────────────────────────────────────
         # One floor for both models.  Low finds a hand in poor light and
         # invents poses in clutter; high is certain but drops out when you
@@ -737,6 +764,56 @@ class GestureStudio(tk.Tk):
 
         self._on_direction()
 
+    def _refresh_screens(self) -> None:
+        """Re-enumerate the displays and rebuild the dropdown.
+
+        Called when the panel is built and again every time the list is
+        opened, so plugging a monitor in mid-session is picked up without
+        a restart.  The current choice survives if it still exists and
+        falls back to Screen 1 if it does not — the same rule the engine
+        applies, so the two never disagree about which screen is live.
+        """
+        if not hasattr(self, "screen_box"):
+            return
+        try:
+            monitors = enumerate_monitors()
+        except Exception:
+            monitors = []
+
+        self.monitors = monitors
+        labels = monitor_labels(monitors)
+        self.screen_box.configure(values=labels)
+
+        wanted = self.screen_var.get() or ALL_SCREENS
+        if wanted not in labels:
+            wanted = "Screen 1" if len(labels) > 1 else ALL_SCREENS
+            self.screen_var.set(wanted)
+
+        if not monitors:
+            self.screen_note.configure(
+                text="No displays enumerated — the cursor uses the whole "
+                     "desktop.")
+            return
+
+        if wanted == ALL_SCREENS:
+            rect = monitor_union(monitors)
+            detail = (f"{len(monitors)} display"
+                      f"{'s' if len(monitors) != 1 else ''}, "
+                      f"{rect[2]}×{rect[3]} combined")
+        else:
+            rect, _ = resolve_monitor_target(wanted, monitors)
+            detail = f"{rect[2]}×{rect[3]} at ({rect[0]}, {rect[1]})"
+        self.screen_note.configure(text=detail)
+
+    def _on_screen_target(self, _event=None) -> None:
+        """Dropdown changed: note it, push it, and save it."""
+        self._refresh_screens()
+        if self._loading:
+            return
+        self._widgets_to_settings()
+        self.update_engine_settings()
+        self._save_config()
+
     def update_engine_settings(self) -> None:
         """Push the panel's three values into the running engine.
 
@@ -757,6 +834,7 @@ class GestureStudio(tk.Tk):
                 is_mirrored=bool(self.mirror_toggle.get()),
                 invert_x=bool(self.invert_toggle.get()),
                 ai_confidence=float(self.confidence_var.get()),
+                target_screen=str(self.screen_var.get() or ALL_SCREENS),
             )
         except (TypeError, ValueError, AttributeError) as exc:
             self._camera_note(f"Could not apply cursor settings: "
@@ -1776,6 +1854,13 @@ class GestureStudio(tk.Tk):
             self.invert_toggle.set(
                 bool(self.settings.get("invert_cursor_x", False)))
             self._on_direction()
+
+            # Set the raw value first, then refresh: _refresh_screens is
+            # what validates it against the displays actually attached and
+            # rewrites it to Screen 1 if the saved one is gone.
+            self.screen_var.set(str(self.settings.get("target_screen")
+                                    or ALL_SCREENS))
+            self._refresh_screens()
         finally:
             self._loading = prior
         self.update_engine_settings()
@@ -1790,6 +1875,8 @@ class GestureStudio(tk.Tk):
         self.settings["invert_cursor_x"] = bool(self.invert_toggle.get())
         self.settings["ai_confidence"] = round(
             float(self.confidence_var.get()), 2)
+        self.settings["target_screen"] = str(self.screen_var.get()
+                                             or ALL_SCREENS)
 
     def _rules_to_config(self) -> dict:
         """Serialise the model, split by which classifier feeds each rule.
