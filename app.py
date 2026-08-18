@@ -812,7 +812,7 @@ class GestureStudio(tk.Tk):
             return
         self._widgets_to_settings()
         self.update_engine_settings()
-        self._save_config()
+        self.save_config()
 
     def update_engine_settings(self) -> None:
         """Push the panel's three values into the running engine.

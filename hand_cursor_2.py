@@ -522,16 +522,53 @@ YOLO_CLASS_NAMES = (
 )
 
 # Poses whose orientation is decided by MediaPipe landmarks instead of by
-# the network.  Deliberately tiny: the model already ships trained inverted
-# classes for peace, stop and two_up, and those beat a two-landmark estimate
-# on the poses they cover.  "three_gun" is here because the model has no
-# three_gun_inverted to compete with — the alternative is no verdict at all.
+# the network, and which axis decides each one.  Deliberately tiny — every
+# entry is a place we second-guess a trained model.
 #
-# Adding a name here silently overrides nothing; it only ever appends
-# "_inverse" to a label the model produced without one.  Adding a name that
-# ALREADY has an inverted twin would put the two verdicts in conflict, which
-# is the one thing this list must not do.
-ORIENTATION_GESTURES = ("three_gun",)
+#   three_gun : the model has no three_gun_inverted at all, so the choice
+#               is between our estimate and nothing.  Read off the BARREL
+#               (wrist -> index tip), because a gun is held in profile and
+#               its knuckles overlap on x.
+#   stop      : read off the KNUCKLES (index MCP -> pinky MCP).  A stop is
+#               a wide flat hand held square to the camera, which is the
+#               pose where that spread is widest and steadiest.
+#
+# The trained "stop_inverted" class used to collide with this: the same
+# pose could arrive under two names depending on which subsystem decided
+# it.  LABEL_ALIASES below now folds that name into "stop_inverse" before
+# this gate is consulted, so both routes end at one spelling and it is
+# safe for "stop" to be listed here.
+ORIENTATION_GESTURES = ("three_gun", "stop")
+
+# Class names rewritten the instant they leave the network, before any of
+# our own modifiers are considered.  One spelling reaches the FSM, the
+# caption and the gestures/ folder: "_inverse", never "_inverted".
+#
+# Two separate problems, one fix.
+#
+# THE COLLISION, which only "stop" has.  The network ships a trained
+# "stop_inverted" AND our knuckle override produces "stop_inverse" for the
+# same physical pose, so a rule bound to one would silently ignore the
+# other.  Aliasing collapses them:
+#
+#   network says "stop_inverted" -> "stop_inverse" immediately, which is
+#   NOT in ORIENTATION_GESTURES, so the knuckle math is skipped (the
+#   network already decided) and only the handedness suffix is added.
+#
+#   network says "stop"          -> stays "stop", the knuckle math runs and
+#   appends "_inverse" itself when the back of the hand is showing.
+#
+# THE MISMATCH, which peace and two_up have.  Nothing competes for these —
+# the network is the only thing that decides them — but it spells them
+# "_inverted" while the artwork in gestures/ is named "_inverse".  Since
+# the alias table was removed from app.py, a filename IS a label, so the
+# PNGs were unreachable.  Renaming here makes the model agree with the
+# folder instead of the other way round.
+LABEL_ALIASES = {
+    "stop_inverted": "stop_inverse",
+    "peace_inverted": "peace_inverse",
+    "two_up_inverted": "two_up_inverse",
+}
 
 
 # ── OpenCV internal threading ──────────────────────────────────────────────
@@ -1090,6 +1127,77 @@ def gun_is_facing(hand, side: str, mirrored: bool):
     if side == "left":
         facing = not facing
     return facing
+
+
+# ── Downward open hand: a pose the network cannot see ─────────────────────
+# The model has no class for a flat hand held fingers-down — it returns
+# "no_gesture" — so there is nothing for LABEL_ALIASES or the orientation
+# override to work on.  This is the one pose recognised from landmarks
+# alone, which is why the test is written to be hard to trigger by accident
+# rather than easy to trigger at all.
+#
+# Both thresholds are RELATIVE to the palm, not to the frame.  A fixed
+# fraction of frame height would stop working the moment the hand moved
+# closer to or further from the camera.
+DOWN_MIN_PALM = 0.03     # wrist -> middle MCP drop, as a fraction of height
+DOWN_TIP_MARGIN = 0.25   # how far past its PIP a tip must sit, in palm spans
+
+
+def _orientation_word(facing):
+    """palm / back / ? — for logs, where None must not read as False."""
+    if facing is True:
+        return "palm"
+    if facing is False:
+        return "back"
+    return "?"
+
+
+def is_hand_pointing_down(hand) -> bool:
+    """True only for an OPEN hand held fingers-down.
+
+    In MediaPipe's normalised space y grows DOWNWARD, so "below" is a
+    larger y.  Three conditions, each ruling out a different false
+    positive:
+
+      1. the palm itself points down — the middle knuckle sits below the
+         wrist by a real margin, which rejects an upright or sideways hand
+         before any finger is examined;
+      2. every fingertip sits below its own PIP joint by a fraction of that
+         palm span, which rejects a fist or a half-curled hand (a curled
+         finger folds its tip back up toward the palm);
+      3. every fingertip sits below the wrist, which rejects a hand angled
+         so far over that the fingers trail behind it.
+
+    All four fingers must agree.  The thumb is deliberately ignored: it
+    folds across the palm rather than along it, so it says nothing useful
+    about which way the hand is pointing.
+    """
+    try:
+        lm = hand.landmark
+        wrist_y = lm[LM_WRIST].y
+        palm = lm[LM_MIDDLE_MCP].y - wrist_y
+    except (AttributeError, IndexError, TypeError):
+        return False
+
+    if not isinstance(palm, float) or palm != palm:
+        return False
+    if palm < DOWN_MIN_PALM:
+        return False
+
+    margin = DOWN_TIP_MARGIN * palm
+    for tip, pip in ((LM_INDEX_TIP, LM_INDEX_PIP),
+                     (LM_MIDDLE_TIP, LM_MIDDLE_PIP),
+                     (LM_RING_TIP, LM_RING_PIP),
+                     (LM_PINKY_TIP, LM_PINKY_PIP)):
+        try:
+            tip_y = lm[tip].y
+            if tip_y < lm[pip].y + margin:
+                return False
+            if tip_y <= wrist_y:
+                return False
+        except (AttributeError, IndexError, TypeError):
+            return False
+    return True
 
 
 def pick_primary_hand(hands, previous_anchor=None):
@@ -3136,6 +3244,11 @@ class HandTrackerEngine:
         self._ai_confidence = AI_CONFIDENCE_DEFAULT
         self._mp_rebuild = threading.Event()
 
+        # Raised when the mapping rectangle moves under the cursor — a
+        # screen switch, today.  Consumed by the loop thread, which owns
+        # the 1€ filters; nothing else may touch them while it is running.
+        self._filter_reset = threading.Event()
+
         # Keys already reported by _log_once, so a per-frame failure
         # prints once instead of thousands of times.
         self._reported = set()
@@ -3439,6 +3552,24 @@ class HandTrackerEngine:
         if target_screen is not None:
             self.target_screen = target_screen
 
+    def _reset_filters(self) -> None:
+        """Make the cursor SNAP to its next target instead of gliding there.
+
+        Safe to call from any thread, which is the whole reason it is an
+        event rather than a direct assignment: the smoothing state lives in
+        two OneEuroFilter objects owned by the loop thread, and clearing
+        them from a GUI callback mid-frame would corrupt a filter that is
+        part-way through an update.  The flag is raised here and acted on
+        at the top of the next iteration.
+
+        Needed whenever the mapping rectangle moves beneath a stationary
+        hand — confining the cursor to one screen rewrites the whole
+        box→desktop map, so the filters hold a position that no longer
+        means anything.  Without this the cursor sweeps across the desktop
+        to reach its new home instead of simply appearing there.
+        """
+        self._filter_reset.set()
+
     @property
     def target_screen(self) -> str:
         """Which display the cursor is confined to, as the resolved label.
@@ -3654,6 +3785,8 @@ class HandTrackerEngine:
         hand_side = ""            # "left" / "right" / "" when unknown
         hand_facing = None        # True palm, False back, None unknown
         gun_facing = None         # same, read off the barrel (three_gun)
+        hand_down = False         # open hand held fingers-down
+        last_semantic = ""        # for the change-only label log
 
         yolo_action_count = 0
         last_seq = -1
@@ -3697,6 +3830,13 @@ class HandTrackerEngine:
                     if self._rebuild_mediapipe():
                         hands = self.hands
                         hand_present = False
+
+                # Lowering hand_present routes this frame through the same
+                # re-entry path a returning hand takes, which clears both
+                # filters and adopts the raw target verbatim.
+                if self._filter_reset.is_set():
+                    self._filter_reset.clear()
+                    hand_present = False
 
                 # ── Display hot-plug polling ────────────────────────────
                 if screen.poll(now_ts):
@@ -3768,6 +3908,7 @@ class HandTrackerEngine:
                     # frame with no skeleton.  Two float reads, and only
                     # three_gun ever looks at the answer.
                     gun_facing = gun_is_facing(hand, hand_side, IS_MIRRORED)
+                    hand_down = is_hand_pointing_down(hand)
 
                     anchor = hand.landmark[LM_MIDDLE_MCP]
                     primary_anchor = (anchor.x, anchor.y)
@@ -3881,6 +4022,7 @@ class HandTrackerEngine:
                     hand_side = ""
                     hand_facing = None
                     gun_facing = None
+                    hand_down = False
                     if yolo_worker is not None:
                         yolo_worker.request_reset()
                     if gesture_state is not None:
@@ -3937,6 +4079,38 @@ class HandTrackerEngine:
                 if yolo_worker is not None:
                     _yg, _ys, _yms = yolo_worker.current_state
 
+                    # Alias FIRST, before orientation or handedness is even
+                    # considered, so everything downstream — the override
+                    # gate, the caption, the FSM — sees one spelling.
+                    _yg = LABEL_ALIASES.get(_yg, _yg)
+
+                    # ── MediaPipe-only fallback ────────────────────
+                    # A flat hand held fingers-down has no class in the
+                    # model, so the network reports nothing and every
+                    # rule downstream — including the "stop" orientation
+                    # override — has nothing to fire on.  Synthesised
+                    # here from landmarks alone.
+                    #
+                    # Only ever fills a GAP: it is gated on the network
+                    # having said nothing, so it can never overrule a
+                    # real prediction.  "no_gesture" is included because
+                    # that is the class name the model uses for nothing,
+                    # alongside the None the worker returns below the
+                    # confidence floor.
+                    _raw = _yg          # kept for the diagnostic below
+                    _source = "yolo"
+                    if not _yg or _yg in ("none", "no_gesture"):
+                        if hand_down:
+                            _yg = "stop_inverse"
+                            _source = "landmarks"
+                            # _ys still holds the confidence of whatever
+                            # the network JUST REJECTED — _infer returns the
+                            # score even when it returns no gesture — and
+                            # printing that next to a label MediaPipe
+                            # invented reads as "this pose scored 0.44".
+                            # It scored nothing; there was no detection.
+                            _ys = None
+
                     # ── Label assembly:  name -> _inverse -> _side ──────
                     # YOLO cannot tell the hands apart and we are not
                     # retraining it to; MediaPipe already knows, and is
@@ -3974,13 +4148,41 @@ class HandTrackerEngine:
                     # can produce a double underscore.
                     _labelled = _yg
                     if _yg:
-                        if (gun_facing is False
-                                and _yg in ORIENTATION_GESTURES):
+                        # Which axis decides THIS pose's orientation.  The
+                        # two poses need different ones and neither reads
+                        # the other well: a gun is held in profile, where
+                        # the knuckles project onto nearly the same x and
+                        # flicker; a stop is a flat hand square to the
+                        # camera, where the knuckle spread is at its widest
+                        # while the wrist-to-tip axis is nearly vertical
+                        # and says nothing about x.
+                        #
+                        # Both estimators already fold in the true hand and
+                        # IS_MIRRORED, so nothing extra is applied here.
+                        if _yg not in ORIENTATION_GESTURES:
+                            _facing = None          # trust the network
+                        elif _yg == "three_gun":
+                            _facing = gun_facing    # wrist -> index tip
+                        else:                       # "stop"
+                            _facing = hand_facing   # knuckle 5 -> 17
+
+                        if _facing is False:
                             _labelled = f"{_labelled}_inverse"
                         if hand_side:
                             _labelled = f"{_labelled}_{hand_side}"
 
+                    if _labelled != last_semantic:
+                        last_semantic = _labelled
+                        self._log(
+                            f"[label] {_raw or '-'} -> {_labelled or '-'}"
+                            f"   (src={_source}"
+                            + (f" {_ys:.2f}" if _ys is not None else "")
+                            + f", side={hand_side or '-'}"
+                            f", knuckles={_orientation_word(hand_facing)}"
+                            f", down={hand_down})")
+
                     self.status["yolo"] = _labelled
+                    self.status["label_source"] = _source
                     self.status["yolo_score"] = _ys
                     self.status["yolo_ms"] = _yms
                     self.status["handedness"] = hand_side
@@ -4016,9 +4218,14 @@ class HandTrackerEngine:
                                  if yolo_worker.load_error is None
                                  else "Gesture: model unavailable")
                         _colour = _PREDICT_IDLE_COLOUR
-                    elif _labelled is None:
+                    elif not _labelled:
                         _text = "Gesture: none"
                         _colour = _PREDICT_IDLE_COLOUR
+                    elif _ys is None:
+                        # No network confidence exists for this one.  Say
+                        # where it came from rather than borrow a number.
+                        _text = f"Gesture: {_labelled} (landmarks)"
+                        _colour = _PREDICT_COLOUR
                     else:
                         # The combined name, so what is on screen is
                         # exactly what the PNG in gestures/ must be
