@@ -716,7 +716,24 @@ PROC_MAX_HEIGHT = 720
 # is identical at both sensor sizes; only the preview buffer grew.
 #
 # Set to 0 to hand MediaPipe the full-size frame.
-INFER_MAX_WIDTH = 320
+# MEASURED on this machine, 45 frames, median TOTAL cost per frame
+# (resize + colour convert + Hands.process):
+#
+#       320x180  Lite   35.6 ms      <- what this used to be
+#       480x270  Lite   32.0 ms
+#       640x360  Lite   32.8 ms      <- 4x the pixels, still faster
+#       480x270  Full   67.9 ms      <- the heavy model is not affordable
+#
+# Smaller is SLOWER, which is the opposite of what the old note here
+# assumed.  MediaPipe letterboxes its input to a fixed internal size, so
+# handing it 320x180 only means it upscales again — the downscale saves
+# nothing and costs a resize.  Feeding it 640x360 gives the landmark model
+# four times the detail for slightly less wall-clock time.
+#
+# That detail is the point.  At 320x180 a hand occupies a few dozen pixels
+# and a patterned shirt can plausibly look like one; false-positive hands
+# on the torso are the visible symptom.  More pixels is the direct fix.
+INFER_MAX_WIDTH = 640
 
 # ── Display hot-plug polling ───────────────────────────────────────────────
 # How often to re-read the virtual desktop rectangle.  The query is a cheap
@@ -1303,13 +1320,23 @@ def pick_infer_size(width: int, height: int):
 
     # Smallest integer divisor that brings the width within budget.
     divisor = -(-width // INFER_MAX_WIDTH)          # ceil, int arithmetic
-    infer_w = max(1, width // divisor)
-    infer_h = max(1, height // divisor)
 
-    # Exact only when the divisor divides both axes without remainder.
-    exact = (width % divisor == 0) and (height % divisor == 0)
-    interp = cv2.INTER_AREA if exact else cv2.INTER_LINEAR
-    return infer_w, infer_h, divisor, interp
+    if width % divisor == 0 and height % divisor == 0:
+        # The fast path: an exact integer divide keeps OpenCV on its
+        # optimised kernel and preserves the aspect ratio to the pixel.
+        return width // divisor, height // divisor, divisor, cv2.INTER_AREA
+
+    # No integer divisor divides BOTH axes, so an integer downscale would
+    # truncate one of them and quietly change the aspect ratio — 1366x768
+    # at /5 becomes 273x153, which is 0.32% wider than the source.  That
+    # matters because MediaPipe normalises its landmarks to the image it
+    # was handed: a stretched input returns landmarks stretched by the same
+    # amount, and every one of them lands slightly off when drawn on the
+    # full-size frame.  Derive the height from the true ratio instead and
+    # pay for the generic resize; a correct frame beats a fast wrong one.
+    infer_w = min(width, INFER_MAX_WIDTH)
+    infer_h = max(1, int(round(infer_w * height / width)))
+    return infer_w, infer_h, width / infer_w, cv2.INTER_LINEAR
 
 
 def sanitise_margins() -> tuple[float, float, float]:
@@ -3905,8 +3932,9 @@ class HandTrackerEngine:
                                              raw_frame.dtype)
                         rgb_buf = np.empty((infer_h, infer_w, 3),
                                            raw_frame.dtype)
-                        self._log(f"[infer] MediaPipe fed {infer_w}×{infer_h} "
-                                  f"(1/{infer_div} of {frame_w}×{frame_h})")
+                        self._log(f"[infer] MediaPipe fed {infer_w}×{infer_h}"
+                                  f" (1/{infer_div:g} of "
+                                  f"{frame_w}×{frame_h})")
                     else:
                         infer_bgr = None
                         rgb_buf = np.empty_like(raw_frame)
