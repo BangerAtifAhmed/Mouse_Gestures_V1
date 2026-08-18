@@ -1143,6 +1143,55 @@ DOWN_MIN_PALM = 0.03     # wrist -> middle MCP drop, as a fraction of height
 DOWN_TIP_MARGIN = 0.25   # how far past its PIP a tip must sit, in palm spans
 
 
+# ── Poses the network confuses because their thumbs agree ─────────────────
+# A thumbs-down and a downward open hand share the one feature the model
+# leans on hardest: an extended thumb pointing away from a downward hand.
+# They differ completely everywhere else, and the difference is not subtle
+# — it is four fingers.
+#
+#       dislike        thumb out, four fingers FOLDED   (a fist)
+#       stop_inverse   thumb out, four fingers EXTENDED (an open hand)
+#
+# So the thumb is exactly the wrong thing to discriminate on, and the
+# finger states are exactly the right thing.  detect_gesture() already
+# computes them every frame with the radial test — |tip-wrist| against
+# |pip-wrist| — which is self-normalising and holds at any hand distance
+# and any in-plane rotation, so it stays right where a y-comparison would
+# fall over on a tilted hand.
+#
+# Listed as a tuple because the same argument applies to any class the
+# model only ever assigns to a closed hand ("like", "fist"); adding one
+# here is a one-word change.
+FIST_SHAPED_CLASSES = ("dislike",)
+
+# How many of the four fingers must read extended before a fist-shaped
+# prediction is treated as contradicted.  Three, not four, so a single
+# mis-tracked fingertip cannot veto the correction — while a real fist,
+# which extends none of them, is nowhere near the line.
+OPEN_HAND_MIN_FINGERS = 3
+
+
+def extended_finger_count(fingers_ext) -> int:
+    """How many of index/middle/ring/pinky read as extended."""
+    try:
+        return sum(1 for flag in fingers_ext if flag)
+    except TypeError:
+        return 0
+
+
+def contradicts_closed_hand(label, fingers_ext) -> bool:
+    """True when *label* claims a fist but the landmarks show an open hand.
+
+    Deliberately one-directional.  It can only ever reject a fist-shaped
+    class on a demonstrably open hand; it never invents one, never touches
+    a prediction that is not in FIST_SHAPED_CLASSES, and never fires on a
+    genuine fist, which extends no fingers at all.
+    """
+    if label not in FIST_SHAPED_CLASSES:
+        return False
+    return extended_finger_count(fingers_ext) >= OPEN_HAND_MIN_FINGERS
+
+
 def _orientation_word(facing):
     """palm / back / ? — for logs, where None must not read as False."""
     if facing is True:
@@ -4099,6 +4148,27 @@ class HandTrackerEngine:
                     # confidence floor.
                     _raw = _yg          # kept for the diagnostic below
                     _source = "yolo"
+
+                    # ── Fist/open-hand disagreement ────────────────────
+                    # The network calls this a closed-hand pose while the
+                    # landmarks show four extended fingers.  Both cannot be
+                    # true, and the finger states are measured geometry
+                    # rather than an inference, so they win.
+                    #
+                    # Corrected, not discarded: dropping the label would
+                    # lose the pose entirely.  It is cleared here so the
+                    # downward-hand rule below can name it properly, and
+                    # if that rule does not apply the frame simply reports
+                    # nothing rather than the wrong thing.
+                    if contradicts_closed_hand(_yg, fingers_ext):
+                        self._log_once(
+                            "fist-open",
+                            f"[label] '{_yg}' claims a closed hand but "
+                            f"{extended_finger_count(fingers_ext)} fingers "
+                            f"are extended — deferring to the landmarks")
+                        _yg = None
+                        _ys = None
+                        _source = "landmarks"
                     if not _yg or _yg in ("none", "no_gesture"):
                         if hand_down:
                             _yg = "stop_inverse"
