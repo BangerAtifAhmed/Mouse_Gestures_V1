@@ -85,6 +85,7 @@ import ctypes
 import math
 import os
 import queue
+import statistics
 import subprocess
 import sys
 import threading
@@ -96,6 +97,7 @@ import numpy as np          # already a hard dependency of cv2 and mediapipe
 
 from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
                       monitor_union, resolve_monitor_target)
+from gesture_fsm import HAND_ANY, HAND_BOTH, HAND_LEFT, HAND_RIGHT
 
 try:
     from gesture_fsm import (DOUBLE_CLICK, DRAG_START, DRAG_STOP, LEFT_CLICK,
@@ -564,6 +566,10 @@ ORIENTATION_GESTURES = ("three_gun", "stop")
 # the alias table was removed from app.py, a filename IS a label, so the
 # PNGs were unreachable.  Renaming here makes the model agree with the
 # folder instead of the other way round.
+# NOT the same thing as "stop_inverse_down", which is a THIRD pose.  The
+# three are: "stop" (palm to camera), "stop_inverse" (back of an upright
+# hand, either route), and "stop_inverse_down" (an open hand pointing at
+# the floor, named by is_hand_pointing_down when the network declines).
 LABEL_ALIASES = {
     "stop_inverted": "stop_inverse",
     "peace_inverted": "peace_inverse",
@@ -1166,8 +1172,8 @@ DOWN_TIP_MARGIN = 0.25   # how far past its PIP a tip must sit, in palm spans
 # They differ completely everywhere else, and the difference is not subtle
 # — it is four fingers.
 #
-#       dislike        thumb out, four fingers FOLDED   (a fist)
-#       stop_inverse   thumb out, four fingers EXTENDED (an open hand)
+#       dislike             thumb out, 4 fingers FOLDED   (a fist)
+#       stop_inverse_down   thumb out, 4 fingers EXTENDED (an open hand)
 #
 # So the thumb is exactly the wrong thing to discriminate on, and the
 # finger states are exactly the right thing.  detect_gesture() already
@@ -1186,6 +1192,29 @@ FIST_SHAPED_CLASSES = ("dislike",)
 # mis-tracked fingertip cannot veto the correction — while a real fist,
 # which extends none of them, is nowhere near the line.
 OPEN_HAND_MIN_FINGERS = 3
+
+
+# The suffixes the label assembler appends, longest first so "_right"
+# is tried before any shorter accidental match.
+_HAND_SUFFIXES = ("_right", "_left")
+
+
+def split_hand_suffix(label):
+    """("three_gun_inverse_right") -> ("three_gun_inverse", "right").
+
+    The pose and the hand that made it travel glued together in one string
+    for the caption and the log, because that is what a human wants to
+    read.  The rule engine needs them apart: a rule names a POSE, and its
+    hand requirement is a separate field it matches independently.
+
+    Splitting here rather than never joining keeps the display honest and
+    the matching simple.  A label with no suffix returns ("label", "").
+    """
+    text = str(label or "")
+    for suffix in _HAND_SUFFIXES:
+        if text.endswith(suffix):
+            return text[:-len(suffix)], suffix[1:]
+    return text, ""
 
 
 def extended_finger_count(fingers_ext) -> int:
@@ -1264,6 +1293,155 @@ def is_hand_pointing_down(hand) -> bool:
         except (AttributeError, IndexError, TypeError):
             return False
     return True
+
+
+# ── Landmark plausibility ─────────────────────────────────────────────────
+# MediaPipe occasionally emits a frame whose landmarks are not a hand: a
+# point flung across the image, a palm stretched onto a shirt, a skeleton
+# that teleports.  One such frame is enough to fire the wrong gesture, and
+# a gesture fires an OS action that cannot be taken back.
+#
+# Every bound below is deliberately GENEROUS.  A false reject costs one
+# frame of held cursor — 33 ms, invisible.  A false accept costs a wrong
+# click.  The two are not comparable, so the thresholds sit well outside
+# anything a real hand reaches and only catch gross corruption.
+#
+# Everything is measured in PALM LENGTHS, never pixels or frame fractions,
+# so the same numbers hold whether the hand is near the camera or far.
+# The yardstick is the MEDIAN BONE LENGTH, not the palm.  Two reasons, and
+# both were found by measuring rather than reasoning:
+#
+#   * the palm was the wrong reference.  A wrist dragged onto the shirt —
+#     the exact corruption this exists to catch — lengthens wrist->middle
+#     MCP, inflating the very scale it is measured against, so everything
+#     else then looks proportionally fine.  The bug hid inside its own
+#     yardstick.
+#   * a median is immune to the handful of bones a corrupt frame distorts,
+#     and to perspective.  Measured on a palm rotated nearly edge-on, the
+#     worst bone ratio was 4.29 against a square-on hand's 4.26 — while
+#     corrupted frames scored 7.5 to 14.7.  Nothing else separated real
+#     foreshortening from real corruption that cleanly.
+#
+# Thresholds sit between those two populations with margin on both sides.
+LM_BOUND_SLACK = 0.30      # how far outside the frame a point may sit
+LM_MIN_SCALE = 1e-4        # below this the hand is degenerate, not small
+LM_MAX_BONE_SCALES = 6.0   # real <= 4.3, corrupt >= 7.5
+LM_MAX_SPREAD_SCALES = 9.0  # real <= 7.7, corrupt >= 9.5
+LM_MAX_SCALE_JUMP = 2.2    # hand may not grow/shrink faster than this
+LM_MAX_WRIST_JUMP = 12.0   # nor travel more than this many scales a frame
+LM_MAX_HELD_FRAMES = 6     # after this many rejects, stop holding, let go
+
+_PALM_CHAIN = ((LM_WRIST, LM_INDEX_MCP), (LM_INDEX_MCP, LM_MIDDLE_MCP),
+               (LM_MIDDLE_MCP, LM_PINKY_MCP), (LM_PINKY_MCP, LM_WRIST))
+_FINGER_CHAINS = (
+    (LM_WRIST, 1, 2, 3, LM_THUMB_TIP),
+    (LM_INDEX_MCP, LM_INDEX_PIP, 7, LM_INDEX_TIP),
+    (LM_MIDDLE_MCP, LM_MIDDLE_PIP, 11, LM_MIDDLE_TIP),
+    (13, LM_RING_PIP, 15, LM_RING_TIP),
+    (LM_PINKY_MCP, LM_PINKY_PIP, 19, LM_PINKY_TIP),
+)
+_INFINITE = (float("inf"), float("-inf"))
+
+
+class LandmarkValidator:
+    """Accepts or rejects one frame of landmarks, with a one-frame memory.
+
+    Stateful only for the temporal tests.  The static tests never consult
+    history, which is what stops a run of rejects from locking the tracker
+    out: if the temporal reference goes stale — a genuinely fast movement,
+    or a hand that left and came back — it is dropped after
+    LM_MAX_HELD_FRAMES and the next frame is judged on its own merits.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._scale = None
+        self._wrist = None
+        self.held = 0
+        self.rejected = 0
+
+    @staticmethod
+    def _points(hand):
+        """21 (x, y) pairs, or None if the shape is wrong or non-finite."""
+        try:
+            landmarks = hand.landmark
+        except AttributeError:
+            return None
+        if len(landmarks) != 21:
+            return None
+        points = []
+        for mark in landmarks:
+            x, y = mark.x, mark.y
+            # NaN fails every comparison, including with itself, so a bare
+            # range test would silently pass it; infinities pass a range
+            # test for the opposite reason.  Both are checked explicitly.
+            if x != x or y != y or x in _INFINITE or y in _INFINITE:
+                return None
+            points.append((x, y))
+        return points
+
+    def check(self, hand):
+        """(True, "") to use this frame, or (False, reason) to hold it."""
+        points = self._points(hand)
+        if points is None:
+            return self._reject("non-finite or malformed landmarks")
+
+        limit_lo, limit_hi = -LM_BOUND_SLACK, 1.0 + LM_BOUND_SLACK
+        for x, y in points:
+            if (not (limit_lo <= x <= limit_hi)
+                    or not (limit_lo <= y <= limit_hi)):
+                return self._reject("a landmark is far outside the frame")
+
+        wrist = points[LM_WRIST]
+
+        # Every bone in the hand: the four rigid palm edges and the four
+        # links along each digit.
+        bones = []
+        for a, b in _PALM_CHAIN:
+            bones.append(math.dist(points[a], points[b]))
+        for chain in _FINGER_CHAINS:
+            for a, b in zip(chain, chain[1:]):
+                bones.append(math.dist(points[a], points[b]))
+
+        scale = statistics.median(bones)
+        if scale < LM_MIN_SCALE:
+            return self._reject("degenerate hand")
+
+        if max(bones) > LM_MAX_BONE_SCALES * scale:
+            return self._reject("a bone is impossibly long for this hand")
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        if (max(max(xs) - min(xs), max(ys) - min(ys))
+                > LM_MAX_SPREAD_SCALES * scale):
+            return self._reject("hand is spread wider than a hand can be")
+
+        # ── temporal: continuity with the last ACCEPTED frame ───────────
+        if self._scale is not None:
+            growth = scale / self._scale
+            if (growth > LM_MAX_SCALE_JUMP
+                    or growth < 1.0 / LM_MAX_SCALE_JUMP):
+                return self._reject("hand changed size impossibly fast")
+            if math.dist(wrist, self._wrist) > LM_MAX_WRIST_JUMP * scale:
+                return self._reject("wrist teleported")
+
+        self._scale = scale
+        self._wrist = wrist
+        self.held = 0
+        return True, ""
+
+    def _reject(self, reason: str):
+        self.rejected += 1
+        self.held += 1
+        if self.held >= LM_MAX_HELD_FRAMES:
+            # The reference is stale, not the frame.  Forget it so the
+            # static tests alone judge the next one — holding forever is
+            # worse than trusting a hand that really did move.
+            self._scale = None
+            self._wrist = None
+        return False, reason
 
 
 def pick_primary_hand(hands, previous_anchor=None):
@@ -3325,6 +3503,10 @@ class HandTrackerEngine:
         # the 1€ filters; nothing else may touch them while it is running.
         self._filter_reset = threading.Event()
 
+        # Rejects implausible landmark frames.  Owned by the loop
+        # thread; reset() is called there, never from outside.
+        self._validator = LandmarkValidator()
+
         # Keys already reported by _log_once, so a per-frame failure
         # prints once instead of thousands of times.
         self._reported = set()
@@ -3858,11 +4040,13 @@ class HandTrackerEngine:
         gesture_changes = 0
         stable_gesture = None
         primary_anchor = None
+        detected_hands = ()       # this frame's hands; drives HAND_BOTH
         hand_side = ""            # "left" / "right" / "" when unknown
         hand_facing = None        # True palm, False back, None unknown
         gun_facing = None         # same, read off the barrel (three_gun)
         hand_down = False         # open hand held fingers-down
         last_semantic = ""        # for the change-only label log
+        held_frames = 0           # landmark frames rejected as bad
 
         yolo_action_count = 0
         last_seq = -1
@@ -3974,9 +4158,36 @@ class HandTrackerEngine:
                 results = hands.process(rgb_buf)
                 rgb_buf.flags.writeable = True
 
-                if results.multi_hand_landmarks:
-                    detected_hands = results.multi_hand_landmarks
-                    hand = pick_primary_hand(detected_hands, primary_anchor)
+                # ── Plausibility gate ──────────────────────────────
+                # Three states, not two.  "Seen but implausible" is its
+                # own case and must not fall through to the hand-lost
+                # branch below, because that branch releases the mouse
+                # button — one corrupt frame mid-drag would drop whatever
+                # is being dragged.
+                seen = results.multi_hand_landmarks
+                hand = None
+                if seen:
+                    candidate = pick_primary_hand(seen, primary_anchor)
+                    good, why = self._validator.check(candidate)
+                    if good:
+                        hand = candidate
+                    elif self._validator.held < LM_MAX_HELD_FRAMES:
+                        # HOLD.  Nothing is updated, nothing is drawn, the
+                        # FSM is not fed and the cursor simply stays put
+                        # for one frame — 33 ms, below the threshold of
+                        # noticing.  Every verdict from the last good
+                        # frame survives untouched.
+                        self._log_once("landmark", f"[landmark] rejecting "
+                                                   f"bad frames ({why})")
+                        held_frames += 1
+                    else:
+                        # Too many in a row: the hand really is gone or
+                        # has changed beyond recognition.  Stop holding
+                        # and let the hand-lost path clean up.
+                        seen = None
+
+                if hand is not None:
+                    detected_hands = seen
                     hand_side = handedness_of(results, hand, IS_MIRRORED)
                     hand_facing = palm_is_facing(hand, hand_side,
                                                  IS_MIRRORED)
@@ -4031,7 +4242,9 @@ class HandTrackerEngine:
                     if fsm is not None and gesture not in FSM_IGNORED_STATES:
                         try:
                             stable_gesture, action = fsm.update_pair(
-                                gesture, now_ts)
+                                gesture, now_ts,
+                                hand=hand_side,
+                                hand_count=len(detected_hands or ()))
                             if action is not None:
                                 actions.dispatch(action, now_ts)
                         except Exception as exc:
@@ -4084,8 +4297,11 @@ class HandTrackerEngine:
                                 int(_it.y * screen.cam_h)),
                                5, (200, 200, 200), 1)
 
+                elif seen is not None:
+                    pass        # held: last valid state kept verbatim
                 else:
                     hand_present = False
+                    self._validator.reset()
                     # FAILSAFE, and the order matters: drop the button
                     # BEFORE clearing the FSM.  The hand is gone, so no
                     # further transition is coming to end the drag.
@@ -4096,6 +4312,7 @@ class HandTrackerEngine:
                             _machine.reset()
                     stable_gesture = None
                     primary_anchor = None
+                    detected_hands = ()
                     hand_side = ""
                     hand_facing = None
                     gun_facing = None
@@ -4185,9 +4402,10 @@ class HandTrackerEngine:
                     #
                     # Corrected, not discarded: dropping the label would
                     # lose the pose entirely.  It is cleared here so the
-                    # downward-hand rule below can name it properly, and
-                    # if that rule does not apply the frame simply reports
-                    # nothing rather than the wrong thing.
+                    # downward-hand rule below can name it
+                    # "stop_inverse_down", and if that rule does not apply
+                    # the frame simply reports nothing rather than the
+                    # wrong thing.
                     if contradicts_closed_hand(_yg, fingers_ext):
                         self._log_once(
                             "fist-open",
@@ -4199,7 +4417,21 @@ class HandTrackerEngine:
                         _source = "landmarks"
                     if not _yg or _yg in ("none", "no_gesture"):
                         if hand_down:
-                            _yg = "stop_inverse"
+                            # Its own label, not "stop_inverse".  Two
+                            # distinct poses reach this point by two
+                            # different routes and they are not the same
+                            # hand shape: the network's trained
+                            # "stop_inverted" is a back-facing UPRIGHT
+                            # stop, while this is an open hand pointing
+                            # DOWN, decided here by is_hand_pointing_down()
+                            # when the network declined to name anything.
+                            #
+                            # Sharing one name meant a rule bound to it
+                            # fired for both, and the artwork for one of
+                            # them was unreachable.  Separate names give
+                            # each its own catalogue tile and its own
+                            # binding.
+                            _yg = "stop_inverse_down"
                             _source = "landmarks"
                             # _ys still holds the confidence of whatever
                             # the network JUST REJECTED — _infer returns the
@@ -4295,7 +4527,18 @@ class HandTrackerEngine:
                     # stream actually emits its pose.
                     if semantic_fsm is not None:
                         try:
-                            _sem = semantic_fsm.update(_labelled, now_ts)
+                            # The FSM is given the pose WITHOUT the
+                            # handedness suffix, and the hand alongside it.
+                            # Feeding the glued label instead would mean a
+                            # rule bound to "three_gun_inverse" never fires
+                            # once handedness is known, because rule
+                            # matching is exact string equality.
+                            _sem_pose, _sem_hand = split_hand_suffix(
+                                _labelled)
+                            _sem = semantic_fsm.update(
+                                _sem_pose, now_ts,
+                                hand=_sem_hand or hand_side,
+                                hand_count=len(detected_hands or ()))
                             if _sem is not None:
                                 actions.dispatch(_sem, now_ts)
                         except Exception as exc:
@@ -4353,6 +4596,8 @@ class HandTrackerEngine:
                     "clicks": actions.click_count,
                     "drags": actions.drag_count,
                     "gesture_changes": gesture_changes,
+                    "held_frames": held_frames,
+                    "rejected_landmarks": self._validator.rejected,
                     "frozen": frozen_target is not None
                     and now_ts < freeze_until,
                     "last_action": actions.last_action,

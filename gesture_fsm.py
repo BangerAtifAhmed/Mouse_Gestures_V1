@@ -70,6 +70,9 @@ __all__ = [
     "KEYBOARD_MACRO",
     "ACTIONS", "MOUSE_ACTIONS", "MACRO_ACTIONS", "ACTION_MACROS",
     "NO_GESTURE",
+    # Hand requirement
+    "HAND_ANY", "HAND_RIGHT", "HAND_LEFT", "HAND_BOTH",
+    "HANDS", "normalise_hand",
     # Engine
     "GestureStabilizer", "MajorityStabilizer",
     "TransitionRule", "HoldRule", "ActionEvent",
@@ -145,6 +148,37 @@ ACTIONS = MOUSE_ACTIONS + MACRO_ACTIONS
 # the engine is concerned — losing the hand is exactly the event that has
 # to release a stuck drag — so it is not in the ignored list.
 NO_GESTURE = "none"
+
+# ─── Hand requirement ───────────────────────────────────────────────────────
+# Which hand a rule demands.  Stored on the rule and checked at match time,
+# deliberately NOT folded into the pose name: a pose is a shape, and which
+# hand made it is a separate fact about the same frame.  Encoding it in the
+# label instead ("three_gun_right") doubles the vocabulary and makes a rule
+# that genuinely does not care impossible to express.
+HAND_ANY = "any"
+HAND_RIGHT = "right"
+HAND_LEFT = "left"
+HAND_BOTH = "both"
+
+HANDS = (HAND_ANY, HAND_RIGHT, HAND_LEFT, HAND_BOTH)
+
+
+def normalise_hand(value) -> str:
+    """Any spelling of a hand requirement -> one of HANDS.  Never raises.
+
+    Unrecognised input becomes HAND_ANY rather than an error, because this
+    reads a config file a human may have edited by hand: a typo should cost
+    the constraint, not the whole rule.
+    """
+    text = str(value or "").strip().lower().replace(" ", "_")
+    if text in ("r", "right", "right_hand", "righthand"):
+        return HAND_RIGHT
+    if text in ("l", "left", "left_hand", "lefthand"):
+        return HAND_LEFT
+    if text in ("both", "both_hands", "bothhands", "two", "two_hands", "2"):
+        return HAND_BOTH
+    return HAND_ANY
+
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "gesture_config.json")
@@ -331,7 +365,7 @@ class _Rule:
     """Fields shared by both trigger kinds."""
 
     __slots__ = ("id", "name", "enabled", "action", "keys",
-                 "cooldown_sec", "source")
+                 "cooldown_sec", "source", "hand")
 
     def __init__(self, raw: dict, index: int, settings: dict) -> None:
         self.id = str(raw.get("id") or f"rule-{index}")
@@ -355,6 +389,11 @@ class _Rule:
         # rules and keep the two vocabularies from colliding.
         self.source = str(raw.get("source", "any")).strip().lower() or "any"
 
+        # Which hand must perform this gesture.  HAND_ANY is the default and
+        # the meaning of an absent key, so every rule written before this
+        # field existed keeps working untouched.
+        self.hand = normalise_hand(raw.get("hand"))
+
         # Filled in by _finalise(), which subclasses call once their own
         # fields exist — _describe() reads them.
         self.name = str(raw.get("name") or "")
@@ -369,6 +408,35 @@ class _Rule:
     def accepts_source(self, source) -> bool:
         return self.source == "any" or source is None or source == self.source
 
+    def accepts_hand(self, hand, hand_count=0) -> bool:
+        """True when the hand on screen satisfies this rule's requirement.
+
+        `hand` is the side of the hand that produced the pose ("left" /
+        "right" / "" when unknown); `hand_count` is how many hands the
+        tracker can currently see.
+
+        Two deliberate choices about missing information:
+
+          * An UNKNOWN side satisfies a left/right rule.  Handedness comes
+            from MediaPipe and is occasionally blank — refusing the rule
+            then would make a bound gesture fail silently and look broken,
+            which is worse than firing on the wrong hand once.
+
+          * HAND_BOTH is a count test, not a side test.  It asks for two
+            hands in frame, which is the only part of "both hands" the
+            tracker can actually verify; the pose itself is still read from
+            the primary hand.
+        """
+        requirement = self.hand
+        if requirement == HAND_ANY:
+            return True
+        if requirement == HAND_BOTH:
+            return int(hand_count or 0) >= 2
+        side = str(hand or "").strip().lower()
+        if not side:
+            return True
+        return side == requirement
+
     def to_dict(self) -> dict:
         out = {
             "id": self.id,
@@ -377,6 +445,10 @@ class _Rule:
             "action": self.action,
             "cooldown_sec": round(self.cooldown_sec, 3),
         }
+        # Written only when it constrains something, so a rule that does not
+        # care about the hand stays as short in the file as it always was.
+        if self.hand != HAND_ANY:
+            out["hand"] = self.hand
         if self.action == KEYBOARD_MACRO:
             out["keys"] = self.keys
         if self.source != "any":
@@ -643,6 +715,12 @@ class GestureFSM:
         self._stabilizer = stabilizer or MajorityStabilizer(
             window, min(threshold, window))
 
+        # The frame context the rules are matched against.  Initialised
+        # here so any entry point into _tick() finds them defined, even one
+        # that never calls update().
+        self._hand = None
+        self._hand_count = 0
+
         # Never raises: a fault here would leave the engine half-built.
         self._fault_reported = False
 
@@ -812,12 +890,19 @@ class GestureFSM:
 
     # ── the loop entry point ────────────────────────────────────────────
 
-    def update(self, gesture, timestamp: float, source=None):
+    def update(self, gesture, timestamp: float, source=None,
+               hand=None, hand_count=0):
         """One frame.  Returns an action string, or None.
 
         The return is an ActionEvent, which *is* a str — compare it to the
         action constants directly.  `.keys` carries the chord for macros.
+
+        `hand` and `hand_count` describe the frame, not the pose: which side
+        produced it and how many hands are visible.  Both are optional, so
+        a caller that does not track handedness behaves exactly as before.
         """
+        self._hand = hand
+        self._hand_count = hand_count
         try:
             events = self._advance(gesture, _as_float(timestamp, 0.0), source)
         except Exception as exc:                      # pragma: no cover
@@ -826,13 +911,17 @@ class GestureFSM:
             self._queue.extend(events)
         return self._queue.popleft() if self._queue else None
 
-    def update_pair(self, gesture, timestamp: float, source=None):
+    def update_pair(self, gesture, timestamp: float, source=None,
+                    hand=None, hand_count=0):
         """`(stable_gesture, action)` for callers that display both."""
-        action = self.update(gesture, timestamp, source)
+        action = self.update(gesture, timestamp, source, hand, hand_count)
         return self._current, action
 
-    def poll(self, gesture, timestamp: float, source=None) -> list:
+    def poll(self, gesture, timestamp: float, source=None,
+             hand=None, hand_count=0) -> list:
         """Every action this frame produced, in order.  Drains the queue."""
+        self._hand = hand
+        self._hand_count = hand_count
         try:
             events = self._advance(gesture, _as_float(timestamp, 0.0), source)
         except Exception as exc:                      # pragma: no cover
@@ -957,7 +1046,8 @@ class GestureFSM:
 
         candidates = [rule for rule in self._transitions
                       if rule.to_state == self._current
-                      and rule.accepts_source(source)]
+                      and rule.accepts_source(source)
+                      and rule.accepts_hand(self._hand, self._hand_count)]
         matched = self._match_origin(candidates, now)
 
         if matched:
@@ -1010,6 +1100,15 @@ class GestureFSM:
 
         for rule in self._holds:
             if not rule.accepts_source(source):
+                continue
+
+            # Checked before the pose test so a hold whose hand requirement
+            # has stopped being satisfied is DISARMED rather than frozen
+            # armed — otherwise dropping the second hand mid-hold would
+            # leave the rule primed to fire the instant it came back.
+            if not rule.accepts_hand(self._hand, self._hand_count):
+                self._hold_armed.pop(rule.id, None)
+                self._hold_next.pop(rule.id, None)
                 continue
 
             if self._current != rule.pose:

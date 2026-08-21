@@ -48,6 +48,8 @@ except Exception:                                         # pragma: no cover
 import gesture_fsm
 from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
                       monitor_union, resolve_monitor_target)
+from gesture_fsm import (HAND_ANY, HAND_BOTH, HAND_LEFT, HAND_RIGHT,
+                         normalise_hand)
 from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
                          MIDDLE_CLICK, MOUSE_ACTIONS, RIGHT_CLICK,
@@ -115,6 +117,27 @@ GESTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # the dual-stream split in gesture_config.json working.
 DEFAULT_SOURCE = "any"
 
+# Hand requirement, as the builder offers it.  ANY leads and is the default
+# because it is what every rule written before this feature meant, so
+# opening an old config does not silently constrain it.
+HAND_CHOICES = (
+    (HAND_ANY, "Any"),
+    (HAND_RIGHT, "Right"),
+    (HAND_LEFT, "Left"),
+    (HAND_BOTH, "Both"),
+)
+
+HAND_WORDS = {
+    HAND_ANY: "either hand",
+    HAND_RIGHT: "right hand",
+    HAND_LEFT: "left hand",
+    HAND_BOTH: "both hands",
+}
+
+# The reference image in the builder.  Larger than a socket thumbnail (SLOT)
+# because its whole job is to be looked at while you copy the pose.
+REFERENCE = 148
+
 TRANSITION = "transition"
 HOLD = "hold"
 
@@ -153,6 +176,15 @@ class GestureLibrary:
         "xsign", "x_sign",
         "heart", "hand_heart",
         "heart2", "hand_heart2",
+        # "open" is the geometry classifier's flat-palm state and "palm" is
+        # the network's class for the same shape, and open.png is a byte
+        # copy of palm.png — so the catalog showed the same drawing twice
+        # with two names and nothing to tell them apart.  "palm" is kept
+        # because it is the one the trained model reports.
+        #
+        # The engine still classifies "open" every frame and any rule
+        # already bound to it still fires; it simply cannot be picked here.
+        "open",
     }
 
     def __init__(self, directory: str = GESTURE_DIR) -> None:
@@ -205,6 +237,10 @@ class GestureLibrary:
 
         self._path_for = found
         self.labels = sorted(found)
+
+    def path_for(self, label):
+        """Full path to a pose's artwork, or None when it has none."""
+        return self._path_for.get(str(label or "").strip().lower())
 
     def start_loading(self, size: int = THUMB) -> None:
         worker = threading.Thread(target=self._load_all, args=(size,),
@@ -340,7 +376,10 @@ class FlatButton(tk.Label):
 
 
 class Segmented(tk.Frame):
-    """Two-option segmented control — the trigger-type switch."""
+    """Segmented control for any number of mutually exclusive options.
+
+    Used for the trigger-type switch (2) and the hand requirement (4).
+    """
 
     def __init__(self, master, options, command):
         super().__init__(master, bg=FIELD, highlightbackground=BORDER,
@@ -481,6 +520,11 @@ class GestureStudio(tk.Tk):
 
         self.library = GestureLibrary()
         self.thumbs = {}              # label -> PhotoImage (kept alive here)
+        # Reference renders are built on demand rather than in the
+        # background pass: only one is on screen at a time, and
+        # decoding 29 PNGs at a second size to show one of them would
+        # cost startup time for nothing.
+        self.reference_large = {}
         self.rules = []               # rule dicts; the source of truth
         self.settings = dict(gesture_fsm.DEFAULT_SETTINGS)
         self.editing_id = None
@@ -1092,6 +1136,7 @@ class GestureStudio(tk.Tk):
         visible = self._visible_slots()
         slot = self.armed_slot if self.armed_slot in visible else visible[0]
         slot.set_pose(label, self.thumbs.get(label))
+        self._show_reference(label)
         self._arm(visible[(visible.index(slot) + 1) % len(visible)])
         self._refresh_preview()
 
@@ -1128,6 +1173,35 @@ class GestureStudio(tk.Tk):
         self.slot_arrow.pack(side="left", padx=10, pady=(18, 0))
         self.slot_to.pack(side="left")
         self.slot_pose.pack(side="left")
+
+        # Reference image ----------------------------------------------
+        # The sockets show the pose at thumbnail size, which is enough to
+        # confirm a pick but not to copy a hand shape from.  This shows the
+        # pose you most recently placed, large enough to actually read.
+        # It is DISPLAY ONLY — nothing downstream reads this widget, and
+        # recognition never consults the artwork.
+        reference = tk.Frame(body, bg=CARD)
+        reference.pack(side="left", padx=(0, PAD))
+
+        tk.Label(reference, text="REFERENCE", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w")
+
+        self._ref_box = tk.Frame(reference, bg=FIELD,
+                                 width=REFERENCE, height=REFERENCE,
+                                 highlightbackground=BORDER,
+                                 highlightthickness=1)
+        self._ref_box.pack_propagate(False)
+        self._ref_box.pack(pady=(4, 0))
+
+        self.reference_image = tk.Label(
+            self._ref_box, bg=FIELD, fg=FAINT,
+            text="pick a pose", font=("Segoe UI", 9), wraplength=REFERENCE - 16)
+        self.reference_image.pack(expand=True)
+
+        self.reference_caption = tk.Label(
+            reference, text="", bg=CARD, fg=FAINT, font=("Segoe UI", 8),
+            wraplength=REFERENCE + 12, justify="left")
+        self.reference_caption.pack(anchor="w", pady=(4, 0))
 
         # Fields -------------------------------------------------------
         fields = tk.Frame(body, bg=CARD)
@@ -1190,8 +1264,26 @@ class GestureStudio(tk.Tk):
         # when it is opened in the editor and saved again.
         self.keys_var = tk.StringVar(value="")
 
+        # Hand requirement ---------------------------------------------
+        # A separate field rather than four more poses in the catalog: the
+        # shape and the hand that makes it are independent, and folding one
+        # into the other would double the pose list.
+        hand_row = tk.Frame(fields, bg=CARD)
+        hand_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+
+        tk.Label(hand_row, text="HAND", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(side="left",
+                                                    padx=(0, 10))
+        self.hand = Segmented(hand_row, list(HAND_CHOICES),
+                              lambda _v: self._on_hand_change())
+        self.hand.pack(side="left")
+
+        self.hand_note = tk.Label(hand_row, text="", bg=CARD, fg=FAINT,
+                                  font=("Segoe UI", 8))
+        self.hand_note.pack(side="left", padx=(12, 0))
+
         toggles = tk.Frame(fields, bg=CARD)
-        toggles.grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        toggles.grid(row=5, column=0, columnspan=4, sticky="w", pady=(12, 0))
         self.promote_toggle = Toggle(
             toggles,
             "Repeat inside the double-click window fires DOUBLE_CLICK",
@@ -1218,6 +1310,55 @@ class GestureStudio(tk.Tk):
 
         self._arm(self.slot_from)
         self._on_trigger_change(TRANSITION)
+
+    def _on_hand_change(self) -> None:
+        """Explain what the choice will require, then re-render the preview."""
+        if not hasattr(self, "hand_note"):
+            return
+        value = self.hand.value
+        if value == HAND_BOTH:
+            note = "requires two hands in frame"
+        elif value == HAND_ANY:
+            note = "fires on whichever hand performs it"
+        else:
+            note = f"only the {value} hand"
+        self.hand_note.configure(text=note)
+        self._refresh_preview()
+
+    def _show_reference(self, label) -> None:
+        """Put a pose in the reference panel.  Display only.
+
+        Falls back to the pose name when the catalog has no artwork for it,
+        so a geometric pose — which has no PNG — still reads as picked
+        rather than looking like a failure.
+        """
+        if not hasattr(self, "reference_image"):
+            return
+        if not label:
+            self.reference_image.configure(image="", text="pick a pose",
+                                           fg=FAINT)
+            self.reference_image.image = None
+            self.reference_caption.configure(text="")
+            return
+
+        photo = self.reference_large.get(label)
+        if photo is None:
+            path = self.library.path_for(label)
+            if path:
+                try:
+                    image = GestureLibrary._decode(path, REFERENCE)
+                    photo = ImageTk.PhotoImage(image)
+                    self.reference_large[label] = photo
+                except Exception:
+                    photo = None
+        if photo is not None:
+            self.reference_image.configure(image=photo, text="")
+            self.reference_image.image = photo
+        else:
+            self.reference_image.configure(image="", text=pretty(label),
+                                           fg=TEXT)
+            self.reference_image.image = None
+        self.reference_caption.configure(text=pretty(label), fg=ACCENT)
 
     def _visible_slots(self):
         if self.trigger.value == TRANSITION:
@@ -1321,6 +1462,10 @@ class GestureStudio(tk.Tk):
         note = ("   • YOLO path (~4.7 Hz)"
                 if rule.get("source") == "semantic" else "")
 
+        requirement = normalise_hand(rule.get("hand"))
+        if requirement != HAND_ANY:
+            note = f"   • {HAND_WORDS[requirement]}" + note
+
         self.preview.configure(
             text=f"{body}  ⇒  {action}{suffix}"
                  f"   • cooldown {rule['cooldown_sec']:.2f}s{note}",
@@ -1395,6 +1540,7 @@ class GestureStudio(tk.Tk):
             rule["name"] = name
 
         rule["source"] = DEFAULT_SOURCE
+        rule["hand"] = self.hand.value
         return rule
 
     def _commit(self) -> None:
@@ -1451,6 +1597,9 @@ class GestureStudio(tk.Tk):
         self.keys_var.set("")
         self.promote_toggle.set(False)
         self.repeat_toggle.set(False)
+        self.hand.select(HAND_ANY, notify=False)
+        self._on_hand_change()
+        self._show_reference(None)
         self.builder_title.configure(text="CREATE MAPPING")
         self.commit_button.configure(text="Add Mapping")
         self._arm(self._visible_slots()[0])
@@ -1558,6 +1707,13 @@ class GestureStudio(tk.Tk):
                 if rule.get("repeat"):
                     timing += " ↻"
 
+            # Shown on the gesture, not in a column of its own: it is a
+            # qualifier on the pose, and an extra column would be blank on
+            # most rows.
+            requirement = normalise_hand(rule.get("hand"))
+            if requirement != HAND_ANY:
+                gestures = f"{gestures}   [{requirement}]"
+
             action = rule["action"]
             if action == KEYBOARD_MACRO:
                 action = f"{action}  {rule.get('keys', '')}"
@@ -1605,16 +1761,23 @@ class GestureStudio(tk.Tk):
                                   self.thumbs.get(rule["to_state"]))
             self.timing_var.set(f"{rule.get('max_time_sec', 0.8):.2f}")
             self.promote_toggle.set(bool(rule.get("promote_double")))
+            self._show_reference(rule["to_state"])
         else:
             self.slot_pose.set_pose(rule["pose"],
                                     self.thumbs.get(rule["pose"]))
             self.timing_var.set(f"{rule.get('hold_sec', 0.4):.2f}")
             self.repeat_toggle.set(bool(rule.get("repeat")))
+            self._show_reference(rule["pose"])
 
         self.action_var.set(rule["action"])
         self.cooldown_var.set(f"{rule.get('cooldown_sec', 0.35):.2f}")
         self.keys_var.set(rule.get("keys", ""))
         self.name_var.set(rule.get("name", ""))
+        # An absent key means HAND_ANY, so a rule written before this
+        # field existed opens unconstrained rather than defaulting to a
+        # hand its author never chose.
+        self.hand.select(normalise_hand(rule.get("hand")), notify=False)
+        self._on_hand_change()
 
         self.builder_title.configure(text="EDIT MAPPING")
         self.commit_button.configure(text="Save Changes")
@@ -1969,6 +2132,10 @@ class GestureStudio(tk.Tk):
         poses = ([rule.get("from_state"), rule.get("to_state")]
                  if kind == TRANSITION else [rule.get("pose")])
         rule.setdefault("source", DEFAULT_SOURCE)
+        # Normalised rather than defaulted: "Right", "right_hand" and a
+        # typo all resolve here, so the table and the engine agree on one
+        # spelling whatever the file said.
+        rule["hand"] = normalise_hand(rule.get("hand"))
         return rule
 
     def _config_to_rules(self, config: dict) -> None:
