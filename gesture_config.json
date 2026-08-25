@@ -6,7 +6,32 @@
     "ai_confidence": 0.6,
     "target_screen": "Screen 1"
   },
-  "geometry_bindings": [],
+  "geometry_bindings": [
+    {
+      "id": "r677645cd",
+      "trigger": "transition",
+      "action": "LEFT_CLICK",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "one",
+      "to_state": "fist",
+      "max_time_sec": 2.0,
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r675aa362",
+      "trigger": "transition",
+      "action": "LEFT_CLICK",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "two_up",
+      "to_state": "fist",
+      "adaptive_timing": true,
+      "source": "any",
+      "hand": "any"
+    }
+  ],
   "yolo_bindings": [],
   "deleted_bindings": []
 }

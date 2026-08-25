@@ -49,7 +49,7 @@ import gesture_fsm
 from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
                       monitor_union, resolve_monitor_target)
 from gesture_fsm import (HAND_ANY, HAND_BOTH, HAND_LEFT, HAND_RIGHT,
-                         normalise_hand)
+                         hands_can_coincide, normalise_hand)
 from gesture_fsm import (ACTION_MACROS, ACTIONS, CONFIG_PATH, DOUBLE_CLICK,
                          DRAG_START, DRAG_STOP, KEYBOARD_MACRO, LEFT_CLICK,
                          MIDDLE_CLICK, MOUSE_ACTIONS, RIGHT_CLICK,
@@ -148,6 +148,48 @@ def pretty(label: str) -> str:
 
 
 # ─── Gesture catalog ────────────────────────────────────────────────────────
+
+
+# Temporary: set MOUSEGESTURE_DEBUG_ADAPTIVE=1 to trace the calibration
+# hand-off.  Silent otherwise, so a normal run prints nothing.
+_DEBUG_ADAPTIVE = bool(os.environ.get("MOUSEGESTURE_DEBUG_ADAPTIVE"))
+
+
+def _dbg(message: str) -> None:
+    if _DEBUG_ADAPTIVE:
+        print(f"[adaptive] {message}")
+
+
+# ── Camera state ───────────────────────────────────────────────────────
+# One vocabulary, shared by the button, the calibration dialog and
+# anything else that needs to know.  The point of naming these is that
+# CONNECTED is DERIVED from the engine on every read rather than latched
+# when a button was pressed -- a label reading "Disconnect" while the
+# camera has actually stopped is the failure this exists to prevent.
+CAM_DISCONNECTED = "DISCONNECTED"
+CAM_CONNECTING = "CONNECTING"
+CAM_CONNECTED = "CONNECTED"
+CAM_DISCONNECTING = "DISCONNECTING"
+CAM_ERROR = "ERROR"
+
+# How often the button re-reads the engine.  Two attribute lookups, so
+# it costs nothing, and it means an engine that stops on its own is
+# reflected in the UI without anything having to notice and report it.
+CAMERA_SYNC_MS = 300
+
+
+def timing_label(rule) -> str:
+    """How a transition's timing reads in the UI.
+
+    Three distinct states, and they must not be conflated: the engine
+    owns it, the user pinned a number, or the user asked for no limit at
+    all (which max_time_sec spells as 0).
+    """
+    if rule.get("adaptive_timing"):
+        return "timing: automatic"
+    window = rule.get("max_time_sec", 0.0) or 0.0
+    return f"within {window:.2f}s" if window > 0 else "no time limit"
+
 
 class GestureLibrary:
     """Scans gestures/ and decodes thumbnails off the main thread.
@@ -544,6 +586,18 @@ class GestureStudio(tk.Tk):
 
         self.engine = None
         self._engine_busy = False
+        self._cam_disconnecting = False
+        self._cam_error = ""
+        self._camera_watchers = []   # notified on any change
+        self._camera_last_state = None
+
+        # The authoritative selection.  Every other place that needs to
+        # know which camera is chosen -- the calibration popup included
+        # -- asks selected_camera() rather than reading a widget.
+        self.cameras = []
+        self.camera_index = None
+        self._camera_scan = queue.Queue()
+        self._camera_scan_busy = False
         self._engine_result = queue.Queue()
         self._video_job = None
         self._monitor_job = None
@@ -560,6 +614,12 @@ class GestureStudio(tk.Tk):
         self._load_from_disk()
         self._booting = False
         self._refresh_metrics()       # self-rescheduling, every 1000 ms
+        # Re-reads the engine on a timer, so the button follows the
+        # camera even when nothing pressed it.
+        self._sync_camera_ui()
+        # First scan runs off-thread, so the window opens at once
+        # and the dropdown fills in a moment later.
+        self.after(200, self.refresh_cameras)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── chrome ──────────────────────────────────────────────────────────
@@ -1246,16 +1306,18 @@ class GestureStudio(tk.Tk):
                                       style="Dark.TSpinbox", font=self.f_body)
         self.timing_box.grid(row=3, column=0, sticky="w")
 
-        tk.Label(fields, text="COOLDOWN (SEC)", bg=CARD, fg=FAINT,
-                 font=("Segoe UI", 8, "bold")).grid(row=2, column=1,
-                                                    sticky="w", pady=(0, 2))
         self.cooldown_var = tk.StringVar(value="0.35")
         self.cooldown_var.trace_add("write",
                                     lambda *_: self._refresh_preview())
-        ttk.Spinbox(fields, from_=0.0, to=30.0, increment=0.05,
-                    textvariable=self.cooldown_var, width=8,
-                    style="Dark.TSpinbox", font=self.f_body).grid(
-            row=3, column=1, sticky="w")
+        self.cooldown_caption = tk.Label(
+            fields, text="COOLDOWN (SEC)", bg=CARD, fg=FAINT,
+            font=("Segoe UI", 8, "bold"))
+        self.cooldown_box = ttk.Spinbox(
+            fields, from_=0.0, to=30.0, increment=0.05,
+            textvariable=self.cooldown_var, width=8,
+            style="Dark.TSpinbox", font=self.f_body)
+        self.cooldown_caption.grid(row=2, column=1, sticky="w", pady=(0, 2))
+        self.cooldown_box.grid(row=3, column=1, sticky="w")
 
         # No key-combination field.  Every action offered in the dropdown
         # carries its own chord (ACTION_MACROS), so the box sat reading
@@ -1376,13 +1438,27 @@ class GestureStudio(tk.Tk):
             self.slot_from.pack(side="left")
             self.slot_arrow.pack(side="left", padx=10, pady=(18, 0))
             self.slot_to.pack(side="left")
-            self.timing_caption.configure(text="WITHIN (SEC)")
+            # A transition has no timing field any more: the engine keeps
+            # its own per-pose-pair estimate (adaptive_timing.py), so the
+            # user configures FROM, TO, ACTION and HAND and nothing else.
+            # Cooldown goes with it -- it keeps its default and stays out
+            # of the way rather than becoming another number to manage.
+            self.timing_caption.grid_remove()
+            self.timing_box.grid_remove()
+            self.cooldown_caption.grid_remove()
+            self.cooldown_box.grid_remove()
         else:
             self.slot_from.pack_forget()
             self.slot_arrow.pack_forget()
             self.slot_to.pack_forget()
             self.slot_pose.pack(side="left")
+            # A hold is different: how long to hold IS the gesture, not an
+            # engine detail, so that field stays.
             self.timing_caption.configure(text="HOLD FOR (SEC)")
+            self.timing_caption.grid()
+            self.timing_box.grid()
+            self.cooldown_caption.grid()
+            self.cooldown_box.grid()
 
         # The box means two different things in the two modes, so carrying
         # a value across the switch would silently reinterpret it.  Skipped
@@ -1450,10 +1526,8 @@ class GestureStudio(tk.Tk):
         suffix = f"  [{chord}]" if chord else ""
 
         if rule["trigger"] == TRANSITION:
-            window = rule["max_time_sec"]
             body = (f"{rule['from_state']} → {rule['to_state']} "
-                    + (f"within {window:.2f}s" if window > 0
-                       else "with no time limit"))
+                    + timing_label(rule))
         else:
             delay = rule["hold_sec"]
             body = (f"hold {rule['pose']} for {delay:.2f}s" if delay > 0
@@ -1501,8 +1575,21 @@ class GestureStudio(tk.Tk):
                     self._toast("A transition needs two different poses.",
                                 DANGER)
                 return None
-            rule.update({"from_state": src, "to_state": dst,
-                         "max_time_sec": number(self.timing_var, 0.8)})
+            rule.update({"from_state": src, "to_state": dst})
+
+            # MIGRATION.  A rule that already carries an explicit
+            # max_time_sec keeps it, untouched, even when it is edited
+            # here -- converting it silently would change behaviour the
+            # user never asked to change, and there is no longer a field
+            # in which to see or undo that.  Only rules created from now
+            # on hand their timing to the engine.
+            prior = self._rule_by_id(self.editing_id)
+            if prior is not None and not prior.get("adaptive_timing") \
+                    and prior.get("max_time_sec") is not None:
+                rule["max_time_sec"] = prior["max_time_sec"]
+            else:
+                rule["adaptive_timing"] = True
+                rule.pop("max_time_sec", None)
             if action in (LEFT_CLICK, RIGHT_CLICK, MIDDLE_CLICK) \
                     and self.promote_toggle.get():
                 rule["promote_double"] = True
@@ -1550,8 +1637,14 @@ class GestureStudio(tk.Tk):
 
         clash = self._conflict(rule)
         if clash is not None:
+            # Naming the clashing rule's hand matters now that per-hand
+            # variants are legal: "already bound" alone would look wrong
+            # to someone who just set Left and can see a Right mapping
+            # sitting in the table.
+            whose = HAND_WORDS.get(normalise_hand(clash.get("hand")),
+                                   "either hand")
             self._toast(f"That trigger is already bound to "
-                        f"{clash['action']}.", DANGER)
+                        f"{clash['action']} for {whose}.", DANGER)
             return
 
         if self.editing_id:
@@ -1562,25 +1655,126 @@ class GestureStudio(tk.Tk):
                     break
             self._toast("Mapping updated.", ACCENT)
         else:
+            # A NEW adaptive mapping is not added here.  It asks for its
+            # twenty examples first, and only exists if they arrive --
+            # so cancelling, closing the window or losing the camera
+            # leaves nothing half-created behind.  Editing an existing
+            # rule never calibrates: it already has its timing.
+            _dbg(f"create requested: {rule.get('from_state')} -> "
+                 f"{rule.get('to_state')} adaptive="
+                 f"{rule.get('adaptive_timing')!r} "
+                 f"max_time_sec={rule.get('max_time_sec')!r} "
+                 f"editing_id={self.editing_id!r}")
+            if rule.get("adaptive_timing"):
+                _dbg("rule detected as adaptive")
+                if self._begin_calibration(rule):
+                    _dbg("calibration took over; mapping NOT added yet")
+                    return
+                _dbg("calibration declined; falling through to direct add")
+            else:
+                _dbg("rule is NOT adaptive; no calibration")
             self.rules.append(rule)
+            _dbg("mapping added directly")
             self._toast("Mapping added.", ACCENT)
 
         self._mark_dirty()
         self._clear_builder()
         self._render_table()
 
+    def _begin_calibration(self, rule) -> bool:
+        """Ask for the initial examples.  True if the dialog took over.
+
+        The dialog opens whether or not a camera is running.  With one,
+        it starts counting immediately.  Without, it says so and offers
+        to start one -- and because it follows the camera state rather
+        than sampling it once, connecting from inside the dialog carries
+        straight on into collection instead of making the user close it
+        and rebuild the mapping.
+
+        Nothing is created either way until twenty valid samples land.
+
+        Returning True means "do not add this mapping here", which is as
+        true of a session waiting for a camera as of one collecting.
+        """
+        engine = getattr(self, "engine", None)
+        _dbg(f"starting calibration (camera={self.camera_state()})")
+        try:
+            import calibration_ui
+        except Exception as exc:
+            self._toast(f"Calibration unavailable "
+                        f"({exc.__class__.__name__}), using defaults.",
+                        FAINT)
+            return False
+
+        def finish(durations):
+            for name in ("semantic_learner", "geometry_learner"):
+                learner = getattr(engine, name, None)
+                if learner is not None:
+                    learner.seed(rule["from_state"], rule["to_state"],
+                                 durations)
+            _dbg(f"calibration complete: {len(durations)} samples")
+            self.rules.append(rule)
+            self._mark_dirty()
+            self._clear_builder()
+            self._render_table()
+            _dbg("mapping added")
+            self._toast("Mapping added and timing initialised.", ACCENT)
+
+        try:
+            panel = calibration_ui.CalibrationDialog(self, rule, finish)
+
+            # Drop the handle when the window goes, so a cancelled
+            # session does not leave a destroyed widget behind for
+            # _forget_learning to trip over.  Filtered to the dialog
+            # itself: <Destroy> fires for every child on the way down.
+            def _forget_panel(event, _p=panel):
+                if event.widget is _p and self._calibration is _p:
+                    self._calibration = None
+
+            panel.bind("<Destroy>", _forget_panel, "+")
+            self._calibration = panel
+            _dbg("dialog opened")
+        except Exception as exc:
+            _dbg(f"dialog FAILED to open: {exc.__class__.__name__}: {exc}")
+            self._toast(f"Calibration unavailable "
+                        f"({exc.__class__.__name__}), using defaults.",
+                        FAINT)
+            return False
+        return True
+
     def _conflict(self, rule):
-        """Two rules on one trigger both fire.  Refuse the second."""
+        """Two rules that could both fire on one frame.  Refuse the second.
+
+        Sharing a trigger is not enough to be a duplicate.  Two mappings on
+        the same gesture are a genuine conflict only if some frame satisfies
+        BOTH hand requirements — otherwise they are alternatives, which is
+        the entire point of per-hand mappings:
+
+            point → grip [right] = LEFT_CLICK
+            point → grip [left]  = RIGHT_CLICK
+
+        A hand is left or right, never both, so those two can never fire
+        together and are allowed to coexist.  Pairing either of them with
+        an "Any" mapping on the same gesture still IS a conflict, because
+        Any matches the very frames the specific one does.
+
+        hands_can_coincide() lives in gesture_fsm so this check and the
+        engine's own guard cannot drift apart.
+        """
         for existing in self.rules:
             if existing["id"] == rule["id"]:
                 continue
             if existing["trigger"] != rule["trigger"]:
                 continue
             if rule["trigger"] == TRANSITION:
-                if (existing.get("from_state") == rule.get("from_state")
-                        and existing.get("to_state") == rule.get("to_state")):
-                    return existing
-            elif existing.get("pose") == rule.get("pose"):
+                same_trigger = (
+                    existing.get("from_state") == rule.get("from_state")
+                    and existing.get("to_state") == rule.get("to_state"))
+            else:
+                same_trigger = existing.get("pose") == rule.get("pose")
+            if not same_trigger:
+                continue
+            if hands_can_coincide(existing.get("hand"), rule.get("hand")):
                 return existing
         return None
 
@@ -1696,10 +1890,7 @@ class GestureStudio(tk.Tk):
             if rule["trigger"] == TRANSITION:
                 gestures = (f"{pretty(rule['from_state'])}  →  "
                             f"{pretty(rule['to_state'])}")
-                window = rule.get("max_time_sec", 0.0)
-                # Zero is the engine's "no limit", which reads as an
-                # impossible 0.00 s deadline if printed as a number.
-                timing = f"within {window:.2f}s" if window > 0 else "no limit"
+                timing = timing_label(rule)
             else:
                 gestures = f"hold {pretty(rule['pose'])}"
                 delay = rule.get("hold_sec", 0.0)
@@ -1741,6 +1932,15 @@ class GestureStudio(tk.Tk):
             return None
         for rule in self.rules:
             if rule["id"] == selection[0]:
+                return rule
+        return None
+
+    def _rule_by_id(self, rule_id):
+        """The saved rule behind an id, or None for a brand new one."""
+        if not rule_id:
+            return None
+        for rule in self.rules:
+            if rule.get("id") == rule_id:
                 return rule
         return None
 
@@ -1820,6 +2020,53 @@ class GestureStudio(tk.Tk):
         self.undo_delete()
         return "break"
 
+    def _forget_learning(self, rules) -> int:
+        """Retire the adaptive state behind deleted mappings.
+
+        A deleted mapping must leave nothing behind: no history, no
+        learned tolerance, and nothing still queued for the learner.
+        Both streams are asked, because a pose pair is fed by whichever
+        classifier reports it and the GUI does not track which.
+
+        Only ever called with pose pairs that are genuinely going away,
+        and it removes exactly those keys -- another mapping on a
+        different pair is untouched by construction.
+
+        Any calibration still running for one of these pairs is
+        cancelled too: it would otherwise finish and recreate the
+        mapping the user just deleted.
+        """
+        engine = getattr(self, "engine", None)
+        pairs = {(r.get("from_state"), r.get("to_state"))
+                 for r in rules
+                 if r.get("trigger") == TRANSITION
+                 and r.get("from_state") and r.get("to_state")}
+        if not pairs:
+            return 0
+
+        panel = getattr(self, "_calibration", None)
+        if panel is not None:
+            try:
+                if panel.winfo_exists() and (
+                        panel.session.from_state,
+                        panel.session.to_state) in pairs:
+                    panel._cancel()
+                    self._calibration = None
+            except Exception:
+                self._calibration = None
+
+        if engine is None:
+            return 0
+        forgotten = 0
+        for name in ("semantic_learner", "geometry_learner"):
+            learner = getattr(engine, name, None)
+            if learner is None:
+                continue
+            for src, dst in pairs:
+                if learner.forget(src, dst):
+                    forgotten += 1
+        return forgotten
+
     def delete_selected_mapping(self) -> None:
         """Remove every selected mapping from the table and from self.rules.
 
@@ -1873,6 +2120,11 @@ class GestureStudio(tk.Tk):
         if not moved:
             self._toast("Nothing was deleted.", AMBER)
             return
+
+        # The mapping is inactive from here, so its learning must be
+        # too -- an estimator that kept accumulating for a binned rule
+        # would still be shaping timing nobody can see.
+        self._forget_learning(moved)
 
         self.deleted.extend(moved)
         self._undo_stack.append([entry["id"] for entry in moved])
@@ -2316,25 +2568,51 @@ class GestureStudio(tk.Tk):
                  bg=CARD, fg=FAINT, font=("Segoe UI", 8)).pack(
             anchor="w", padx=PAD)
 
-        row = tk.Frame(card, bg=CARD)
-        row.pack(fill="x", padx=PAD, pady=(10, 0))
-        tk.Label(row, text="INDEX", bg=CARD, fg=FAINT,
-                 font=("Segoe UI", 8, "bold")).pack(side="left")
-        self.camera_var = tk.StringVar(value="0")
-        ttk.Combobox(row, textvariable=self.camera_var,
-                     values=[str(i) for i in range(6)], width=5,
-                     style="Dark.TCombobox", font=self.f_body).pack(
-            side="right")
+        tk.Label(card, text="CAMERA", bg=CARD, fg=FAINT,
+                 font=("Segoe UI", 8, "bold")).pack(
+            anchor="w", padx=PAD, pady=(10, 2))
+
+        # A dropdown of what is actually attached, not a spinner over
+        # indices that may not exist.  Index 0 is not reliably the
+        # camera anyone wants.
+        self.camera_var = tk.StringVar(value="")
+        self.camera_box = ttk.Combobox(
+            card, textvariable=self.camera_var, state="readonly",
+            values=[], style="Dark.TCombobox", font=self.f_body)
+        self.camera_box.pack(fill="x", padx=PAD)
+        self.camera_box.bind("<<ComboboxSelected>>",
+                             lambda _e: self._on_camera_pick())
+
+        pick_row = tk.Frame(card, bg=CARD)
+        pick_row.pack(fill="x", padx=PAD, pady=(6, 0))
+        self.refresh_button = FlatButton(pick_row, "Refresh Cameras",
+                                         self.refresh_cameras)
+        self.refresh_button.pack(side="left")
+        self.change_button = FlatButton(pick_row, "Change Camera",
+                                        self._change_camera)
+        self.change_button.pack(side="left", padx=(8, 0))
 
         buttons = tk.Frame(card, bg=CARD)
         buttons.pack(fill="x", padx=PAD, pady=(12, 0))
-        self.connect_button = FlatButton(buttons, "Connect", self._connect,
-                                         kind="accent")
-        self.connect_button.pack(side="left")
-        self.disconnect_button = FlatButton(buttons, "Disconnect",
-                                            self._disconnect)
-        self.disconnect_button.pack(side="left", padx=(8, 0))
-        self.disconnect_button.set_enabled(False)
+        # ONE control, not two.  Two buttons meant two widgets that
+        # could disagree with each other and with the engine; a single
+        # toggle whose label is recomputed from the live state cannot.
+        self.camera_button = FlatButton(buttons, "Connect Camera",
+                                        self._toggle_camera, kind="accent")
+        self.camera_button.pack(side="left")
+        self.camera_state_label = tk.Label(buttons, text="", bg=CARD,
+                                           fg=FAINT,
+                                           font=("Segoe UI", 8, "bold"))
+        self.camera_state_label.pack(side="left", padx=(10, 0))
+
+        # Diagnostics, not configuration.  It opens its own window and
+        # reads the rule list without touching it, which is why it sits
+        # here beside the camera rather than in the Mapping Studio.
+        test_row = tk.Frame(card, bg=CARD)
+        test_row.pack(fill="x", padx=PAD, pady=(8, 0))
+        self.test_button = FlatButton(test_row, "Test Gesture",
+                                      self._open_gesture_test)
+        self.test_button.pack(side="left")
 
         self.camera_status = tk.Label(card, text="Idle.", bg=CARD, fg=FAINT,
                                       font=("Segoe UI", 8), wraplength=232,
@@ -2381,6 +2659,200 @@ class GestureStudio(tk.Tk):
 
     # ── engine glue ─────────────────────────────────────────────────────
 
+    # ── camera selection ───────────────────────────────────────────────
+    def selected_camera(self):
+        """The chosen index, or None.  The one authoritative answer."""
+        return self.camera_index
+
+    def selected_camera_label(self) -> str:
+        for cam in self.cameras:
+            if cam.index == self.camera_index:
+                return cam.label
+        if self.camera_index is None:
+            return "no camera selected"
+        return f"Camera {self.camera_index}"
+
+    def refresh_cameras(self, select=None) -> None:
+        """Re-enumerate, off the Tk thread.
+
+        Probing a camera costs the best part of two seconds, so this
+        cannot happen inline without freezing the window.  The result
+        comes back through a queue, the same hand-off the engine start
+        already uses.
+        """
+        if self._camera_scan_busy:
+            return
+        self._camera_scan_busy = True
+        self._camera_note("Looking for cameras…", CYAN)
+        try:
+            self.refresh_button.set_enabled(False)
+        except Exception:
+            pass
+
+        # The engine holds its camera open, and probing an open device
+        # fails -- so the live one is carried through as present rather
+        # than vanishing from its own list mid-session.
+        busy = []
+        if self.camera_is_live() and self.camera_index is not None:
+            busy.append(self.camera_index)
+
+        def work():
+            try:
+                import cameras
+                found = cameras.enumerate_cameras(skip=busy)
+                error = ""
+            except Exception as exc:
+                found, error = [], f"{exc.__class__.__name__}: {exc}"
+            self._camera_scan.put((found, error, select))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(120, self._poll_camera_scan)
+
+    def _poll_camera_scan(self) -> None:
+        try:
+            found, error, select = self._camera_scan.get_nowait()
+        except queue.Empty:
+            if self._camera_scan_busy:
+                self.after(120, self._poll_camera_scan)
+            return
+        self._camera_scan_busy = False
+        try:
+            self.refresh_button.set_enabled(True)
+        except Exception:
+            pass
+        self.cameras = list(found)
+        self._render_camera_list(error, select)
+
+    def _render_camera_list(self, error="", select=None) -> None:
+        labels = [cam.label for cam in self.cameras]
+        try:
+            self.camera_box.configure(values=labels)
+        except Exception:
+            return
+
+        if not self.cameras:
+            self.camera_index = None
+            self.camera_var.set("")
+            self._camera_note(
+                error or "No camera detected. Connect a camera and "
+                         "refresh the list.", DANGER)
+            self._notify_camera_watchers()
+            return
+
+        wanted = select if select is not None else self.camera_index
+        chosen = next((c for c in self.cameras if c.index == wanted),
+                      self.cameras[0])
+        self.camera_index = chosen.index
+        self.camera_var.set(chosen.label)
+        self._camera_note(
+            f"{len(self.cameras)} camera(s) found. "
+            f"Selected {chosen.label}.", FAINT)
+        self._notify_camera_watchers()
+
+    def _on_camera_pick(self) -> None:
+        label = self.camera_var.get()
+        for cam in self.cameras:
+            if cam.label == label:
+                self.camera_index = cam.index
+                break
+        self._notify_camera_watchers()
+
+    def _change_camera(self) -> None:
+        """Release the current device, then let the user choose another.
+
+        Disconnect first and deliberately: the device has to be free
+        before it can be re-enumerated, and calibration has to be told
+        before the frames stop.  Mappings are untouched throughout.
+        """
+        if self.camera_is_live():
+            self._disconnect()
+        self.refresh_cameras()
+        try:
+            self.camera_box.focus_set()
+        except Exception:
+            pass
+
+    def _notify_camera_watchers(self) -> None:
+        for watcher in list(self._camera_watchers):
+            try:
+                watcher(self.camera_state())
+            except Exception:
+                self._camera_watchers.remove(watcher)
+
+    # ── camera state ───────────────────────────────────────────────────
+    def camera_state(self) -> str:
+        """The one answer everything else asks.
+
+        CONNECTED is read from the engine every time rather than
+        remembered from a button press, so a camera that stops on its own
+        cannot leave the UI claiming otherwise.
+        """
+        if self._engine_busy:
+            return CAM_CONNECTING
+        if self._cam_disconnecting:
+            return CAM_DISCONNECTING
+        engine = getattr(self, "engine", None)
+        if engine is not None and getattr(engine, "running", False):
+            return CAM_CONNECTED
+        if self._cam_error:
+            return CAM_ERROR
+        return CAM_DISCONNECTED
+
+    def camera_is_live(self) -> bool:
+        return self.camera_state() == CAM_CONNECTED
+
+    def watch_camera(self, callback) -> None:
+        """Be told when the state changes.  Used by the calibration
+        dialog so it can start collecting the moment a camera appears."""
+        if callback not in self._camera_watchers:
+            self._camera_watchers.append(callback)
+
+    def unwatch_camera(self, callback) -> None:
+        if callback in self._camera_watchers:
+            self._camera_watchers.remove(callback)
+
+    def _sync_camera_ui(self, repeat: bool = True) -> None:
+        """Make the button agree with reality, then say so if it moved."""
+        if repeat:
+            self.after(CAMERA_SYNC_MS, self._sync_camera_ui)
+        try:
+            state = self.camera_state()
+        except Exception:                       # pragma: no cover
+            return
+
+        label, enabled, tint = {
+            CAM_CONNECTED: ("Disconnect Camera", True, ACCENT),
+            CAM_CONNECTING: ("Connecting…", False, CYAN),
+            CAM_DISCONNECTING: ("Disconnecting…", False, MUTED),
+            CAM_ERROR: ("Connect Camera", True, DANGER),
+            CAM_DISCONNECTED: ("Connect Camera", True, FAINT),
+        }[state]
+
+        try:
+            self.camera_button.configure(text=label)
+            self.camera_button.set_enabled(enabled)
+            self.camera_state_label.configure(text=state, fg=tint)
+        except tk.TclError:                     # pragma: no cover
+            return
+
+        if state != self._camera_last_state:
+            self._camera_last_state = state
+            for watcher in list(self._camera_watchers):
+                try:
+                    watcher(state)
+                except Exception:
+                    self._camera_watchers.remove(watcher)
+
+    def _toggle_camera(self) -> None:
+        """One button, two directions, decided by the real state."""
+        state = self.camera_state()
+        if state == CAM_CONNECTED:
+            self._disconnect()
+        elif state in (CAM_DISCONNECTED, CAM_ERROR):
+            self._connect()
+        # CONNECTING / DISCONNECTING: the button is disabled anyway, and
+        # ignoring a stray click is better than queuing a contradiction.
+
     def _connect(self) -> None:
         """Start the tracker, importing it off the GUI thread.
 
@@ -2391,14 +2863,15 @@ class GestureStudio(tk.Tk):
         """
         if self._engine_busy:
             return
-        try:
-            index = int(self.camera_var.get())
-        except (TypeError, ValueError):
-            self._camera_note("Camera index must be a number.", DANGER)
+        index = self.selected_camera()
+        if index is None:
+            self._camera_note("No camera selected. Refresh the list and "
+                              "choose one.", DANGER)
             return
 
         self._engine_busy = True
-        self.connect_button.set_enabled(False)
+        self._cam_error = ""
+        self._sync_camera_ui(repeat=False)
         self._camera_note(f"Starting the engine on index {index}…", CYAN)
 
         def work():
@@ -2432,9 +2905,8 @@ class GestureStudio(tk.Tk):
 
     def _connected(self, ok: bool, index: int, error) -> None:
         self._engine_busy = False
-        self.connect_button.set_enabled(True)
+        self._cam_error = "" if ok else (error or "camera unavailable")
         if ok:
-            self.disconnect_button.set_enabled(True)
             # The engine adopted whatever gesture_config.json held when it
             # was constructed; the panel may have been changed since, and
             # on a reconnect it certainly has.  Pushing here makes the
@@ -2444,21 +2916,71 @@ class GestureStudio(tk.Tk):
             self._toast(f"Tracker running on camera {index}.", ACCENT)
             self._schedule_video()
         else:
-            self.disconnect_button.set_enabled(False)
             self._camera_note(f"Could not open camera {index}. {error or ''}",
                               DANGER)
+        self._sync_camera_ui(repeat=False)
 
     def _disconnect(self) -> None:
+        """Stop the camera cleanly, taking everything that rides on it.
+
+        Order matters: the calibration session is ended and the probe
+        detached BEFORE the engine stops, so nothing is left recording
+        into a buffer that will never be drained.  Mappings are not
+        touched -- disconnecting a camera is not a reason to lose
+        configuration.
+        """
         if self.engine is None:
             return
+        self._cam_disconnecting = True
+        self._sync_camera_ui(repeat=False)
+
+        panel = getattr(self, "_calibration", None)
+        if panel is not None:
+            try:
+                if panel.winfo_exists():
+                    panel.camera_lost()
+            except tk.TclError:
+                pass
+        try:
+            self.engine.probe = None
+        except Exception:
+            pass
+
+        # Stopping the loop ends the cursor freeze with it: the freeze is
+        # loop-local state, not a flag that outlives the thread.
         self.engine.stop()
-        self.disconnect_button.set_enabled(False)
+        self._cam_disconnecting = False
         self._video_photo = None
         self.video_label.configure(
             image="", text="Disconnected. Press Connect to resume.")
         self.video_label.image = None
         self.preview_meta.configure(text="not connected")
         self._camera_note("Camera released.", MUTED)
+        self._sync_camera_ui(repeat=False)
+
+    def _open_gesture_test(self) -> None:
+        """Open the gesture test bench, or raise the one already open.
+
+        Imported here rather than at module scope so a broken or missing
+        gesture_test.py costs this button and nothing else — the studio
+        still starts and every mapping still works.
+        """
+        existing = getattr(self, "_test_panel", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            import gesture_test
+            self._test_panel = gesture_test.GestureTestPanel(self)
+        except Exception as exc:
+            self._toast(f"Gesture testing unavailable "
+                        f"({exc.__class__.__name__}: {exc})", DANGER)
 
     def _camera_note(self, message: str, colour: str = FAINT) -> None:
         self.camera_status.configure(text=message, fg=colour)
@@ -2789,9 +3311,7 @@ class GestureStudio(tk.Tk):
                         str(rule.get("trigger", "—")).capitalize())
 
         if rule.get("trigger") == TRANSITION:
-            window = rule.get("max_time_sec", 0.0)
-            self._bin_field("MAX TIME",
-                            f"{window:.2f} s" if window > 0 else "no limit")
+            self._bin_field("MAX TIME", timing_label(rule))
         else:
             delay = rule.get("hold_sec", 0.0)
             self._bin_field("HOLD FOR",
@@ -2865,6 +3385,16 @@ class GestureStudio(tk.Tk):
         while the rule sat in the bin.  Two rules on one trigger both fire,
         which is a broken control scheme rather than a conflict the user
         can see, so the returning rule comes back disabled and says so.
+
+        ADAPTIVE STATE IS NOT RESURRECTED.  Deleting retires the pose
+        pair's learning outright, so a restored mapping comes back to a
+        fresh context: baseline tolerance, zero samples, learning again
+        from what it sees.  The alternative — holding the old history
+        aside in case of an undo — would mean a "deleted" mapping still
+        had state in the engine, which is exactly the influence deletion
+        is supposed to remove.  Restoring stale state cannot be done
+        atomically with the rule move either, and a half-restored
+        estimator is worse than an honest fresh start.
         """
         wanted_ids = set(ids)
         wanted = [entry for entry in self.deleted
@@ -2931,6 +3461,8 @@ class GestureStudio(tk.Tk):
             except ValueError:                        # pragma: no cover
                 continue
 
+        self._forget_learning(
+            [e for e in self.deleted if e.get("id") in ids])
         self._prune_undo(ids)
         self._render_bin()
 

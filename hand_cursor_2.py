@@ -80,6 +80,7 @@ Platform:      Windows (user32) and Linux/X11 (libX11)
 # 3.8/3.9 half of the supported range importable.
 from __future__ import annotations
 
+import collections
 import contextlib
 import ctypes
 import math
@@ -97,6 +98,7 @@ import numpy as np          # already a hard dependency of cv2 and mediapipe
 
 from monitors import (ALL_SCREENS, enumerate_monitors, monitor_labels,
                       monitor_union, resolve_monitor_target)
+import adaptive_timing
 from gesture_fsm import HAND_ANY, HAND_BOTH, HAND_LEFT, HAND_RIGHT
 
 try:
@@ -275,7 +277,101 @@ _PALM_MIN_SQ = 1e-12          # was |palm| <= 1e-6
 # Landmark 9 already removes most of it (see the anchor note below); this
 # covers the residual.  Long enough to outlast the twitch, short enough that
 # an intentional move right after a transition does not feel blocked.
-STATE_FREEZE_MS = 75
+#
+# Raised from 75 ms to cover the semantic branch.  A YOLO-native transition
+# does not dispatch until its worker has voted at ~4.7 Hz, hundreds of
+# milliseconds after the fingers start folding, and the old value expired
+# long before the click landed — so the cursor was live and picking up
+# knuckle drift at exactly the wrong moment.  Worse than a shaky pointer:
+# a click dispatched while the cursor is still travelling is delivered by
+# the OS as a drag, so the action failed outright.
+#
+# The geometric stream is the brake pedal.  It sees the fingers start to
+# fold at 30 Hz, ~400 ms before YOLO has voted, so arming the freeze from
+# a GEOMETRIC state change pins the cursor for the whole time the slower
+# branch needs.  The cost is paid on every geometric pose change, not only
+# the semantic ones — that is the trade this number buys.
+STATE_FREEZE_MS = 300
+
+# ── Semantic action freeze (the other half of the anti-drift story) ────
+# STATE_FREEZE_MS above is armed by GEOMETRIC state changes, and measured
+# against a real `one -> fist` fold that is not enough: geometry does not
+# relabel until the fold is ~56% done, so 20.1 px of drift accumulate
+# before it arms, and its 300 ms lapses ~270 ms before the semantic click
+# actually lands.  Total measured drift at the click: 48.4 px.
+#
+# So the semantic branch pins the cursor too, and it can do it EARLIER,
+# because it knows a transition is in flight from the moment the origin
+# pose stabilises -- before the hand has started moving.
+#
+# WHY THIS IS CAPPED.  The transition itself stays valid for its full
+# adaptive window (up to 2.5 s).  Holding the cursor that long would make
+# pointing miserable for anyone whose cursor-control pose happens also to
+# be an action origin, so the CURSOR stops holding after this long while
+# the FSM carries on regardless.  600 ms covers the measured fold with
+# room to spare.
+#
+# WHAT TRIGGERS IT.  Not the origin pose appearing -- measured, that is
+# the wrong moment.  A budget started when the pose appears is mostly
+# spent before the hand moves: holding `one` for 396 ms then folding left
+# 24.4 px of drift against 26.6 px unprotected, and a hold beyond ~800 ms
+# got no protection at all.  The drift is in the MOVEMENT, so the
+# movement is what arms the freeze.
+#
+# The anchor is compared against a rest point that re-anchors itself
+# whenever the hand is still.  Once it has travelled MOTION_TRIGGER_PX
+# for MOTION_CONFIRM_FRAMES in a row AND a transition is armed from the
+# current pose, the cursor pins -- to the REST POINT, not to where the
+# hand has already got to, which is what makes the drift zero rather
+# than merely smaller.
+#
+# Thresholds are in SCREEN pixels, after the 1 Euro filter, so they are
+# measured in the same units the user actually sees the cursor move.
+# Internal implementation details, deliberately not settings.
+
+# How far back the comparison reaches.  A reference that re-anchors on
+# every "still" frame CREEPS: a fold moves the anchor about 2 px per
+# frame, each step passes the still test, and the reference follows the
+# drift instead of marking where it began -- measured, that left 10.6 px
+# at the click and missed a slow fold entirely.  Comparing against a
+# fixed number of frames ago cannot creep, because the baseline leaves
+# the window on its own schedule rather than being dragged along.
+# 8 frames is 266 ms at 30 Hz.
+MOTION_BASELINE_FRAMES = 8
+
+# Below this, across the WHOLE baseline window, the hand counts as still.
+MOTION_REST_PX = 2.5
+
+# Above this it counts as movement.  Sits above filtered jitter (the
+# measured resting anchor wanders well under a pixel) and below the
+# first fold frame's 4.2 px, so a real gesture is caught almost at once.
+MOTION_TRIGGER_PX = 4.0
+
+# Consecutive frames required.  Two at 30 Hz is 66 ms -- enough that a
+# single spurious frame cannot pin the cursor, short enough that the
+# fold is caught in its first tenth.
+MOTION_CONFIRM_FRAMES = 2
+
+# Past this the movement is too large to be a gesture articulating, so
+# the cursor is released to follow the hand.  Sized between the two
+# populations it has to separate: a measured `one -> fist` fold moves the
+# anchor 48.6 px, while deliberate pointing crosses the screen.  80 px
+# keeps a 1.6x margin over the fold and cuts the pause when someone
+# moves while holding an origin pose from 633 ms to about 230 ms.
+#
+# Measured from the PIN, not over the baseline window: a hand that keeps
+# travelling accumulates distance without bound, whereas a gesture's
+# displacement stops when the fold does.
+MOTION_RELEASE_PX = 80.0
+
+# Hard safety ceiling, NOT the mechanism.  The freeze normally ends when
+# the action fires or the hand stops; this only guarantees that no
+# combination of circumstances can pin the cursor forever.
+SEMANTIC_FREEZE_MAX_MS = 1200
+
+_MOTION_REST_SQ = MOTION_REST_PX * MOTION_REST_PX
+_MOTION_TRIGGER_SQ = MOTION_TRIGGER_PX * MOTION_TRIGGER_PX
+_MOTION_RELEASE_SQ = MOTION_RELEASE_PX * MOTION_RELEASE_PX
 
 # MediaPipe prints a TFLite banner and two absl warnings while its graph
 # builds.  They are harmless and unactionable, and they are the only thing
@@ -510,6 +606,32 @@ FPS_NOTE = "30 Hz"
 # to 500 ms does fix it, at the cost of a 500 ms click.  Filtering is the
 # version that keeps both.
 FSM_IGNORED_STATES = ("idle",)
+
+# Which FSM instance a pose belongs to.
+#
+# Two classifiers run at once and their vocabularies overlap: "point",
+# "peace" and "grip" are geometry states AND trained network classes.  Both
+# machines compile the same rule list, so without an owner a single hand
+# movement seen by both streams fires the bound action TWICE.
+#
+# The overlap is resolved statically, in favour of geometry, because for a
+# pose both can see geometry is the better reporter on every axis that
+# matters here: it runs at the full frame rate rather than the worker's,
+# it is deterministic rather than probabilistic, and it is already the
+# stream driving the cursor the click has to land on.
+#
+# Routing on the POSE rather than on the rule is what keeps this invisible
+# in the GUI.  A mapping stays a mapping — no source to choose, no way to
+# pick the combination that silently fires twice — and the rule still
+# carries its own source field for anyone who wants to pin one by hand.
+GEOMETRY_VOCABULARY = frozenset({"grip", "point", "peace", "open"})
+
+# Names for the `source` a rule can be pinned to.  Passing these is what
+# makes an explicitly-pinned rule mean something; it is NOT what prevents
+# the double fire, since a rule that does not pin a source listens to
+# both by design.
+SOURCE_GEOMETRY = "geometry"
+SOURCE_SEMANTIC = "semantic"
 
 # The training order.  Index 5 is "three3" whatever it gets called; the
 # worker prefers the model's own names when the export carries them and
@@ -1330,6 +1452,32 @@ LM_MAX_SPREAD_SCALES = 9.0  # real <= 7.7, corrupt >= 9.5
 LM_MAX_SCALE_JUMP = 2.2    # hand may not grow/shrink faster than this
 LM_MAX_WRIST_JUMP = 12.0   # nor travel more than this many scales a frame
 LM_MAX_HELD_FRAMES = 6     # after this many rejects, stop holding, let go
+
+# ── Feeding YOLO through a MediaPipe dropout ───────────────────────────
+# YOLO submission used to sit inside the hand-present branch, so a frame
+# only reached the classifier when MediaPipe had produced usable
+# landmarks.  Measured, that costs 45 ms of blocked detection per lost
+# frame -- and MediaPipe loses the skeleton precisely DURING a fold,
+# which is the one moment the classifier most needs the picture.  A
+# 4-frame dropout turned a 240 ms click into 374 ms.
+#
+# YOLO does not use landmarks at all.  It only needs the image.  So a
+# frame MediaPipe could not parse is still a perfectly good frame for
+# the classifier, and withholding it buys nothing.
+#
+# The gate is therefore about EVIDENCE OF A HAND, not about landmark
+# quality.  Three cases, and only the third needs a clock:
+#
+#   * landmarks good              -> feed, and remember the time
+#   * MediaPipe saw a hand but the validator rejected it -> feed; the
+#     hand is demonstrably there, only the skeleton is unusable
+#   * MediaPipe saw nothing -> feed only while a valid hand was here
+#     very recently AND an action transition is still armed
+#
+# That last conjunct is what keeps an empty scene empty: with no gesture
+# in flight the grace never opens, so a hand simply leaving stops the
+# classifier on the next frame rather than after a timeout.
+YOLO_DROPOUT_GRACE_MS = 300
 
 _PALM_CHAIN = ((LM_WRIST, LM_INDEX_MCP), (LM_INDEX_MCP, LM_MIDDLE_MCP),
                (LM_MIDDLE_MCP, LM_PINKY_MCP), (LM_PINKY_MCP, LM_WRIST))
@@ -3441,6 +3589,45 @@ mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
 
+class GestureProbe:
+    """A read-only tap on the semantic pipeline, for the GUI test harness.
+
+    OBSERVATIONAL ONLY.  It records what each stage did and changes
+    nothing: not a label, not a threshold, not a rule, not whether an
+    action dispatches.  Detaching it must leave behaviour bit-identical,
+    which is why the engine's only interaction with it is one `record`
+    call after the decisions have already been made.
+
+    Rows are drained by the GUI thread, so the deque is guarded.  It is
+    bounded: a test left running for an hour costs a fixed amount of
+    memory and drops the oldest rows rather than growing without limit.
+    """
+
+    __slots__ = ("_rows", "_lock", "_dropped")
+
+    def __init__(self, capacity: int = 8192) -> None:
+        self._rows = collections.deque(maxlen=capacity)
+        self._lock = threading.Lock()
+        self._dropped = 0
+
+    def record(self, row: dict) -> None:
+        with self._lock:
+            if len(self._rows) == self._rows.maxlen:
+                self._dropped += 1
+            self._rows.append(row)
+
+    def drain(self) -> list:
+        """Take everything recorded since the last call."""
+        with self._lock:
+            out = list(self._rows)
+            self._rows.clear()
+            return out
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+
 class HandTrackerEngine:
     """The tracking pipeline, on its own thread, with no window of its own.
 
@@ -3486,6 +3673,19 @@ class HandTrackerEngine:
         self.hands = None
         self.fsm = None
         self.semantic_fsm = None
+
+        # Set by the GUI's gesture test harness; None in normal operation
+        # and checked, not called, on the hot path.  See GestureProbe.
+        self.probe = None
+
+        # Learning outlives the FSMs.  _apply_config rebuilds both
+        # machines whenever the config is saved, so an estimator owned by
+        # an FSM would be thrown away every time an unrelated mapping was
+        # edited.  Held here instead, and injected.  One per stream: the
+        # two run at rates 6x apart, and pooling their observations for
+        # the same pose pair would average two unrelated distributions.
+        self.geometry_learner = adaptive_timing.TimingLearner()
+        self.semantic_learner = adaptive_timing.TimingLearner()
         self.macros = None
         self.yolo_worker = None
         self.monitor_process = None
@@ -3537,13 +3737,39 @@ class HandTrackerEngine:
             return
 
         cfg = load_config()
-        self.fsm = GestureFSM(cfg)
+        self.fsm = GestureFSM(cfg, learner=self.geometry_learner)
 
         # Same rules, separate state.  The geometric stream runs at the
         # camera rate and the semantic one at the network rate, so they
         # need one stabiliser each; sharing would let a 5 Hz label
         # outvote a 30 Hz one inside the same window.
-        self.semantic_fsm = GestureFSM(cfg)
+        #
+        # Every override here exists because a number tuned for 30 Hz means
+        # something else entirely at 4.7 Hz.  None of them touch the file on
+        # disk, so gesture_config.json keeps its defaults for the geometric
+        # machine and for the GUI.
+        #
+        # transition_memory is counted in FRAMES, so the same number buys
+        # very different amounts of TIME on the two streams.  At the
+        # geometric rate the default 2 spans ~65 ms; at the semantic
+        # ~4.7 Hz it spans ~425 ms — far too short for the hand to finish
+        # folding, so the half-formed frames in between flush the origin
+        # out of the deque before the destination pose ever stabilises and
+        # the transition never fires.  6 restores roughly the same wall
+        # clock (~1.3 s) that the geometric stream already gets.
+        #
+        # window_size/stability_threshold of 1 disable the majority vote on
+        # this stream.  The vote costs one frame minimum, which is 33 ms of
+        # geometry but 213 ms of YOLO, and a fast click shows the
+        # destination pose for exactly one inference — so the vote was
+        # discarding the only frame that carried the click.  The classifier
+        # is trusted directly here; its own confidence floor is the filter
+        # instead.  The cost is that a single misdetection now becomes a
+        # state, which is why transition_memory above is wide enough to
+        # still hold the origin when one lands mid-fold.
+        self.semantic_fsm = GestureFSM(cfg, stability_threshold=1,
+                                       window_size=1, transition_memory=6,
+                                       learner=self.semantic_learner)
 
         settings = cfg.get("settings") or {}
         try:
@@ -4037,6 +4263,13 @@ class HandTrackerEngine:
         thumb_out = False
         frozen_target = None
         freeze_until = 0.0
+        motion_history = collections.deque(
+            maxlen=MOTION_BASELINE_FRAMES)
+        still_anchor = None
+        motion_frames = 0
+        sem_freeze_started = None
+        sem_pin = None
+        motion_locked_out = False
         gesture_changes = 0
         stable_gesture = None
         primary_anchor = None
@@ -4047,6 +4280,7 @@ class HandTrackerEngine:
         hand_down = False         # open hand held fingers-down
         last_semantic = ""        # for the change-only label log
         held_frames = 0           # landmark frames rejected as bad
+        last_valid_hand_t = None  # when landmarks last parsed cleanly
 
         yolo_action_count = 0
         last_seq = -1
@@ -4186,6 +4420,39 @@ class HandTrackerEngine:
                         # and let the hand-lost path clean up.
                         seen = None
 
+                # ── Feed the classifier ─────────────────────────────
+                # Placed here rather than inside the hand-present branch
+                # so a dropout does not starve it.  See the note by
+                # YOLO_DROPOUT_GRACE_MS.  The frame handed over is the
+                # raw camera image, before any overlay is drawn on it.
+                if yolo_worker is not None:
+                    if hand is not None:
+                        last_valid_hand_t = now_ts
+                        yolo_worker.submit(bgr_buf.copy())
+                    elif seen is not None:
+                        # MediaPipe found a hand; only its landmarks were
+                        # implausible, and YOLO never looks at those.
+                        yolo_worker.submit(bgr_buf.copy())
+                    elif (last_valid_hand_t is not None
+                          and (now_ts - last_valid_hand_t)
+                          <= YOLO_DROPOUT_GRACE_MS / 1000.0):
+                        # Nothing seen this frame.  Keep feeding ONLY
+                        # while a transition is still armed from the pose
+                        # that was there a moment ago -- that is the
+                        # difference between "mid-gesture" and "gone".
+                        _ctx = False
+                        if semantic_fsm is not None:
+                            try:
+                                _ctx = semantic_fsm.armed_action_origin(
+                                    now_ts, source=SOURCE_SEMANTIC,
+                                    hand=hand_side,
+                                    hand_count=len(detected_hands or ())
+                                ) is not None
+                            except Exception:
+                                _ctx = False
+                        if _ctx:
+                            yolo_worker.submit(bgr_buf.copy())
+
                 if hand is not None:
                     detected_hands = seen
                     hand_side = handedness_of(results, hand, IS_MIRRORED)
@@ -4207,9 +4474,6 @@ class HandTrackerEngine:
                     gesture, fingers_ext, thumb_out = detect_gesture(
                         hand, screen.cam_w, screen.cam_h)
 
-                    if yolo_worker is not None:
-                        yolo_worker.submit(bgr_buf.copy())
-
                     target_x, target_y = screen.to_screen(raw_x, raw_y)
 
                     if not hand_present:
@@ -4220,6 +4484,12 @@ class HandTrackerEngine:
                         gesture_state = None
                         frozen_target = None
                         freeze_until = 0.0
+                        motion_history.clear()
+                        still_anchor = None
+                        motion_frames = 0
+                        sem_freeze_started = None
+                        sem_pin = None
+                        motion_locked_out = False
 
                     if gesture != gesture_state:
                         previous = gesture_state
@@ -4243,6 +4513,7 @@ class HandTrackerEngine:
                         try:
                             stable_gesture, action = fsm.update_pair(
                                 gesture, now_ts,
+                                source=SOURCE_GEOMETRY,
                                 hand=hand_side,
                                 hand_count=len(detected_hands or ()))
                             if action is not None:
@@ -4259,6 +4530,96 @@ class HandTrackerEngine:
                             target_x, target_y = frozen_target
                         else:
                             frozen_target = None
+
+                    # ── Semantic action freeze ──────────────────────────
+                    # Asked fresh every frame rather than latched, so
+                    # every release path -- action fired, window lapsed,
+                    # hand lost, rule deleted, config reloaded, machine
+                    # reset -- is handled by the same answer coming back
+                    # None.  There is no flag here to get stuck.
+                    #
+                    # Placed after the geometry block deliberately: when
+                    # both are holding, the semantic pin is the older and
+                    # therefore the better anchor, taken before the hand
+                    # began to move.
+                    _armed_since = None
+                    if semantic_fsm is not None:
+                        try:
+                            _armed_since = semantic_fsm.armed_action_origin(
+                                now_ts, source=SOURCE_SEMANTIC,
+                                hand=hand_side,
+                                hand_count=len(detected_hands or ()))
+                        except Exception:
+                            _armed_since = None
+
+                    # Movement measured against where the hand was
+                    # MOTION_BASELINE_FRAMES ago, not against a reference
+                    # that re-anchors itself -- see the note by the
+                    # constants for why the latter creeps.
+                    motion_history.append((target_x, target_y))
+                    _base = motion_history[0]
+                    _dx = target_x - _base[0]
+                    _dy = target_y - _base[1]
+                    _moved_sq = _dx * _dx + _dy * _dy
+
+                    if sem_freeze_started is not None:
+                        # Frozen.  Every exit is checked in this one
+                        # place, so there is nowhere else for a stuck
+                        # cursor to hide.  Distance is measured from the
+                        # PIN here, not over the window: a hand that
+                        # keeps travelling is someone moving the cursor,
+                        # and its displacement grows without bound while
+                        # a gesture's does not.
+                        _pdx = target_x - sem_pin[0]
+                        _pdy = target_y - sem_pin[1]
+                        if (_armed_since is None
+                                or _pdx * _pdx + _pdy * _pdy
+                                > _MOTION_RELEASE_SQ
+                                or (now_ts - sem_freeze_started)
+                                > SEMANTIC_FREEZE_MAX_MS / 1000.0):
+                            # A release on DISTANCE means this is the
+                            # user moving the cursor, not a gesture.
+                            # Without a lock-out the window refills and
+                            # the freeze re-arms a few frames later,
+                            # which reads as cursor stutter rather than
+                            # as movement.  Suppressed until the hand
+                            # settles again.
+                            _pdsq = _pdx * _pdx + _pdy * _pdy
+                            motion_locked_out = _pdsq > _MOTION_RELEASE_SQ
+                            sem_freeze_started = None
+                            sem_pin = None
+                            motion_frames = 0
+                            still_anchor = (target_x, target_y)
+                            # The history is NOT cleared: emptying it
+                            # makes the next frame's baseline equal the
+                            # current point, which reads as "still" and
+                            # cancels the lock-out a frame after setting
+                            # it -- the cursor then re-froze every eight
+                            # frames and stuttered instead of moving.
+                        else:
+                            target_x, target_y = sem_pin
+                    elif (len(motion_history) == MOTION_BASELINE_FRAMES
+                            and _moved_sq < _MOTION_REST_SQ):
+                        # Still across the whole window: safe to mark
+                        # this as where the hand is resting, and the
+                        # moment a lock-out is allowed to end.
+                        still_anchor = (target_x, target_y)
+                        motion_frames = 0
+                        motion_locked_out = False
+                    elif _moved_sq >= _MOTION_TRIGGER_SQ:
+                        motion_frames += 1
+                        if (_armed_since is not None
+                                and not motion_locked_out
+                                and motion_frames >= MOTION_CONFIRM_FRAMES):
+                            # Pin to the last position the hand was
+                            # RESTING at, not to where it has already
+                            # travelled -- that is what makes the drift
+                            # zero rather than merely smaller.
+                            sem_freeze_started = now_ts
+                            sem_pin = still_anchor or _base
+                            target_x, target_y = sem_pin
+                    else:
+                        motion_frames = 0
 
                     smooth_x = oef_x(target_x, timestamp=now_ts)
                     smooth_y = oef_y(target_y, timestamp=now_ts)
@@ -4307,9 +4668,26 @@ class HandTrackerEngine:
                     # further transition is coming to end the drag.
                     if actions.release():
                         self._log("[action] DRAG_STOP (hand lost)")
-                    for _machine in (fsm, semantic_fsm):
-                        if _machine is not None:
-                            _machine.reset()
+
+                    # GEOMETRIC ONLY.  "Hand lost" is a statement about
+                    # MediaPipe, not about the world: folding the fingers
+                    # to make a fist hides the skeleton for a few frames
+                    # while YOLO still sees the hand perfectly well.
+                    # Resetting the semantic machine here cleared _recent
+                    # mid-fold, so the origin pose was gone before the
+                    # destination arrived and a YOLO-native transition
+                    # could never complete.
+                    #
+                    # The semantic machine is not left unattended: its
+                    # update() runs off the worker branch below, a sibling
+                    # of this else rather than a child of it, so it keeps
+                    # ticking through the drop.  request_reset() feeds it
+                    # NO_GESTURE, which disarms holds and takes the drag
+                    # adrift -> stuck-release path within
+                    # stuck_release_sec.  That costs one deque slot
+                    # instead of all of them.
+                    if fsm is not None:
+                        fsm.reset()
                     stable_gesture = None
                     primary_anchor = None
                     detected_hands = ()
@@ -4327,6 +4705,12 @@ class HandTrackerEngine:
                     thumb_out = False
                     frozen_target = None
                     freeze_until = 0.0
+                    motion_history.clear()
+                    still_anchor = None
+                    motion_frames = 0
+                    sem_freeze_started = None
+                    sem_pin = None
+                    motion_locked_out = False
 
                 # ── YOLO output drain (non-blocking) ────────────────────
                 if yolo_worker is not None:
@@ -4535,12 +4919,73 @@ class HandTrackerEngine:
                             # matching is exact string equality.
                             _sem_pose, _sem_hand = split_hand_suffix(
                                 _labelled)
+
+                            # The overlap belongs to geometry, so hand
+                            # this machine an abstention for those poses
+                            # instead of skipping the call.  Abstaining
+                            # keeps update() running — drag safety, hold
+                            # disarming and stale-click expiry all live in
+                            # the tick, and a semantic drag left holding
+                            # the mouse button would outlast the pose that
+                            # started it.  It just cannot claim a pose
+                            # geometry is already reporting.
+                            if _sem_pose in GEOMETRY_VOCABULARY:
+                                _sem_pose = FSM_IGNORED_STATES[0]
+
+                            # Captured either side of update() so the
+                            # probe can say whether the pose was ACCEPTED
+                            # as a state, which is the stage the test
+                            # harness most often needs to separate from a
+                            # detection failure.
+                            _probe = self.probe
+                            _before = semantic_fsm._current
+
                             _sem = semantic_fsm.update(
                                 _sem_pose, now_ts,
+                                source=SOURCE_SEMANTIC,
                                 hand=_sem_hand or hand_side,
                                 hand_count=len(detected_hands or ()))
+                            # ActionDispatcher.dispatch() returns None on
+                            # every path — success and backend refusal
+                            # alike — so its return value proves nothing.
+                            # The counters do: click_count and drag_count
+                            # advance ONLY after the cursor backend
+                            # accepted the call, and last_action is set on
+                            # the same line.  Sampled either side, with no
+                            # change to what dispatch actually does.
+                            _clicks_before = actions.click_count
+                            _drags_before = actions.drag_count
                             if _sem is not None:
                                 actions.dispatch(_sem, now_ts)
+
+                            if _probe is not None:
+                                _probe.record({
+                                    "t": now_ts,
+                                    "yolo_raw": _raw,
+                                    "yolo_label": _labelled,
+                                    "score": _ys,
+                                    "side": hand_side,
+                                    "sem_pose": _sem_pose,
+                                    "sem_hand": _sem_hand or hand_side,
+                                    "hand_count": len(detected_hands or ()),
+                                    "state_before": _before,
+                                    "state_after":
+                                        semantic_fsm._current,
+                                    "recent": [x[0] for x in
+                                               semantic_fsm._recent],
+                                    "action": str(_sem) if _sem else None,
+                                    "rule_id": getattr(_sem, "rule_id", None),
+                                    # Evidence, not a verdict.  The harness
+                                    # decides what these mean; the engine
+                                    # only reports them.
+                                    "clicks_before": _clicks_before,
+                                    "clicks_after": actions.click_count,
+                                    "drags_before": _drags_before,
+                                    "drags_after": actions.drag_count,
+                                    "dispatcher_last": actions.last_action,
+                                    "backend": getattr(self.cursor, "name",
+                                                       "unknown"),
+                                })
                         except Exception as exc:
                             self._log_once(
                                 "semantic",

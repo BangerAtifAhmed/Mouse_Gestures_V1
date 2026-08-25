@@ -1,0 +1,56 @@
+# Mousegesture — runtime dependencies
+#
+# Pinned to the versions this project is developed and tested against
+# (Python 3.11.15).  Install with:
+#
+#     pip install -r requirements.txt
+#
+# Every entry below is imported by the shipped code; nothing here is
+# aspirational.  The module each package provides is named in the comment
+# where it differs from the distribution name.
+
+# --- Vision pipeline -------------------------------------------------
+# Camera capture, colour conversion, overlay drawing.  opencv-python is
+# enough on its own; opencv-contrib-python is NOT required, and having
+# both installed is a known source of cv2 import conflicts.
+opencv-python==4.11.0.86
+
+# Hand landmarks (21-point model).  Pinned tightly: the landmark index
+# layout and the handedness contract this code relies on are version
+# sensitive.
+mediapipe==0.10.14
+
+# YOLOv10n semantic gesture classifier.  Pulls in torch/torchvision
+# itself, which is why neither is pinned here — let ultralytics resolve
+# the pair it was built against.  For CUDA builds install torch from the
+# PyTorch index FIRST, then this file.
+ultralytics==8.3.253
+
+# Array backend shared by OpenCV and MediaPipe.
+numpy==2.4.6
+
+# --- Input / output --------------------------------------------------
+# Cursor movement and click injection (PynputCursor, ActionExecutor).
+# Linux additionally needs python-xlib for the X11 backend; on Windows
+# the ctypes fallback in hand_cursor_2.py covers a missing pynput.
+pynput==1.8.2
+
+# --- GUI (app.py) ----------------------------------------------------
+# tkinter itself ships with CPython and is not installable via pip.
+# On Debian/Ubuntu it is a separate OS package: apt install python3-tk
+#
+# Gesture thumbnails in the Mapping Studio catalog.  Provides `PIL`.
+pillow==12.2.0
+
+# Multi-monitor enumeration for the target-screen setting (monitors.py).
+screeninfo==0.8.1
+
+# --- Diagnostics panel (optional but imported) -----------------------
+# CPU/RAM figures on the Live Camera tab.  app.py degrades gracefully if
+# absent, but the panel shows "psutil?" instead of numbers.
+psutil==7.2.2
+
+# GPU/VRAM figures.  Provides `pynvml`.  Only meaningful on NVIDIA
+# hardware; app.py falls back to a CPU-mode note when the NVML library
+# is missing, so this is safe to omit on machines without an NVIDIA GPU.
+nvidia-ml-py==13.610.43

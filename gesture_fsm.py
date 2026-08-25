@@ -60,6 +60,8 @@ import json
 import os
 from collections import Counter, deque
 
+import adaptive_timing
+
 __all__ = [
     # Action vocabulary
     "LEFT_CLICK", "RIGHT_CLICK", "MIDDLE_CLICK", "DOUBLE_CLICK",
@@ -72,7 +74,7 @@ __all__ = [
     "NO_GESTURE",
     # Hand requirement
     "HAND_ANY", "HAND_RIGHT", "HAND_LEFT", "HAND_BOTH",
-    "HANDS", "normalise_hand",
+    "HANDS", "normalise_hand", "hands_can_coincide",
     # Engine
     "GestureStabilizer", "MajorityStabilizer",
     "TransitionRule", "HoldRule", "ActionEvent",
@@ -178,6 +180,32 @@ def normalise_hand(value) -> str:
     if text in ("both", "both_hands", "bothhands", "two", "two_hands", "2"):
         return HAND_BOTH
     return HAND_ANY
+
+
+def hands_can_coincide(a, b) -> bool:
+    """True when two hand requirements can BOTH be met on the same frame.
+
+    This is the duplicate test.  Two rules on the same trigger are only a
+    conflict if there is a frame that satisfies both of them — otherwise
+    they are alternatives and may coexist, which is the whole point of
+    per-hand mappings:
+
+        right vs left   -> False.  A hand is one or the other, so the two
+                           rules are mutually exclusive by construction.
+        any   vs x      -> True.   ANY matches whatever x matches.
+        both  vs right  -> True.   A two-hand frame still has a primary
+                           side, so a "both hands" rule and a "right hand"
+                           rule can fire on the very same frame.
+        x     vs x      -> True.
+    """
+    left, right = normalise_hand(a), normalise_hand(b)
+    if left == right:
+        return True
+    if HAND_ANY in (left, right):
+        return True
+    if {left, right} == {HAND_RIGHT, HAND_LEFT}:
+        return False
+    return True          # BOTH paired with a specific side
 
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -408,6 +436,15 @@ class _Rule:
     def accepts_source(self, source) -> bool:
         return self.source == "any" or source is None or source == self.source
 
+    def trigger_key(self):
+        """What this rule listens for, IGNORING its hand requirement.
+
+        Two rules sharing a trigger_key are the same physical event seen
+        through different hand filters.  At most one of them may fire on
+        any given frame — see GestureFSM._one_per_trigger().
+        """
+        return (self.__class__.__name__, self._describe())
+
     def accepts_hand(self, hand, hand_count=0) -> bool:
         """True when the hand on screen satisfies this rule's requirement.
 
@@ -464,7 +501,8 @@ class TransitionRule(_Rule):
     ago and has now closed their hand for an unrelated reason".
     """
 
-    __slots__ = ("from_state", "to_state", "max_time_sec", "promote_double")
+    __slots__ = ("from_state", "to_state", "max_time_sec", "promote_double",
+                 "adaptive_timing")
 
     def __init__(self, raw: dict, index: int, settings: dict) -> None:
         super().__init__(raw, index, settings)
@@ -477,6 +515,15 @@ class TransitionRule(_Rule):
 
         self.max_time_sec = max(0.0, _as_float(
             raw.get("max_time_sec"), settings["default_max_time_sec"]))
+
+        # Opt-in per rule, and deliberately a separate key rather than a
+        # sentinel value of max_time_sec: zero already means "no limit
+        # at all", so overloading it would make "let the engine decide"
+        # indistinguishable from "never expire".  A rule that carries an
+        # explicit max_time_sec and no marker keeps that number exactly,
+        # which is what stops an existing config being converted behind
+        # the user's back.
+        self.adaptive_timing = bool(raw.get("adaptive_timing", False))
 
         # Opt-in: repeat the same trigger inside the double-click window and
         # get one DOUBLE_CLICK instead of two LEFT_CLICKs.  Off by default,
@@ -678,7 +725,8 @@ class GestureFSM:
     action per call rather than making every caller handle a list.
     """
 
-    def __init__(self, config=None, stabilizer=None, **overrides) -> None:
+    def __init__(self, config=None, stabilizer=None, learner=None,
+                 **overrides) -> None:
         if config is None:
             config = load_config()
         elif isinstance(config, str):
@@ -767,6 +815,19 @@ class GestureFSM:
         memory = _as_int(settings.get("transition_memory"), 2,
                          minimum=1) + 1
         self._recent = deque(maxlen=memory)
+
+        # One learner per FSM.  The geometric and semantic machines run
+        # at rates 6x apart, so pooling their observations for the same
+        # pose pair would average two unrelated distributions.  Separate
+        # instances also make pose-pair isolation structural rather than
+        # something the estimator has to promise.
+        #
+        # Injected when the caller has one to share -- the engine keeps
+        # its learners across config reloads, so editing an unrelated
+        # mapping does not throw away what has been learnt.  A private
+        # one is built otherwise, which keeps this class usable on its
+        # own in a test.
+        self._timing = learner or adaptive_timing.TimingLearner()
 
         self._current = None
         self._previous = None
@@ -1060,6 +1121,32 @@ class GestureFSM:
 
         return events
 
+    @staticmethod
+    def _one_per_trigger(rules: list) -> list:
+        """Keep the first rule for each trigger, drop later duplicates.
+
+        This is what makes an UNKNOWN handedness safe.  A blank side
+        satisfies both a left rule and a right rule — deliberately, so a
+        momentary gap in MediaPipe's handedness does not silently break a
+        binding — but without this the two would both fire and one hand
+        movement would produce two actions.
+
+        Config order decides the winner, so the choice is deterministic
+        rather than dictionary order.  When the side IS known only one of
+        the pair passes accepts_hand() in the first place and this is a
+        no-op.
+        """
+        if len(rules) < 2:
+            return rules
+        seen, kept = set(), []
+        for rule in rules:
+            key = rule.trigger_key()
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(rule)
+        return kept
+
     def _match_origin(self, candidates: list, now: float) -> list:
         """Pick the rules whose origin is the pose the hand actually came from.
 
@@ -1085,19 +1172,124 @@ class GestureFSM:
         for index in range(len(self._recent) - 2, -1, -1):
             state, entered = self._recent[index]
             if state in origins:
-                return [rule for rule in candidates
-                        if rule.from_state == state
-                        and not self._cooling(rule, now)
-                        and (rule.max_time_sec <= 0.0
-                             or (now - entered) <= rule.max_time_sec)]
+                elapsed = now - entered
+
+                # SAMPLE BEFORE FILTERING.  An estimator fed only the
+                # transitions that passed the current window is trained on
+                # a population truncated by the very gate it is tuning:
+                # under an 800 ms window the longest surviving sample was
+                # 792 ms, a ceiling that looks natural and is pure
+                # artefact.  Learning from that can never widen the
+                # window, so the rejected ones are recorded here, one line
+                # above the test that will throw them away.
+                #
+                # Submitting is also asynchronous, which settles a
+                # question the synchronous version got awkwardly: the
+                # sample that trips a recompute is filtered against the
+                # OLD tolerance, because the worker publishes the new one
+                # afterwards.  No arrival can widen the window it is
+                # itself being measured against.
+                # LEARNING ONLY.  If the path from the origin to here
+                # crossed a frame with no hand in it, the elapsed time
+                # measures how long the hand was missing, not how long
+                # the movement takes.  `one -> hand lost -> fist` is not
+                # evidence about `one -> fist`, so it is not learnt from.
+                #
+                # This gates the sample and NOTHING else: the rule below
+                # still matches, still fires, and still respects its
+                # window exactly as before.  Recognition is unchanged;
+                # only what counts as training data is narrower.
+                crossed_lost = any(
+                    adaptive_timing.is_lost(seen)
+                    for seen, _ in tuple(self._recent)[index + 1:-1])
+
+                # submit(), not observe(): one bounded put_nowait, then
+                # the recognition thread walks away.  Sorting fifty
+                # samples is the learning worker's problem.
+                if not crossed_lost:
+                    for rule in candidates:
+                        if rule.from_state == state and rule.adaptive_timing:
+                            self._timing.submit(rule.from_state,
+                                                rule.to_state, elapsed)
+
+                eligible = [rule for rule in candidates
+                            if rule.from_state == state
+                            and self._within_window(rule, elapsed)]
+                # Ownership first, cooldown second — same reasoning as the
+                # hold loop.  Deciding the winner among rules that differ
+                # only by hand BEFORE the cooldown test stops a cooling
+                # rule from quietly handing its trigger to a sibling.
+                return [rule for rule in self._one_per_trigger(eligible)
+                        if not self._cooling(rule, now)]
             if state == self._current:
                 # Already visited the target; the chain restarted there.
                 return []
         return []
 
+    def _within_window(self, rule, elapsed: float) -> bool:
+        """Is this arrival recent enough for the rule to claim it?
+
+        Two sources, never mixed.  A rule that names its own
+        max_time_sec keeps that number for its whole life -- an existing
+        config must behave tomorrow exactly as it does today.  Only a
+        rule that opted in gets the estimator's value, which is bounded
+        by adaptive_timing's baseline and ceiling and so can never leave
+        a transition armed indefinitely.
+        """
+        if rule.adaptive_timing:
+            return elapsed <= self._timing.tolerance(rule.from_state,
+                                                     rule.to_state)
+        return rule.max_time_sec <= 0.0 or elapsed <= rule.max_time_sec
+
+    def armed_action_origin(self, now: float, source=None, hand=None,
+                            hand_count: int = 0):
+        """When the current pose became an armed action-transition origin.
+
+        Returns the timestamp the origin was entered while at least one
+        transition could still fire from it, and None otherwise.  Answers
+        "is an action in flight from this pose right now", which is what
+        the cursor path needs in order to stop dragging the pointer
+        around while the user is mid-gesture.
+
+        DERIVED, NOT LATCHED, and read-only.  Nothing is stored, so there
+        is no flag for a missed cleanup path to leak: the moment the pose
+        changes, the window lapses, the rule is deleted, or the machine
+        is reset, the next call simply returns None.  That is what makes
+        "the cursor can never stay frozen" structural rather than a
+        promise made by six separate release paths.
+
+        The window consulted here is the rule's own -- adaptive or
+        explicit -- so this reports the real transition context and
+        invents no timing of its own.  A caller that wants to stop
+        holding the cursor sooner applies its own bound to the returned
+        timestamp; that is an interaction choice and deliberately not
+        this engine's business.
+        """
+        current = self._current
+        if current is None or current in self._ignored \
+                or current == NO_GESTURE:
+            return None
+
+        elapsed = now - self._entered_at
+        for rule in self._transitions:
+            if rule.from_state != current:
+                continue
+            if not rule.accepts_source(source):
+                continue
+            if not rule.accepts_hand(hand, hand_count):
+                continue
+            if self._within_window(rule, elapsed):
+                return self._entered_at
+        return None
+
+    def timing_snapshot(self) -> dict:
+        """What the estimator currently believes.  Diagnostics only."""
+        return self._timing.snapshot()
+
     def _tick(self, now: float, source) -> list:
         events = self._drag_safety(now)
 
+        fired_triggers = set()
         for rule in self._holds:
             if not rule.accepts_source(source):
                 continue
@@ -1127,6 +1319,26 @@ class GestureFSM:
                     continue
                 if now < self._hold_next.get(rule.id, 0.0):
                     continue
+
+            # One action per trigger, and the loser is ARMED rather than
+            # merely skipped.  Skipping alone would only postpone it: the
+            # winner arms itself and goes quiet, and on the very next frame
+            # the untouched sibling would find nothing in its way and fire
+            # the second action a frame late.  Arming both keeps them in
+            # lockstep until the pose is left, which is the edge that
+            # re-arms the pair together.
+            #
+            # Ownership is claimed BEFORE the cooldown test on purpose.  A
+            # rule that is merely cooling still owns its trigger for this
+            # frame; handing it to a sibling whose only difference is a
+            # hand requirement an unknown side happens to satisfy too would
+            # turn the cooldown into a way of reaching the other action.
+            key = rule.trigger_key()
+            if key in fired_triggers:
+                self._hold_armed[rule.id] = now
+                self._hold_next[rule.id] = now + rule.repeat_sec
+                continue
+            fired_triggers.add(key)
 
             if self._cooling(rule, now):
                 continue
