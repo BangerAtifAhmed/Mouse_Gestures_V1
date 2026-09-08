@@ -409,5 +409,90 @@ class NoHardcodedNamesTests(unittest.TestCase):
                 self.assertNotIn("'%s'" % label, body)
 
 
+class SwipeActionTests(unittest.TestCase):
+    """Regression tests for SWIPE_LEFT and SWIPE_RIGHT keyboard actions."""
+
+    def test_swipe_left_maps_to_left_arrow(self):
+        """SWIPE_LEFT action dispatches Left Arrow key for previous slide."""
+        from gesture_fsm import SWIPE_LEFT, ACTION_MACROS
+        self.assertEqual(ACTION_MACROS[SWIPE_LEFT], "left")
+
+    def test_swipe_right_maps_to_right_arrow(self):
+        """SWIPE_RIGHT action dispatches Right Arrow key for next slide."""
+        from gesture_fsm import SWIPE_RIGHT, ACTION_MACROS
+        self.assertEqual(ACTION_MACROS[SWIPE_RIGHT], "right")
+
+    def test_swipe_left_keyboard_dispatch(self):
+        """SWIPE_LEFT uses keyboard backend via ActionExecutor."""
+        from gesture_fsm import ActionExecutor, SWIPE_LEFT
+        executor = ActionExecutor(dry_run=True)
+        # Should not raise and should return result
+        result = executor.dispatch(SWIPE_LEFT)
+        # dry_run mode just returns the result of _chord or similar
+        self.assertIsNotNone(result)
+
+    def test_swipe_right_keyboard_dispatch(self):
+        """SWIPE_RIGHT uses keyboard backend via ActionExecutor."""
+        from gesture_fsm import ActionExecutor, SWIPE_RIGHT
+        executor = ActionExecutor(dry_run=True)
+        # Should not raise and should return result
+        result = executor.dispatch(SWIPE_RIGHT)
+        self.assertIsNotNone(result)
+
+    def test_swipe_rules_compile_and_dispatch(self):
+        """Swipe rules can be created and dispatched end-to-end."""
+        from gesture_fsm import SWIPE_LEFT, SWIPE_RIGHT
+
+        left_rule = rule(SWIPE_LEFT, id="swipe_left_rule")
+        right_rule = rule(SWIPE_RIGHT, id="swipe_right_rule")
+
+        # Compile FSM with swipe rules
+        fsm = Gesture(left_rule, right_rule)
+
+        # Perform gestures
+        fsm.perform(AIM, CLOSED)
+
+        # Should have received SWIPE_LEFT event
+        self.assertIn(SWIPE_LEFT, fsm.events)
+
+    def test_swipe_one_shot_like_other_actions(self):
+        """Swipe actions are one-shot, not repeated while gesture held."""
+        from gesture_fsm import SWIPE_LEFT
+
+        rule1 = rule(SWIPE_LEFT, id="swipe_left")
+        run = Gesture(rule1)
+
+        # Perform gesture: AIM -> CLOSED transition fires SWIPE_LEFT
+        run.perform(AIM, CLOSED)
+        first_count = len(run.events)
+        self.assertGreater(first_count, 0)
+
+        # Another frame same pose: should not fire again
+        run.now += 0.1
+        run.perform(CLOSED, CLOSED)  # Stay in CLOSED
+        # Events should not increase
+        self.assertEqual(len(run.events), first_count)
+
+    def test_both_swipe_directions_work(self):
+        """Both SWIPE_LEFT and SWIPE_RIGHT work in same mapping."""
+        from gesture_fsm import SWIPE_LEFT, SWIPE_RIGHT
+
+        left_rule = rule(SWIPE_LEFT, from_state=AIM, to_state=CLOSED,
+                        id="swipe_left")
+        right_rule = rule(SWIPE_RIGHT, from_state=SPLIT, to_state=CLOSED,
+                         id="swipe_right")
+
+        run = Gesture(left_rule, right_rule)
+
+        # Left swipe
+        run.perform(AIM, CLOSED)
+        self.assertEqual(run.events, [SWIPE_LEFT])
+
+        # Reset for right swipe
+        run2 = Gesture(left_rule, right_rule)
+        run2.perform(SPLIT, CLOSED)
+        self.assertEqual(run2.events, [SWIPE_RIGHT])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

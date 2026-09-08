@@ -144,6 +144,8 @@ ACTION_MACROS = {
     VOLUME_DOWN: "volume_down",
     MUTE: "volume_mute",
     MEDIA_PLAY_PAUSE: "media_play_pause",
+    SWIPE_LEFT: "left",
+    SWIPE_RIGHT: "right",
 }
 
 MACRO_ACTIONS = tuple(ACTION_MACROS) + (KEYBOARD_MACRO,)
@@ -1691,15 +1693,11 @@ class ActionExecutor:
             elif name == SCROLL_DOWN:
                 self._mouse.scroll(0, -2)
             elif name == SWIPE_LEFT:
-                # Swipe detection and rendering not yet implemented.
-                # Placeholder: silently accept (return True) for config
-                # compatibility. Detection will be added later.
-                pass
+                # Navigate to previous slide: Left Arrow key
+                return self._chord(ACTION_MACROS[SWIPE_LEFT])
             elif name == SWIPE_RIGHT:
-                # Swipe detection and rendering not yet implemented.
-                # Placeholder: silently accept (return True) for config
-                # compatibility. Detection will be added later.
-                pass
+                # Navigate to next slide: Right Arrow key
+                return self._chord(ACTION_MACROS[SWIPE_RIGHT])
             elif keys:
                 return self._chord(keys)
             else:

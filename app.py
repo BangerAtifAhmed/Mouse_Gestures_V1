@@ -1316,6 +1316,17 @@ class GestureStudio(tk.Tk):
                                       style="Dark.TSpinbox", font=self.f_body)
         self.timing_box.grid(row=3, column=0, sticky="w")
 
+        # Static Hold has a fixed set of hold durations (0, 3, 5, 10 sec).
+        # The combobox replaces the spinbox when HOLD mode is selected.
+        self.hold_timing_var = tk.StringVar(value="0")
+        self.hold_timing_var.trace_add("write",
+                                       lambda *_: self._refresh_preview())
+        self.hold_timing_box = ttk.Combobox(
+            fields, textvariable=self.hold_timing_var,
+            values=["0", "3", "5", "10"], state="readonly",
+            style="Dark.TCombobox", font=self.f_body, width=8)
+        # Not gridded yet; shown only in HOLD mode by _on_trigger_change()
+
         self.cooldown_var = tk.StringVar(value="0.35")
         self.cooldown_var.trace_add("write",
                                     lambda *_: self._refresh_preview())
@@ -1455,6 +1466,7 @@ class GestureStudio(tk.Tk):
             # of the way rather than becoming another number to manage.
             self.timing_caption.grid_remove()
             self.timing_box.grid_remove()
+            self.hold_timing_box.grid_remove()
             self.cooldown_caption.grid_remove()
             self.cooldown_box.grid_remove()
         else:
@@ -1464,18 +1476,22 @@ class GestureStudio(tk.Tk):
             self.slot_pose.pack(side="left")
             # Static Hold: only hold duration is a user parameter. Recognize
             # the pose and fire the action. Cooldown is engine-managed and
-            # stays hidden.
+            # stays hidden. Hold duration is a fixed set: [0, 3, 5, 10] sec.
             self.timing_caption.configure(text="HOLD FOR (SEC)")
             self.timing_caption.grid()
-            self.timing_box.grid()
+            self.timing_box.grid_remove()
+            self.hold_timing_box.grid(row=3, column=0, sticky="w")
             self.cooldown_caption.grid_remove()
             self.cooldown_box.grid_remove()
 
-        # The box means two different things in the two modes, so carrying
-        # a value across the switch would silently reinterpret it.  Skipped
-        # while loading a saved rule, which brings its own value.
+        # The hold_timing_var carries its value separately from timing_var,
+        # so switching modes does not reinterpret the value.  Skipped while
+        # loading a saved rule, which brings its own value.
         if not self._loading:
-            self.timing_var.set("0.80" if kind == TRANSITION else "0.40")
+            if kind == TRANSITION:
+                self.timing_var.set("0.80")
+            else:
+                self.hold_timing_var.set("0")
 
         self._arm(self._visible_slots()[0])
         self._on_action_change()
@@ -1611,8 +1627,9 @@ class GestureStudio(tk.Tk):
                 if validate:
                     self._toast("Pick a pose to hold.", DANGER)
                 return None
+            # Static Hold: hold_sec comes from hold_timing_var combobox (0, 3, 5, 10)
             rule.update({"pose": pose,
-                         "hold_sec": number(self.timing_var, 0.4)})
+                         "hold_sec": number(self.hold_timing_var, 0.0)})
             if self.repeat_toggle.get():
                 rule["repeat"] = True
                 rule["repeat_sec"] = 0.25
@@ -2010,7 +2027,12 @@ class GestureStudio(tk.Tk):
         else:
             self.slot_pose.set_pose(rule["pose"],
                                     self.thumbs.get(rule["pose"]))
-            self.timing_var.set(f"{rule.get('hold_sec', 0.4):.2f}")
+            # Static Hold uses fixed durations [0, 3, 5, 10]. Round loaded
+            # values to the nearest valid one for backwards compatibility.
+            loaded_hold_sec = float(rule.get('hold_sec', 0.0))
+            valid_values = [0, 3, 5, 10]
+            nearest = min(valid_values, key=lambda v: abs(v - loaded_hold_sec))
+            self.hold_timing_var.set(str(nearest))
             self.repeat_toggle.set(bool(rule.get("repeat")))
             self._show_reference(rule["pose"])
 

@@ -4,7 +4,7 @@
     "is_mirrored": true,
     "invert_cursor_x": false,
     "ai_confidence": 0.6,
-    "target_screen": "Screen 1"
+    "target_screen": "All Screens"
   },
   "geometry_bindings": [
     {
@@ -57,6 +57,51 @@
       "to_state": "grabbing",
       "adaptive_timing": true,
       "name": "Drag_Stop",
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "redf09e3c",
+      "trigger": "hold",
+      "action": "SWIPE_RIGHT",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "three_gun_inverse",
+      "hold_sec": 0.0,
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r0dd26839",
+      "trigger": "hold",
+      "action": "SWIPE_LEFT",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "three_gun",
+      "hold_sec": 0.0,
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r365d74c2",
+      "trigger": "hold",
+      "action": "SCROLL_UP",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "like",
+      "hold_sec": 0.0,
+      "name": "scroll_up",
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r25d92c66",
+      "trigger": "hold",
+      "action": "SCROLL_DOWN",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "dislike",
+      "hold_sec": 0.0,
       "source": "any",
       "hand": "any"
     }
