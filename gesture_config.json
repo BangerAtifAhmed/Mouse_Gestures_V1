@@ -83,25 +83,28 @@
       "hand": "any"
     },
     {
-      "id": "r365d74c2",
+      "id": "re655a514",
       "trigger": "hold",
       "action": "SCROLL_UP",
       "enabled": true,
       "cooldown_sec": 0.35,
       "pose": "like",
       "hold_sec": 0.0,
-      "name": "scroll_up",
+      "repeat": true,
+      "repeat_sec": 0.25,
       "source": "any",
       "hand": "any"
     },
     {
-      "id": "r25d92c66",
+      "id": "r421ed6e4",
       "trigger": "hold",
       "action": "SCROLL_DOWN",
       "enabled": true,
       "cooldown_sec": 0.35,
       "pose": "dislike",
       "hold_sec": 0.0,
+      "repeat": true,
+      "repeat_sec": 0.25,
       "source": "any",
       "hand": "any"
     }
@@ -164,6 +167,33 @@
       "hand": "any",
       "_origin_index": 3,
       "_deleted_at": 1788870476.5019863
+    },
+    {
+      "id": "r25d92c66",
+      "trigger": "hold",
+      "action": "SCROLL_DOWN",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "dislike",
+      "hold_sec": 0.0,
+      "source": "any",
+      "hand": "any",
+      "_origin_index": 7,
+      "_deleted_at": 1788874325.9495883
+    },
+    {
+      "id": "r365d74c2",
+      "trigger": "hold",
+      "action": "SCROLL_UP",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "pose": "like",
+      "hold_sec": 0.0,
+      "name": "scroll_up",
+      "source": "any",
+      "hand": "any",
+      "_origin_index": 6,
+      "_deleted_at": 1788874328.6446044
     }
   ]
 }

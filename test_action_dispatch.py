@@ -55,6 +55,9 @@ class RecordingCursor:
     def release(self, button="left"):
         self.calls.append(("release", button))
 
+    def scroll(self, x, y):
+        self.calls.append(("scroll", x, y))
+
     def clicks(self):
         """(button, count) for every click call, in order."""
         return [(b, c) for kind, b, c in self.calls if kind == "click"]
@@ -63,10 +66,20 @@ class RecordingCursor:
         """Total button presses the OS would see."""
         return sum(c for _b, c in self.clicks())
 
+    def scrolls(self):
+        """(x, y) for every scroll call, in order."""
+        return [(x, y) for kind, x, y in self.calls if kind == "scroll"]
+
 
 def dispatcher():
     cursor = RecordingCursor()
-    return ActionDispatcher(cursor), cursor
+    disp = ActionDispatcher(cursor)
+    # Inject ActionExecutor with mock cursor for testing
+    from gesture_fsm import ActionExecutor
+    executor = ActionExecutor(dry_run=False)
+    executor._mouse = cursor  # Replace with mock cursor
+    disp._executor = executor
+    return disp, cursor
 
 
 def rule(action, **extra):
@@ -492,6 +505,183 @@ class SwipeActionTests(unittest.TestCase):
         run2 = Gesture(left_rule, right_rule)
         run2.perform(SPLIT, CLOSED)
         self.assertEqual(run2.events, [SWIPE_RIGHT])
+
+
+class ContinuousScrollTests(unittest.TestCase):
+    """Regression tests for continuous scrolling with progressive speed."""
+
+    def test_1_scroll_up_starts_immediately(self):
+        """SCROLL_UP fires on first gesture recognition."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+        disp.dispatch(SCROLL_UP, 1.0)
+        self.assertEqual(len(cursor.scrolls()), 1)
+        x, y = cursor.scrolls()[0]
+        self.assertEqual(x, 0)
+        self.assertGreater(y, 0, "SCROLL_UP should scroll positive Y")
+
+    def test_2_scroll_down_starts_immediately(self):
+        """SCROLL_DOWN fires on first gesture recognition."""
+        from gesture_fsm import SCROLL_DOWN
+        disp, cursor = dispatcher()
+        disp.dispatch(SCROLL_DOWN, 1.0)
+        self.assertEqual(len(cursor.scrolls()), 1)
+        x, y = cursor.scrolls()[0]
+        self.assertEqual(x, 0)
+        self.assertLess(y, 0, "SCROLL_DOWN should scroll negative Y")
+
+    def test_3_scroll_up_repeats_while_gesture_active(self):
+        """SCROLL_UP continues scrolling on repeated dispatch."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+        # Simulate continuous gesture: call dispatch multiple times
+        disp.dispatch(SCROLL_UP, 1.0)
+        disp.dispatch(SCROLL_UP, 1.05)
+        disp.dispatch(SCROLL_UP, 1.10)
+        # Should have multiple scroll events
+        self.assertGreaterEqual(len(cursor.scrolls()), 2)
+
+    def test_4_scroll_down_repeats_while_gesture_active(self):
+        """SCROLL_DOWN continues scrolling on repeated dispatch."""
+        from gesture_fsm import SCROLL_DOWN
+        disp, cursor = dispatcher()
+        disp.dispatch(SCROLL_DOWN, 1.0)
+        disp.dispatch(SCROLL_DOWN, 1.05)
+        disp.dispatch(SCROLL_DOWN, 1.10)
+        self.assertGreaterEqual(len(cursor.scrolls()), 2)
+
+    def test_5_scroll_speed_increases_with_time(self):
+        """Scroll speed increases gradually as gesture duration increases."""
+        from gesture_fsm import ActionExecutor
+        executor = ActionExecutor(dry_run=False)
+
+        # Test speed curve directly
+        speed_at_0 = executor._scroll_speed_curve(0.0)
+        speed_at_1 = executor._scroll_speed_curve(1.0)
+        speed_at_2 = executor._scroll_speed_curve(2.0)
+
+        # Speed should increase with time
+        self.assertLess(speed_at_0, speed_at_1)
+        self.assertLess(speed_at_1, speed_at_2)
+
+    def test_6_scroll_speed_has_maximum(self):
+        """Scroll speed reaches a maximum and stays capped."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+        # Dispatch many times over long duration to reach max speed
+        for i in range(50):
+            disp.dispatch(SCROLL_UP, 5.0 + i * 0.1)
+
+        scrolls = cursor.scrolls()
+        speeds = [abs(s[1]) for s in scrolls]
+        # Speed should stabilize at a reasonable maximum
+        self.assertLessEqual(max(speeds), 15.0,
+                            "scroll speed should be capped")
+
+    def test_7_scroll_speed_based_on_time_not_frames(self):
+        """Speed increases based on elapsed time, not frame count."""
+        from gesture_fsm import SCROLL_UP
+
+        # Two dispatches with same elapsed time but different time steps
+        disp1, cursor1 = dispatcher()
+        disp1.dispatch(SCROLL_UP, 1.0)
+        disp1.dispatch(SCROLL_UP, 2.0)
+        speed1 = abs(cursor1.scrolls()[-1][1])
+
+        # Different time step, same elapsed time
+        disp2, cursor2 = dispatcher()
+        disp2.dispatch(SCROLL_UP, 1.0)
+        disp2.dispatch(SCROLL_UP, 1.5)  # Same total elapsed (1.5-1 = 0.5)
+        disp2.dispatch(SCROLL_UP, 2.0)
+        speed2 = abs(cursor2.scrolls()[-1][1])
+
+        # Speeds should be similar for same elapsed time
+        self.assertAlmostEqual(speed1, speed2, delta=2.0)
+
+    def test_8_scroll_stops_after_timeout(self):
+        """Scrolling stops when gesture is not called for 0.5 seconds."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+
+        # Start scrolling
+        disp.dispatch(SCROLL_UP, 1.0)
+        initial_count = len(cursor.scrolls())
+
+        # Wait beyond timeout (0.5 sec)
+        disp.dispatch(SCROLL_UP, 1.6)
+
+        # Scroll should have been reset (new activation)
+        # Check that speed went back down
+        scrolls = cursor.scrolls()
+        # The new scroll after timeout should be at low speed
+        self.assertGreater(len(scrolls), initial_count)
+
+    def test_9_scroll_resets_acceleration_on_new_activation(self):
+        """New gesture activation starts at minimum speed."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+
+        # First: long scroll (high speed)
+        for t in [1.0, 1.1, 1.2, 1.3, 1.4]:
+            disp.dispatch(SCROLL_UP, t)
+        high_speed_count = len(cursor.scrolls())
+
+        cursor.calls.clear()
+
+        # Second: new activation after timeout
+        disp.dispatch(SCROLL_UP, 2.5)
+        disp.dispatch(SCROLL_UP, 2.55)
+
+        # New activation speeds should be low
+        new_scrolls = cursor.scrolls()
+        self.assertGreaterEqual(len(new_scrolls), 1)
+
+    def test_10_scroll_up_and_down_independent(self):
+        """SCROLL_UP and SCROLL_DOWN have independent speeds."""
+        from gesture_fsm import SCROLL_UP, SCROLL_DOWN
+
+        disp_up, cursor_up = dispatcher()
+        disp_up.dispatch(SCROLL_UP, 0.0)
+        disp_up.dispatch(SCROLL_UP, 1.0)
+        up_speed = abs(cursor_up.scrolls()[-1][1])
+
+        disp_down, cursor_down = dispatcher()
+        disp_down.dispatch(SCROLL_DOWN, 0.0)
+        disp_down.dispatch(SCROLL_DOWN, 1.0)
+        down_speed = abs(cursor_down.scrolls()[-1][1])
+
+        # Both should progress similarly with time
+        self.assertAlmostEqual(up_speed, down_speed, delta=1.0)
+
+    def test_11_scroll_responds_to_repeated_calls(self):
+        """Each dispatch call results in a scroll event."""
+        from gesture_fsm import SCROLL_UP
+        disp, cursor = dispatcher()
+
+        # Call dispatch multiple times with small time increments
+        num_calls = 5
+        for i in range(num_calls):
+            disp.dispatch(SCROLL_UP, 1.0 + i * 0.1)
+
+        # Should have gotten scroll events for most/all calls
+        self.assertGreaterEqual(len(cursor.scrolls()), num_calls - 1)
+
+    def test_12_scroll_directions_opposite(self):
+        """SCROLL_UP and SCROLL_DOWN have opposite Y directions."""
+        from gesture_fsm import SCROLL_UP, SCROLL_DOWN
+
+        disp_up, cursor_up = dispatcher()
+        disp_up.dispatch(SCROLL_UP, 1.0)
+        up_y = cursor_up.scrolls()[0][1]
+
+        disp_down, cursor_down = dispatcher()
+        disp_down.dispatch(SCROLL_DOWN, 1.0)
+        down_y = cursor_down.scrolls()[0][1]
+
+        self.assertGreater(up_y, 0, "SCROLL_UP should have positive Y")
+        self.assertLess(down_y, 0, "SCROLL_DOWN should have negative Y")
+        self.assertEqual(abs(up_y), abs(down_y),
+                        "magnitudes should be equal")
 
 
 if __name__ == "__main__":

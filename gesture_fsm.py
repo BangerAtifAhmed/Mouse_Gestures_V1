@@ -1646,6 +1646,9 @@ class ActionExecutor:
         self._Button = None
         self._Key = None
 
+        # Continuous scroll tracking: action -> start_time for progressive speed
+        self._scroll_active = {}
+
         if dry_run:
             return
 
@@ -1689,9 +1692,9 @@ class ActionExecutor:
                 self._mouse.release(self._Button.left)
                 self._held.discard("left")
             elif name == SCROLL_UP:
-                self._mouse.scroll(0, 2)
+                self._scroll_continuous(name, 0, 1, now)
             elif name == SCROLL_DOWN:
-                self._mouse.scroll(0, -2)
+                self._scroll_continuous(name, 0, -1, now)
             elif name == SWIPE_LEFT:
                 # Navigate to previous slide: Left Arrow key
                 return self._chord(ACTION_MACROS[SWIPE_LEFT])
@@ -1766,6 +1769,83 @@ class ActionExecutor:
                     self._keyboard.release(key)
                 except Exception:
                     pass
+
+    def _scroll_speed_curve(self, elapsed: float) -> float:
+        """Calculate scroll speed based on continuous gesture duration.
+
+        Progressive speed: starts slow, gradually accelerates to maximum.
+        Uses time-based curve rather than frame count for consistency.
+
+        elapsed: seconds since gesture started
+        returns: scroll units per update (> 0)
+        """
+        # Minimum speed: 1 unit per update (immediate feedback)
+        min_speed = 1.0
+        # Maximum speed: 10 units per update (practical limit)
+        max_speed = 10.0
+        # Acceleration time: reach max speed after 3 seconds
+        accel_time = 3.0
+
+        if elapsed <= 0:
+            return min_speed
+        if elapsed >= accel_time:
+            return max_speed
+
+        # Smooth interpolation: quadratic ease-in-out
+        # (faster acceleration early, tapers toward max)
+        t = elapsed / accel_time
+        smooth_t = t * t if t < 0.5 else 1 - (1 - t) ** 2
+        return min_speed + (max_speed - min_speed) * smooth_t
+
+    def _scroll_continuous(self, action: str, x: int, y_sign: int,
+                          now: float) -> None:
+        """Handle continuous scroll with progressive speed acceleration.
+
+        action: SCROLL_UP or SCROLL_DOWN
+        x: horizontal scroll (usually 0)
+        y_sign: +1 for UP, -1 for DOWN
+        now: current timestamp
+        """
+        if not self._mouse:
+            return
+
+        # Timeout: if a scroll action hasn't been called for 0.5 sec, stop it
+        timeout = 0.5
+        stale_actions = [act for act, (start, last) in self._scroll_active.items()
+                        if (now - last) > timeout]
+        for act in stale_actions:
+            self._scroll_active.pop(act, None)
+
+        if action not in self._scroll_active:
+            # First frame of this scroll: (start_time, last_update_time)
+            self._scroll_active[action] = (now, now)
+
+        start_time, _ = self._scroll_active[action]
+        elapsed = now - start_time
+
+        # Calculate progressive speed
+        speed = self._scroll_speed_curve(elapsed)
+
+        # Scroll with progressive speed (convert float to int for units)
+        try:
+            scroll_units = int(round(speed))
+            if scroll_units > 0:
+                self._mouse.scroll(x, y_sign * scroll_units)
+            # Update last update time
+            self._scroll_active[action] = (start_time, now)
+        except Exception as exc:
+            self._warn(f"scroll unavailable: {exc}")
+
+    def _scroll_stop(self, action: str) -> None:
+        """Stop tracking a scroll action (gesture ended)."""
+        self._scroll_active.pop(action, None)
+
+    def release_scrolls(self) -> None:
+        """Stop all active continuous scrolling.
+
+        Called when camera stops, engine resets, or configuration changes.
+        """
+        self._scroll_active.clear()
 
     def _resolve(self, token: str):
         token = _KEY_ALIASES.get(token, token)
