@@ -66,6 +66,7 @@ __all__ = [
     # Action vocabulary
     "LEFT_CLICK", "RIGHT_CLICK", "MIDDLE_CLICK", "DOUBLE_CLICK",
     "DRAG_START", "DRAG_STOP", "SCROLL_UP", "SCROLL_DOWN",
+    "SWIPE_LEFT", "SWIPE_RIGHT",
     "SHOW_DESKTOP", "TASK_VIEW", "MINIMISE_ALL", "LOCK_SCREEN",
     "SWITCH_WINDOW", "CLOSE_WINDOW", "COPY", "PASTE", "SCREENSHOT",
     "VOLUME_UP", "VOLUME_DOWN", "MUTE", "MEDIA_PLAY_PAUSE",
@@ -80,7 +81,7 @@ __all__ = [
     "TransitionRule", "HoldRule", "ActionEvent",
     "GestureFSM", "ActionExecutor",
     # Config plumbing
-    "CONFIG_PATH", "DEFAULT_SETTINGS",
+    "CONFIG_PATH", "DEFAULT_SETTINGS", "format_transition_report",
     "SENSITIVITY_MIN", "SENSITIVITY_MAX", "SENSITIVITY_STEP",
     "AI_CONFIDENCE_MIN", "AI_CONFIDENCE_MAX", "AI_CONFIDENCE_DEFAULT",
     "load_config", "save_config", "empty_config",
@@ -100,6 +101,8 @@ DRAG_START = "DRAG_START"
 DRAG_STOP = "DRAG_STOP"
 SCROLL_UP = "SCROLL_UP"
 SCROLL_DOWN = "SCROLL_DOWN"
+SWIPE_LEFT = "SWIPE_LEFT"
+SWIPE_RIGHT = "SWIPE_RIGHT"
 
 SHOW_DESKTOP = "SHOW_DESKTOP"
 TASK_VIEW = "TASK_VIEW"
@@ -121,6 +124,7 @@ KEYBOARD_MACRO = "KEYBOARD_MACRO"
 MOUSE_ACTIONS = (
     LEFT_CLICK, RIGHT_CLICK, MIDDLE_CLICK, DOUBLE_CLICK,
     DRAG_START, DRAG_STOP, SCROLL_UP, SCROLL_DOWN,
+    SWIPE_LEFT, SWIPE_RIGHT,
 )
 
 # Named macros expand to a chord.  Keeping the expansion here rather than
@@ -234,6 +238,13 @@ DEFAULT_SETTINGS = {
     # what a real hand produces when curling; raising it trades false
     # negatives for false positives.
     "transition_memory": 2,
+
+    # Instrumentation.  When true the engine prints one [transition-debug]
+    # block per state change that any transition rule was targeting.  OFF
+    # by default and read nowhere else: it changes what is PRINTED and
+    # nothing about what is decided.  hand_cursor_2.py leaves it off and
+    # prints the richer merged block itself, so the live app logs once.
+    "transition_debug": False,
 
     # Failsafes.  A drag with no hand to steer it is released after this
     # long, and no drag survives drag_timeout_sec whatever the hand does.
@@ -834,6 +845,15 @@ class GestureFSM:
         self._entered_at = 0.0
         self._queue = deque()
 
+        # Instrumentation.  The last [transition-debug] report, as a dict,
+        # for a caller that wants to print it alongside its own pipeline
+        # fields.  Written on every state change a rule was targeting;
+        # read by nothing inside this class.
+        self.last_transition_report = None
+        self._debug_transitions = bool(
+            settings.get("transition_debug", False))
+        self._walk = None
+
         self._last_fired = {}          # rule id -> time
         self._hold_armed = {}          # rule id -> time it fired
         self._hold_next = {}           # rule id -> next repeat due
@@ -1082,6 +1102,12 @@ class GestureFSM:
         label = normalise_gesture(gesture)
         events = []
 
+        # Instrumentation.  Cleared here so the attribute always means
+        # "the report for the frame just processed, or None" — otherwise
+        # a caller polling it every frame would reprint the last state
+        # change until the next one came along.
+        self.last_transition_report = None
+
         if label in self._ignored:
             # An abstention is not a pose.  It must not enter the vote,
             # because a stabilised "idle" between point and grip would
@@ -1105,11 +1131,20 @@ class GestureFSM:
         # before any new rule gets a chance to fire on the same frame.
         events = self._drag_safety(now)
 
+        # Snapshot BEFORE _match_origin, because a match clears _recent
+        # and the report has to show the history the decision was made on.
+        history = tuple(self._recent)
+
         candidates = [rule for rule in self._transitions
                       if rule.to_state == self._current
                       and rule.accepts_source(source)
                       and rule.accepts_hand(self._hand, self._hand_count)]
         matched = self._match_origin(candidates, now)
+
+        # INSTRUMENTATION.  Built before _fire(), so the cooldown column
+        # reads as it did when the decision was taken rather than after
+        # the winner has stamped its own _last_fired.
+        self._report_transition(now, source, history, matched)
 
         if matched:
             for rule in matched:
@@ -1167,12 +1202,18 @@ class GestureFSM:
             return []
 
         origins = {rule.from_state for rule in candidates}
+        self._walk = {"origins": sorted(origins), "stopped_at": None,
+                      "stopped_because": "ran out of history",
+                      "skipped": [], "elapsed": None}
 
         # index -1 is the pose just entered; an origin has to precede it.
         for index in range(len(self._recent) - 2, -1, -1):
             state, entered = self._recent[index]
             if state in origins:
                 elapsed = now - entered
+                self._walk["stopped_at"] = state
+                self._walk["stopped_because"] = "state is an origin"
+                self._walk["elapsed"] = elapsed
 
                 # SAMPLE BEFORE FILTERING.  An estimator fed only the
                 # transitions that passed the current window is trained on
@@ -1223,8 +1264,98 @@ class GestureFSM:
                         if not self._cooling(rule, now)]
             if state == self._current:
                 # Already visited the target; the chain restarted there.
+                self._walk["stopped_at"] = state
+                self._walk["stopped_because"] = "chain restarted at target"
                 return []
+            self._walk["skipped"].append(state)
         return []
+
+    def _report_transition(self, now, source, history, matched) -> None:
+        """Record what the engine just decided, and why.  READ-ONLY.
+
+        Called on every state change, and does its work only when some
+        transition rule was targeting the pose just entered — a pose no
+        mapping mentions is not a decision and does not deserve a block.
+
+        EVERY RULE TARGETING THE DESTINATION IS LISTED, including ones the
+        hand gate or the source filter excluded before _match_origin ever
+        saw them.  That is the point: "which rules were even in the
+        running" is exactly the question a misfire raises, and a report
+        showing only the survivors cannot answer it.
+
+        The per-candidate columns are counterfactual and labelled as such
+        by `walk_stopped_at`: they say what each rule WOULD have evaluated
+        to, whereas _match_origin stops at the nearest origin and never
+        tests the rest.  Confusing the two is the trap this block exists
+        to keep a reader out of, so the note line spells out where the
+        backward walk actually stopped.
+        """
+        destination = self._current
+        targeting = [rule for rule in self._transitions
+                     if rule.to_state == destination]
+        if not targeting:
+            self.last_transition_report = None
+            return
+
+        # Most recent entry per pose, excluding the destination arrival
+        # itself — index -1 is the pose just entered.
+        seen_at = {}
+        for state, entered in history[:-1]:
+            seen_at[state] = entered
+
+        rows = []
+        for rule in targeting:
+            entered = seen_at.get(rule.from_state)
+            elapsed = None if entered is None else now - entered
+            if rule.adaptive_timing:
+                limit = self._timing.tolerance(rule.from_state,
+                                               rule.to_state)
+                basis = "adaptive"
+            else:
+                limit = rule.max_time_sec
+                basis = "explicit"
+            rows.append({
+                "rule_id": rule.id,
+                "name": rule.name,
+                "from_state": rule.from_state,
+                "to_state": rule.to_state,
+                "action": rule.action,
+                "hand": rule.hand,
+                "source": rule.source,
+                "elapsed": elapsed,
+                "limit": limit,
+                "limit_basis": basis,
+                "in_history": entered is not None,
+                "timing_ok": (elapsed is not None
+                              and self._within_window(rule, elapsed)),
+                "hand_ok": rule.accepts_hand(self._hand, self._hand_count),
+                "source_ok": rule.accepts_source(source),
+                "cooldown_ok": not self._cooling(rule, now),
+                "selected": rule in matched,
+            })
+
+        walk = self._walk or {}
+        self.last_transition_report = {
+            "stream": str(source or "unknown"),
+            "state_before": self._previous,
+            "state_after": destination,
+            "destination": destination,
+            "now": now,
+            "recent": [(state, entered) for state, entered in history],
+            "hand": self._hand,
+            "hand_count": self._hand_count,
+            "candidates": rows,
+            "walk_origins": walk.get("origins"),
+            "walk_skipped": walk.get("skipped"),
+            "walk_stopped_at": walk.get("stopped_at"),
+            "walk_stopped_because": walk.get("stopped_because"),
+            "selected": [{"rule_id": r.id, "from_state": r.from_state,
+                          "to_state": r.to_state, "action": r.action}
+                         for r in matched],
+        }
+
+        if self._debug_transitions:
+            print(format_transition_report(self.last_transition_report))
 
     def _within_window(self, rule, elapsed: float) -> bool:
         """Is this arrival recent enough for the rule to claim it?
@@ -1559,6 +1690,16 @@ class ActionExecutor:
                 self._mouse.scroll(0, 2)
             elif name == SCROLL_DOWN:
                 self._mouse.scroll(0, -2)
+            elif name == SWIPE_LEFT:
+                # Swipe detection and rendering not yet implemented.
+                # Placeholder: silently accept (return True) for config
+                # compatibility. Detection will be added later.
+                pass
+            elif name == SWIPE_RIGHT:
+                # Swipe detection and rendering not yet implemented.
+                # Placeholder: silently accept (return True) for config
+                # compatibility. Detection will be added later.
+                pass
             elif keys:
                 return self._chord(keys)
             else:
@@ -1638,6 +1779,82 @@ class ActionExecutor:
         if not self._error_shown:
             self._error_shown = True
             print(f"[action] {message}")
+
+
+def format_transition_report(report, **extra) -> str:
+    """Render a transition report as the [transition-debug] block.
+
+    `extra` is merged in as additional `key=value` lines, which is how a
+    caller adds the pipeline facts this engine cannot know — the raw
+    classifier label, the labelled pose, the confidence, and the action
+    the dispatcher was actually handed.
+
+    Timestamps are printed absolutely AND as an age relative to the
+    decision, because "0.42 s ago" is the number a stale-origin question
+    is actually asking about and subtracting it by hand from a
+    perf_counter reading is where a reader makes mistakes.
+    """
+    if not report:
+        return "[transition-debug] (no report)"
+
+    now = report.get("now") or 0.0
+    lines = ["[transition-debug]"]
+
+    for key, value in extra.items():
+        lines.append("  %s=%s" % (key, value))
+
+    lines.append("  stream=%s" % report.get("stream"))
+    lines.append("  state_before=%s" % (report.get("state_before") or "-"))
+    lines.append("  state_after=%s" % (report.get("state_after") or "-"))
+    lines.append("  destination=%s" % (report.get("destination") or "-"))
+    lines.append("  hand=%s hand_count=%s"
+                 % (report.get("hand") or "-", report.get("hand_count")))
+
+    recent = report.get("recent") or ()
+    lines.append("  recent=[%s]" % ", ".join(
+        "%s@%.3f(%+.3fs)" % (state, entered, entered - now)
+        for state, entered in recent))
+
+    rows = report.get("candidates") or ()
+    lines.append("  candidates=%d targeting '%s'"
+                 % (len(rows), report.get("destination")))
+    for index, row in enumerate(rows, 1):
+        lines.append("    [%d] %s  %s->%s = %s  hand=%s source=%s"
+                     % (index, row["rule_id"], row["from_state"],
+                        row["to_state"], row["action"], row["hand"],
+                        row["source"]))
+        if row["in_history"]:
+            elapsed = "%.3fs" % row["elapsed"]
+        else:
+            elapsed = "n/a (from_state absent from recent history)"
+        limit = ("no limit" if row["limit"] <= 0.0
+                 else "<=%.3fs %s" % (row["limit"], row["limit_basis"]))
+        lines.append("        elapsed=%s  timing=%s (%s)  hand=%s  "
+                     "source=%s  cooldown=%s  selected=%s"
+                     % (elapsed,
+                        "PASS" if row["timing_ok"] else "FAIL", limit,
+                        "PASS" if row["hand_ok"] else "FAIL",
+                        "PASS" if row["source_ok"] else "FAIL",
+                        "PASS" if row["cooldown_ok"] else "FAIL",
+                        "YES" if row["selected"] else "no"))
+
+    lines.append("  walk_origins=%s" % (report.get("walk_origins") or []))
+    lines.append("  walk_skipped=%s" % (report.get("walk_skipped") or []))
+    lines.append("  walk_stopped_at=%s (%s)"
+                 % (report.get("walk_stopped_at") or "NONE",
+                    report.get("walk_stopped_because")))
+
+    selected = report.get("selected") or ()
+    if selected:
+        for row in selected:
+            lines.append("  selected=%s->%s:%s"
+                         % (row["from_state"], row["to_state"],
+                            row["action"]))
+            lines.append("  rule_id=%s" % row["rule_id"])
+    else:
+        lines.append("  selected=NONE")
+        lines.append("  rule_id=NONE")
+    return "\n".join(lines)
 
 
 def validate_macro(spec: str) -> bool:

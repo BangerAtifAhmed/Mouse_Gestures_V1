@@ -13,6 +13,7 @@ you can redesign a whole control scheme without restarting the tracker.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -153,6 +154,15 @@ def pretty(label: str) -> str:
 # Temporary: set MOUSEGESTURE_DEBUG_ADAPTIVE=1 to trace the calibration
 # hand-off.  Silent otherwise, so a normal run prints nothing.
 _DEBUG_ADAPTIVE = bool(os.environ.get("MOUSEGESTURE_DEBUG_ADAPTIVE"))
+
+
+# The mapping-lifecycle trace: what the builder committed, what was
+# written, and what came back off disk.  OFF by default — it is several
+# lines per rule per save, which is a debugging session rather than
+# something a user should have to opt out of.
+# Enable with MOUSEGESTURE_CONFIG_DEBUG=1.
+CONFIG_DEBUG = os.environ.get("MOUSEGESTURE_CONFIG_DEBUG", "") in (
+    "1", "true", "True", "TRUE", "yes", "on")
 
 
 def _dbg(message: str) -> None:
@@ -1452,13 +1462,14 @@ class GestureStudio(tk.Tk):
             self.slot_arrow.pack_forget()
             self.slot_to.pack_forget()
             self.slot_pose.pack(side="left")
-            # A hold is different: how long to hold IS the gesture, not an
-            # engine detail, so that field stays.
+            # Static Hold: only hold duration is a user parameter. Recognize
+            # the pose and fire the action. Cooldown is engine-managed and
+            # stays hidden.
             self.timing_caption.configure(text="HOLD FOR (SEC)")
             self.timing_caption.grid()
             self.timing_box.grid()
-            self.cooldown_caption.grid()
-            self.cooldown_box.grid()
+            self.cooldown_caption.grid_remove()
+            self.cooldown_box.grid_remove()
 
         # The box means two different things in the two modes, so carrying
         # a value across the switch would silently reinterpret it.  Skipped
@@ -1630,6 +1641,38 @@ class GestureStudio(tk.Tk):
         rule["hand"] = self.hand.value
         return rule
 
+    # ── [config-debug] lifecycle tracing ────────────────────────────
+    # Instrumentation for the "a new mapping never reaches the runtime"
+    # investigation.  Prints only; nothing here creates, routes or drops
+    # a rule.  Off unless MOUSEGESTURE_CONFIG_DEBUG=1.
+
+    def _log_rule_add(self, rule, where: str) -> None:
+        """One block per rule committed to self.rules."""
+        if not CONFIG_DEBUG:
+            return
+        print("[config-debug] GUI ADD (%s)" % where)
+        for key in ("id", "trigger", "from_state", "to_state", "pose",
+                    "action", "hand", "enabled", "adaptive_timing",
+                    "max_time_sec", "cooldown_sec", "source"):
+            if key in rule:
+                print("  %s=%r" % (key, rule.get(key)))
+        self._log_active_rules()
+
+    def _log_active_rules(self) -> None:
+        """Every ACTIVE rule.  The bin is counted, never listed as active."""
+        if not CONFIG_DEBUG:
+            return
+        print("[config-debug] GUI ACTIVE RULES  count=%d  (bin=%d, not "
+              "active)" % (len(self.rules), len(self.deleted)))
+        for index, rule in enumerate(self.rules, 1):
+            print("  [%d] id=%s  %s -> %s = %s  hand=%s source=%s "
+                  "enabled=%s adaptive=%s"
+                  % (index, rule.get("id"),
+                     rule.get("from_state") or rule.get("pose"),
+                     rule.get("to_state") or "-", rule.get("action"),
+                     rule.get("hand"), rule.get("source"),
+                     rule.get("enabled"), rule.get("adaptive_timing")))
+
     def _commit(self) -> None:
         rule = self._read_builder()
         if rule is None:
@@ -1674,6 +1717,7 @@ class GestureStudio(tk.Tk):
             else:
                 _dbg("rule is NOT adaptive; no calibration")
             self.rules.append(rule)
+            self._log_rule_add(rule, "direct, no calibration")
             _dbg("mapping added directly")
             self._toast("Mapping added.", ACCENT)
 
@@ -1714,6 +1758,7 @@ class GestureStudio(tk.Tk):
                                  durations)
             _dbg(f"calibration complete: {len(durations)} samples")
             self.rules.append(rule)
+            self._log_rule_add(rule, "after calibration")
             self._mark_dirty()
             self._clear_builder()
             self._render_table()
@@ -2344,6 +2389,20 @@ class GestureStudio(tk.Tk):
                         f"{exc.__class__.__name__}: {exc}", DANGER)
             return False
 
+        if CONFIG_DEBUG:
+            print("[config-debug] SAVE ABOUT TO WRITE  path=%s"
+                  % CONFIG_PATH)
+            for key in ("geometry_bindings", "yolo_bindings"):
+                rows = payload.get(key) or []
+                print("  %s=%d" % (key, len(rows)))
+                for row in rows:
+                    print("      id=%s  %s -> %s = %s  source=%s"
+                          % (row.get("id"), row.get("from_state"),
+                             row.get("to_state"), row.get("action"),
+                             row.get("source")))
+            print("  deleted_bindings=%d (never compiled)"
+                  % len(payload.get("deleted_bindings") or []))
+
         try:
             gesture_fsm.save_config(payload, CONFIG_PATH)
         except (OSError, TypeError, ValueError) as exc:
@@ -2351,10 +2410,72 @@ class GestureStudio(tk.Tk):
                         f"{os.path.basename(CONFIG_PATH)}: {exc}", DANGER)
             return False
 
+        # Read back from DISK, not from the payload: the question this
+        # answers is whether the file on disk carries the new mapping in
+        # an ACTIVE list, and only re-reading it can answer that.
+        if CONFIG_DEBUG:
+            try:
+                with open(CONFIG_PATH, encoding="utf-8") as handle:
+                    on_disk = json.load(handle)
+            except Exception as exc:
+                print("[config-debug] DISK AFTER SAVE  unreadable: %s: %s"
+                      % (exc.__class__.__name__, exc))
+            else:
+                print("[config-debug] DISK AFTER SAVE  path=%s mtime=%.3f"
+                      % (CONFIG_PATH, os.path.getmtime(CONFIG_PATH)))
+                for key in ("geometry_bindings", "yolo_bindings",
+                            "bindings", "transitions", "mappings", "holds",
+                            "deleted_bindings"):
+                    rows = on_disk.get(key)
+                    if rows is None:
+                        continue
+                    note = ("  <- NEVER COMPILED"
+                            if key == "deleted_bindings" else "")
+                    print("  %s=%d%s" % (key, len(rows), note))
+                    for row in rows:
+                        print("      id=%s  %s -> %s = %s"
+                              % (row.get("id"), row.get("from_state"),
+                                 row.get("to_state"), row.get("action")))
+
         self._clear_dirty()
+        self._resync_engine()
         if message:
             self._toast(message, ACCENT)
         return True
+
+    def _resync_engine(self) -> None:
+        """Push the file just written into the running tracker.
+
+        Without this the engine keeps whatever it compiled when it was
+        constructed: HandTrackerEngine._apply_config() runs once in
+        __init__, reload_config() had no caller anywhere in the project,
+        and apply_settings() carries only the five cursor values — so a
+        mapping created here reached the JSON and stopped there.  The
+        user saw their new mapping listed as active and the OLD rule
+        firing, with nothing short of restarting the application to
+        clear it.
+
+        A no-op when no engine exists, which is the case while the
+        camera has never been connected; the mapping is on disk and the
+        engine will read it when it starts.
+
+        Never fatal.  Saving succeeded whatever happens here, and a
+        tracker that could not be resynchronised is worth a note in the
+        camera tab rather than an exception on top of a good save.
+        """
+        engine = self.engine
+        if engine is None:
+            return
+        reload_config = getattr(engine, "reload_config", None)
+        if reload_config is None:
+            return
+        try:
+            reload_config()
+        except Exception as exc:
+            self._camera_note(
+                f"Saved, but the running tracker kept its old mappings "
+                f"({exc.__class__.__name__}: {exc}). Reconnect the camera "
+                f"to pick them up.", DANGER)
 
     @staticmethod
     def _normalise_rule(entry, trigger=None):

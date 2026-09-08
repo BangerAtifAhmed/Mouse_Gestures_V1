@@ -103,8 +103,9 @@ from gesture_fsm import HAND_ANY, HAND_BOTH, HAND_LEFT, HAND_RIGHT
 
 try:
     from gesture_fsm import (DOUBLE_CLICK, DRAG_START, DRAG_STOP, LEFT_CLICK,
-                             ActionExecutor, GestureFSM, MajorityStabilizer,
-                             load_config)
+                             ActionExecutor, CONFIG_PATH, GestureFSM,
+                             MajorityStabilizer,
+                             format_transition_report, load_config)
     _FSM_AVAILABLE = True
 except Exception:                       # pragma: no cover - optional branch
     DOUBLE_CLICK = "DOUBLE_CLICK"
@@ -112,7 +113,9 @@ except Exception:                       # pragma: no cover - optional branch
     DRAG_START = "DRAG_START"
     DRAG_STOP = "DRAG_STOP"
     ActionExecutor = None
+    CONFIG_PATH = "gesture_config.json"
     GestureFSM = None
+    format_transition_report = None
     MajorityStabilizer = None
     load_config = None
     _FSM_AVAILABLE = False
@@ -368,6 +371,34 @@ MOTION_RELEASE_PX = 80.0
 # the action fires or the hand stops; this only guarantees that no
 # combination of circumstances can pin the cursor forever.
 SEMANTIC_FREEZE_MAX_MS = 1200
+
+# ── Action settle ──────────────────────────────────────────────────────
+# The articulation freeze above releases the instant the FSM stops
+# reporting an armed origin -- which is the frame the action fires, since
+# the pose has by then become the transition's DESTINATION.  Measured,
+# that put the release exactly on the click: the cursor sat still for the
+# whole fold and then lurched 30 px as the hold handed back to a
+# pose-change pin that had been taken 27 px into the drift.
+#
+# Worse for anything needing two clicks.  A promoted double is delivered
+# as two ORDINARY clicks (ActionDispatcher sends count=1 for both), so
+# the OS assembles them into a double only if they land inside its own
+# double-click box -- 4x4 px on Windows by default.  With the hold
+# released between them the hand's return stroke moved the cursor 23 px
+# and the pair arrived as two singles.
+#
+# So a dispatched action extends the hold rather than ending it, and the
+# pin does not move: a follow-up click lands on the same pixel as the
+# first.  This is about ACTIONS, not about any particular gesture -- every
+# mapping a user creates gets it, and nothing here knows a pose name.
+#
+# SIZED TO THE DOUBLE-CLICK WINDOW.  A second click later than this is a
+# separate click by the engine's own definition (see double_click_sec),
+# so there is nothing left to keep still for.  Deliberate movement is not
+# blocked meanwhile: the distance release below still applies, and
+# pointing crosses MOTION_RELEASE_PX within a few frames, whereas a
+# gesture's return stroke travels back TOWARDS the pin and never does.
+ACTION_SETTLE_MS = 800
 
 _MOTION_REST_SQ = MOTION_REST_PX * MOTION_REST_PX
 _MOTION_TRIGGER_SQ = MOTION_TRIGGER_PX * MOTION_TRIGGER_PX
@@ -632,6 +663,29 @@ GEOMETRY_VOCABULARY = frozenset({"grip", "point", "peace", "open"})
 # both by design.
 SOURCE_GEOMETRY = "geometry"
 SOURCE_SEMANTIC = "semantic"
+
+# Values that turn a diagnostic switch on.  OFF is the default for all
+# of them: these print several lines per event, which is a debugging
+# session rather than something a user should have to opt out of.
+DEBUG_ON = ("1", "true", "True", "TRUE", "yes", "on")
+
+# One [transition-debug] block per semantic state change that a
+# transition rule was targeting: what the classifier detected, what the
+# engine accepted as the origin, and which rule won.
+# Enable with MOUSEGESTURE_TRANSITION_DEBUG=1.
+SEMANTIC_TRANSITION_DEBUG = os.environ.get(
+    "MOUSEGESTURE_TRANSITION_DEBUG", "") in DEBUG_ON
+
+# The compiled rule set of BOTH machines, every time the config is
+# applied.  Enable with MOUSEGESTURE_CONFIG_DEBUG=1.
+CONFIG_DEBUG = os.environ.get("MOUSEGESTURE_CONFIG_DEBUG", "") in DEBUG_ON
+
+# One [cursor-debug] line per frame with a hand in it: where the anchor
+# put the cursor, where the stabiliser held it, and why.  Per-FRAME, so
+# this is the noisiest switch in the file — enable it for a few seconds
+# to inspect one gesture, not for a session.
+# Enable with MOUSEGESTURE_CURSOR_DEBUG=1.
+CURSOR_DEBUG = os.environ.get("MOUSEGESTURE_CURSOR_DEBUG", "") in DEBUG_ON
 
 # The training order.  Index 5 is "three3" whatever it gets called; the
 # worker prefers the model's own names when the export carries them and
@@ -2023,16 +2077,66 @@ class ActionDispatcher:
         self.last_action = None
         self.last_action_time = 0.0
         self._error_shown = False
+        # Rule ids that have delivered a left click with no partner yet.
+        # Read only by _clicks_for(); see the reasoning there.
+        self._unpaired = set()
         # Built on first use, for the actions a cursor backend cannot do:
         # right/middle click, scroll wheel, and keyboard macros.  Left alone
         # unless a config actually binds one.
         self._executor = None
 
+    def _clicks_for(self, action) -> int:
+        """How many button presses this action means at the OS level.
+
+        DOUBLE_CLICK is two, and every cursor backend already takes a
+        count -- pynput passes it straight to Controller.click, and the
+        two ctypes backends loop press/release.  Sending one and letting
+        the desktop infer a double from two separately dispatched events
+        made the action depend on the OS double-click timer, which the
+        semantic branch cannot reliably beat at 4.7 Hz.
+        ActionExecutor in gesture_fsm.py has always sent two; this is the
+        path that disagreed with it.
+
+        THE ONE EXCEPTION IS A PROMOTION COMPLETING.  When a rule opts
+        into promote_double the engine emits an ordinary LEFT_CLICK for
+        the first gesture and DOUBLE_CLICK for the second, meaning "and
+        the partner to the one you just sent".  Sending two there would
+        put three clicks on the desktop, which reads as a triple.
+
+        The two cases are told apart by the RULE, not by a timer.
+        GestureFSM only ever promotes a rule that has just fired an
+        ordinary click, and a rule carries exactly one action -- a rule
+        bound to DOUBLE_CLICK never reaches _register_click and so can
+        never appear here as an unpaired single.  An event with no rule
+        at all is treated as a standalone double, which is what a caller
+        asking for DOUBLE_CLICK directly means.
+        """
+        if action != DOUBLE_CLICK:
+            return 1
+        rule_id = getattr(action, "rule_id", None)
+        if rule_id is not None and rule_id in self._unpaired:
+            return 1
+        return 2
+
+    def _note_click(self, action) -> None:
+        """Remember whether this rule now has a click awaiting a partner."""
+        rule_id = getattr(action, "rule_id", None)
+        if rule_id is None:
+            return
+        if action == DOUBLE_CLICK:
+            self._unpaired.discard(rule_id)
+        else:
+            self._unpaired.add(rule_id)
+
     def dispatch(self, action: str, now: float) -> None:
         if action in (LEFT_CLICK, DOUBLE_CLICK):
+            clicks = self._clicks_for(action)
             if not self._safely(self._cursor.click,
-                                button=self._button, count=1):
+                                button=self._button, count=clicks):
                 return
+            self._note_click(action)
+            # Counts ACTIONS, not button presses, exactly as it always
+            # has: a double-click is one thing the user asked for.
             self.click_count += 1
         elif action == DRAG_START:
             if self.dragging:
@@ -3628,6 +3732,205 @@ class GestureProbe:
         return self._dropped
 
 
+class CursorStabiliser:
+    """Decides whether the cursor holds still while a gesture articulates.
+
+    Lifted verbatim out of the tracking loop, where it was seven locals
+    and two blocks forty lines apart.  Behaviour is unchanged; what
+    changes is that the decision can now be replayed frame by frame
+    against a recorded trajectory, which is the only way to measure how
+    much the cursor actually drifts during a fold.
+
+    TWO INDEPENDENT HOLDS, in the order the loop applied them:
+
+      * The GEOMETRIC hold, armed by any geometric pose change and
+        lasting STATE_FREEZE_MS.  It pins to wherever the cursor is at
+        the moment the pose changes.
+
+      * The SEMANTIC hold, armed by MOVEMENT while a transition is armed
+        from the current pose.  It pins to the last point the hand was
+        RESTING at, which is why its drift is zero rather than merely
+        smaller.
+
+    `reason` is diagnostics only and never read to make a decision.
+    """
+
+    __slots__ = ("frozen_target", "freeze_until", "motion_history",
+                 "still_anchor", "motion_frames", "sem_freeze_started",
+                 "sem_pin", "motion_locked_out", "frozen", "reason",
+                 "action_hold_until")
+
+    def __init__(self) -> None:
+        self.motion_history = collections.deque(
+            maxlen=MOTION_BASELINE_FRAMES)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything.  Called when the hand arrives or is lost."""
+        self.frozen_target = None
+        self.freeze_until = 0.0
+        self.motion_history.clear()
+        self.still_anchor = None
+        self.motion_frames = 0
+        self.sem_freeze_started = None
+        self.sem_pin = None
+        self.motion_locked_out = False
+        self.action_hold_until = 0.0
+        self.frozen = False
+        self.reason = "none"
+
+    def arm_pose_change(self, target, now: float) -> None:
+        """A geometric pose change: hold this point for STATE_FREEZE_MS."""
+        self.frozen_target = target
+        self.freeze_until = now + STATE_FREEZE_MS / 1000.0
+
+    def note_action(self, now: float) -> None:
+        """An action was dispatched: keep holding the pin for a moment.
+
+        Called for every dispatched action and told nothing about which
+        one it was, so a user's own mapping gets the same treatment as
+        any other.  The engine skips it only while a drag is in flight,
+        because a drag's whole purpose is to move the pointer.
+
+        THE PIN DOES NOT MOVE.  Extending the existing hold is the point:
+        a second click inside the settle window has to land on the same
+        pixel as the first, and re-pinning to wherever the hand has got
+        to would defeat that.
+
+        `sem_freeze_started` is restamped so the safety ceiling measures
+        from the action rather than from the fold that preceded it.  The
+        ceiling is there to stop a cursor being held indefinitely without
+        justification, and a dispatched action is fresh justification.
+
+        With no pin to extend -- an action that fired without the
+        articulation hold ever arming -- the last resting point is
+        adopted, which is the same anchor the hold itself would have
+        used.  Failing that, the motion history baseline is the best we
+        have: a geometry-only rule fires without semantic involvement, so
+        still_anchor may be None, but motion_history always contains the
+        last MOTION_BASELINE_FRAMES.
+        """
+        if self.sem_pin is None:
+            if self.still_anchor is not None:
+                self.sem_pin = self.still_anchor
+            elif self.motion_history:
+                # For a fast geometry action that fires before motion_history
+                # fills, use the oldest point we have. This is the best
+                # anchor available: the position the hand was at when
+                # motion was first detected.  Better than nothing, and
+                # geometry rules bypass the semantic arming window entirely.
+                self.sem_pin = self.motion_history[0]
+            else:
+                # Hand just arrived, no history yet.
+                # Rare, but harmless: the pose-change hold already covers it.
+                return
+        self.sem_freeze_started = now
+        self.action_hold_until = now + ACTION_SETTLE_MS / 1000.0
+
+    def update(self, target_x: float, target_y: float, now: float,
+               armed_since):
+        """The point the cursor should use this frame.
+
+        `armed_since` is when the current pose became an armed transition
+        origin, or None -- GestureFSM.armed_action_origin()'s answer,
+        passed in rather than queried here so this class stays a pure
+        function of the trajectory and that one flag.
+        """
+        self.frozen = False
+        self.reason = "none"
+
+        if self.frozen_target is not None:
+            if now < self.freeze_until:
+                target_x, target_y = self.frozen_target
+                self.frozen = True
+                self.reason = "pose-change"
+            else:
+                self.frozen_target = None
+
+        # Movement measured against where the hand was
+        # MOTION_BASELINE_FRAMES ago, not against a reference
+        # that re-anchors itself -- see the note by the
+        # constants for why the latter creeps.
+        self.motion_history.append((target_x, target_y))
+        _base = self.motion_history[0]
+        _dx = target_x - _base[0]
+        _dy = target_y - _base[1]
+        _moved_sq = _dx * _dx + _dy * _dy
+
+        if self.sem_freeze_started is not None:
+            # Frozen.  Every exit is checked in this one
+            # place, so there is nowhere else for a stuck
+            # cursor to hide.  Distance is measured from the
+            # PIN here, not over the window: a hand that
+            # keeps travelling is someone moving the cursor,
+            # and its displacement grows without bound while
+            # a gesture's does not.
+            _pdx = target_x - self.sem_pin[0]
+            _pdy = target_y - self.sem_pin[1]
+            # An action dispatched moments ago keeps the hold alive even
+            # though the pose is no longer an armed origin -- it stopped
+            # being one BECAUSE the transition completed.  Distance and
+            # the safety ceiling still release it; only the "no longer
+            # armed" test is deferred.
+            _settling = now < self.action_hold_until
+            if ((armed_since is None and not _settling)
+                    or _pdx * _pdx + _pdy * _pdy > _MOTION_RELEASE_SQ
+                    or (now - self.sem_freeze_started)
+                    > SEMANTIC_FREEZE_MAX_MS / 1000.0):
+                # A release on DISTANCE means this is the
+                # user moving the cursor, not a gesture.
+                # Without a lock-out the window refills and
+                # the freeze re-arms a few frames later,
+                # which reads as cursor stutter rather than
+                # as movement.  Suppressed until the hand
+                # settles again.
+                _pdsq = _pdx * _pdx + _pdy * _pdy
+                self.motion_locked_out = _pdsq > _MOTION_RELEASE_SQ
+                self.sem_freeze_started = None
+                self.sem_pin = None
+                self.action_hold_until = 0.0
+                self.motion_frames = 0
+                self.still_anchor = (target_x, target_y)
+                # The history is NOT cleared: emptying it
+                # makes the next frame's baseline equal the
+                # current point, which reads as "still" and
+                # cancels the lock-out a frame after setting
+                # it -- the cursor then re-froze every eight
+                # frames and stuttered instead of moving.
+            else:
+                target_x, target_y = self.sem_pin
+                self.frozen = True
+                self.reason = ("action-settle" if _settling
+                               and armed_since is None
+                               else "semantic-action")
+        elif (len(self.motion_history) == MOTION_BASELINE_FRAMES
+                and _moved_sq < _MOTION_REST_SQ):
+            # Still across the whole window: safe to mark
+            # this as where the hand is resting, and the
+            # moment a lock-out is allowed to end.
+            self.still_anchor = (target_x, target_y)
+            self.motion_frames = 0
+            self.motion_locked_out = False
+        elif _moved_sq >= _MOTION_TRIGGER_SQ:
+            self.motion_frames += 1
+            if (armed_since is not None
+                    and not self.motion_locked_out
+                    and self.motion_frames >= MOTION_CONFIRM_FRAMES):
+                # Pin to the last position the hand was
+                # RESTING at, not to where it has already
+                # travelled -- that is what makes the drift
+                # zero rather than merely smaller.
+                self.sem_freeze_started = now
+                self.sem_pin = self.still_anchor or _base
+                target_x, target_y = self.sem_pin
+                self.frozen = True
+                self.reason = "semantic-action"
+        else:
+            self.motion_frames = 0
+
+        return target_x, target_y
+
+
 class HandTrackerEngine:
     """The tracking pipeline, on its own thread, with no window of its own.
 
@@ -3724,6 +4027,12 @@ class HandTrackerEngine:
             "yolo_ms": 0.0, "error": None,
         }
 
+        # Set BEFORE the first _apply_config(), which returns early when
+        # gesture_fsm.py is missing.  The tracking loop compares this
+        # every frame, so it has to exist even on the path where no rule
+        # set was ever built.
+        self._config_generation = 0
+
         self._apply_config()
 
     # ── configuration ───────────────────────────────────────────────────
@@ -3737,7 +4046,13 @@ class HandTrackerEngine:
             return
 
         cfg = load_config()
-        self.fsm = GestureFSM(cfg, learner=self.geometry_learner)
+
+        # BOTH machines are built into LOCALS before either is published.
+        # A reload that fails half way has to leave the engine on the
+        # rule set it already had: the tracking loop reads the two as a
+        # pair, and a new geometric machine beside an old semantic one
+        # is a state no configuration ever described.
+        geometry = GestureFSM(cfg, learner=self.geometry_learner)
 
         # Same rules, separate state.  The geometric stream runs at the
         # camera rate and the semantic one at the network rate, so they
@@ -3767,9 +4082,19 @@ class HandTrackerEngine:
         # instead.  The cost is that a single misdetection now becomes a
         # state, which is why transition_memory above is wide enough to
         # still hold the origin when one lands mid-fold.
-        self.semantic_fsm = GestureFSM(cfg, stability_threshold=1,
-                                       window_size=1, transition_memory=6,
-                                       learner=self.semantic_learner)
+        semantic = GestureFSM(cfg, stability_threshold=1,
+                              window_size=1, transition_memory=6,
+                              learner=self.semantic_learner)
+
+        # PUBLISHED AS A PAIR, THEN STAMPED, in that order and no other.
+        # The loop reads the stamp first and the machines second, so a
+        # stamp that has moved proves both assignments already landed —
+        # which is what makes a half-rebuilt swap unobservable rather
+        # than merely unlikely.  Everything below this point is settings
+        # and logging, none of which can fail the swap once it is done.
+        self.fsm = geometry
+        self.semantic_fsm = semantic
+        self._config_generation = getattr(self, "_config_generation", 0) + 1
 
         settings = cfg.get("settings") or {}
         try:
@@ -3802,9 +4127,116 @@ class HandTrackerEngine:
         for rule in self.fsm.rules:
             self._log(f"          {rule.name:<28} -> {rule.action}")
 
+        self._log_compiled_rules(cfg)
+
+    def _log_compiled_rules(self, cfg) -> None:
+        """[config-debug] what the two machines actually compiled.
+
+        Printed from _apply_config(), which is the ONLY place either FSM
+        is built.  If a mapping is in the file and absent here, the file
+        was never re-read — which is a synchronisation question, not a
+        recognition one.
+        """
+        if not CONFIG_DEBUG:
+            return
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            mtime = float("nan")
+
+        active = sum(len(cfg.get(key) or [])
+                     for key in ("geometry_bindings", "yolo_bindings",
+                                 "bindings", "transitions", "mappings",
+                                 "holds"))
+        print("[config-debug] RUNTIME CONFIG")
+        print("  path=%s" % CONFIG_PATH)
+        print("  mtime=%.3f" % mtime)
+        print("  active transition/hold entries in file=%d" % active)
+        print("  deleted_bindings in file=%d (never compiled)"
+              % len(cfg.get("deleted_bindings") or []))
+
+        for name, machine in (("GEOMETRY", self.fsm),
+                              ("SEMANTIC", self.semantic_fsm)):
+            rules = tuple(machine.rules) if machine is not None else ()
+            print("[config-debug] %s FSM RULES  count=%d  (%s)"
+                  % (name, len(rules),
+                     machine.describe() if machine is not None else "none"))
+            for rule in rules:
+                print("[config-debug] COMPILED RULE")
+                print("  machine=%s" % name.lower())
+                print("  id=%s" % rule.id)
+                print("  from=%s" % getattr(rule, "from_state", "-"))
+                print("  to=%s" % getattr(rule, "to_state", "-"))
+                print("  pose=%s" % getattr(rule, "pose", "-"))
+                print("  action=%s" % rule.action)
+                print("  hand=%s" % rule.hand)
+                print("  source=%s" % rule.source)
+                print("  enabled=%s" % rule.enabled)
+
+        # Source routing, stated rather than assumed.  _compile() merges
+        # geometry_bindings, yolo_bindings and bindings into ONE rule set
+        # that BOTH machines receive; which list a rule was written to
+        # does not route it.  What routes it is the rule's own `source`
+        # field, tested per frame by accepts_source().
+        print("[config-debug] SOURCE ROUTING")
+        for name, machine in (("geometry", self.fsm),
+                              ("semantic", self.semantic_fsm)):
+            if machine is None:
+                continue
+            listens = [r.id for r in machine.rules
+                       if r.accepts_source(name)]
+            print("  %s stream: %d of %d rule(s) accept it -> %s"
+                  % (name, len(listens), len(tuple(machine.rules)),
+                     listens or "none"))
+
+    def _machines_for_frame(self, generation):
+        """The newly published FSM pair, or None when nothing changed.
+
+        THE STAMP IS READ FIRST, and that ordering is the whole
+        synchronisation argument.  _apply_config() publishes both
+        machines and only then advances the stamp, so a stamp that has
+        moved proves both assignments have already landed.  Reading the
+        machines afterwards therefore cannot see a new geometric one
+        beside an old semantic one — the interleaving that would produce
+        it is over before the stamp moves.
+
+        Returning None rather than the unchanged pair is what preserves
+        the hoist _run() has always had: on the overwhelming majority of
+        frames this costs one integer compare and touches nothing else.
+
+        Called from the tracking thread only.  The rebuild happens on
+        the GUI thread, and this is the point at which its result
+        becomes visible to a frame — the same discipline the MediaPipe
+        rebuild already follows.
+        """
+        current = self._config_generation
+        if current == generation:
+            return None
+        return current, self.fsm, self.semantic_fsm
+
     def reload_config(self) -> None:
-        """Re-read gesture_config.json without restarting the camera."""
+        """Re-read gesture_config.json without restarting the camera.
+
+        Called by the GUI after Save Config, so a mapping created in the
+        editor takes effect on the next frame rather than on the next
+        launch.  Before this had a caller, _apply_config() ran exactly
+        once — in __init__ — and the tracker kept the rule set it
+        compiled at startup for its whole life: a new mapping was written
+        to disk and then ignored, while the OLD rules kept firing.
+
+        THE BUTTON IS DROPPED FIRST.  A drag in progress belongs to a
+        rule in the outgoing set; once that set is replaced there is no
+        machine left that knows the button is down, and DRAG_STOP would
+        never be emitted.  Releasing here costs an interrupted drag and
+        saves a desktop stuck selecting text.
+
+        Safe to call while the camera is running, and safe to call when
+        it is not.
+        """
+        if self.actions.release():
+            self._log("[action] DRAG_STOP (config reloaded)")
         self._apply_config()
+        self._log("[config] reloaded — %s" % self.fsm.describe())
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -4242,8 +4674,13 @@ class HandTrackerEngine:
         stream = self.stream
         screen = self.screen
         hands = self.hands
+        # Hoisted out of the loop, as they always were — but a reload
+        # replaces the objects these names point at, and a local captured
+        # once would go on feeding the OLD rule set for the life of the
+        # thread.  The generation stamp below is what closes that gap.
         fsm = self.fsm
         semantic_fsm = self.semantic_fsm
+        config_generation = getattr(self, "_config_generation", 0)
         actions = self.actions
         yolo_worker = self.yolo_worker
         macros = self.macros
@@ -4261,15 +4698,7 @@ class HandTrackerEngine:
         gesture = "idle"
         fingers_ext = (False, False, False, False)
         thumb_out = False
-        frozen_target = None
-        freeze_until = 0.0
-        motion_history = collections.deque(
-            maxlen=MOTION_BASELINE_FRAMES)
-        still_anchor = None
-        motion_frames = 0
-        sem_freeze_started = None
-        sem_pin = None
-        motion_locked_out = False
+        stabiliser = CursorStabiliser()
         gesture_changes = 0
         stable_gesture = None
         primary_anchor = None
@@ -4315,6 +4744,18 @@ class HandTrackerEngine:
                 last_seq = seq
 
                 now_ts = time.perf_counter()
+
+                # ── Live config reload ──────────────────────────────────
+                # One integer compare per frame.  Re-read on this thread
+                # rather than assigned from the GUI thread, for the same
+                # reason the MediaPipe rebuild below is: the loop is the
+                # only place that may decide when a swap becomes visible
+                # to a frame already part-way through being processed.
+                refreshed = self._machines_for_frame(config_generation)
+                if refreshed is not None:
+                    config_generation, fsm, semantic_fsm = refreshed
+                    self._log("[config] tracking loop picked up the new "
+                              "rule set")
 
                 # ── Live AI-confidence change ───────────────────────────
                 # Done here, on this thread, because MediaPipe must not
@@ -4482,20 +4923,13 @@ class HandTrackerEngine:
                         prev_x, prev_y = target_x, target_y
                         hand_present = True
                         gesture_state = None
-                        frozen_target = None
-                        freeze_until = 0.0
-                        motion_history.clear()
-                        still_anchor = None
-                        motion_frames = 0
-                        sem_freeze_started = None
-                        sem_pin = None
-                        motion_locked_out = False
+                        stabiliser.reset()
 
                     if gesture != gesture_state:
                         previous = gesture_state
                         gesture_state = gesture
-                        frozen_target = (target_x, target_y)
-                        freeze_until = now_ts + STATE_FREEZE_MS / 1000.0
+                        stabiliser.arm_pose_change((target_x, target_y),
+                                                   now_ts)
                         gesture_changes += 1
                         self._log(f"[gesture] {previous or '-'} -> {gesture}"
                                   f"   (hold {STATE_FREEZE_MS} ms)")
@@ -4518,6 +4952,12 @@ class HandTrackerEngine:
                                 hand_count=len(detected_hands or ()))
                             if action is not None:
                                 actions.dispatch(action, now_ts)
+                                # Not while dragging: a drag exists to
+                                # move the pointer, so holding it still
+                                # would break the one action that needs
+                                # the cursor live.
+                                if not actions.dragging:
+                                    stabiliser.note_action(now_ts)
                         except Exception as exc:
                             self._log_once(
                                 "action",
@@ -4525,23 +4965,17 @@ class HandTrackerEngine:
                                 f"continues ({exc.__class__.__name__}: "
                                 f"{exc})")
 
-                    if frozen_target is not None:
-                        if now_ts < freeze_until:
-                            target_x, target_y = frozen_target
-                        else:
-                            frozen_target = None
-
-                    # ── Semantic action freeze ──────────────────────────
-                    # Asked fresh every frame rather than latched, so
-                    # every release path -- action fired, window lapsed,
-                    # hand lost, rule deleted, config reloaded, machine
-                    # reset -- is handled by the same answer coming back
-                    # None.  There is no flag here to get stuck.
+                    # ── Cursor stabilisation ────────────────────
+                    # Both holds live in CursorStabiliser now: the
+                    # geometric one armed above, and the semantic one
+                    # armed by movement while a transition is in flight.
                     #
-                    # Placed after the geometry block deliberately: when
-                    # both are holding, the semantic pin is the older and
-                    # therefore the better anchor, taken before the hand
-                    # began to move.
+                    # armed_action_origin is asked fresh every frame
+                    # rather than latched, so every release path --
+                    # action fired, window lapsed, hand lost, rule
+                    # deleted, config reloaded, machine reset -- is
+                    # handled by the same answer coming back None.
+                    # There is no flag here to get stuck.
                     _armed_since = None
                     if semantic_fsm is not None:
                         try:
@@ -4552,74 +4986,27 @@ class HandTrackerEngine:
                         except Exception:
                             _armed_since = None
 
-                    # Movement measured against where the hand was
-                    # MOTION_BASELINE_FRAMES ago, not against a reference
-                    # that re-anchors itself -- see the note by the
-                    # constants for why the latter creeps.
-                    motion_history.append((target_x, target_y))
-                    _base = motion_history[0]
-                    _dx = target_x - _base[0]
-                    _dy = target_y - _base[1]
-                    _moved_sq = _dx * _dx + _dy * _dy
+                    _pre_x, _pre_y = target_x, target_y
+                    target_x, target_y = stabiliser.update(
+                        target_x, target_y, now_ts, _armed_since)
 
-                    if sem_freeze_started is not None:
-                        # Frozen.  Every exit is checked in this one
-                        # place, so there is nowhere else for a stuck
-                        # cursor to hide.  Distance is measured from the
-                        # PIN here, not over the window: a hand that
-                        # keeps travelling is someone moving the cursor,
-                        # and its displacement grows without bound while
-                        # a gesture's does not.
-                        _pdx = target_x - sem_pin[0]
-                        _pdy = target_y - sem_pin[1]
-                        if (_armed_since is None
-                                or _pdx * _pdx + _pdy * _pdy
-                                > _MOTION_RELEASE_SQ
-                                or (now_ts - sem_freeze_started)
-                                > SEMANTIC_FREEZE_MAX_MS / 1000.0):
-                            # A release on DISTANCE means this is the
-                            # user moving the cursor, not a gesture.
-                            # Without a lock-out the window refills and
-                            # the freeze re-arms a few frames later,
-                            # which reads as cursor stutter rather than
-                            # as movement.  Suppressed until the hand
-                            # settles again.
-                            _pdsq = _pdx * _pdx + _pdy * _pdy
-                            motion_locked_out = _pdsq > _MOTION_RELEASE_SQ
-                            sem_freeze_started = None
-                            sem_pin = None
-                            motion_frames = 0
-                            still_anchor = (target_x, target_y)
-                            # The history is NOT cleared: emptying it
-                            # makes the next frame's baseline equal the
-                            # current point, which reads as "still" and
-                            # cancels the lock-out a frame after setting
-                            # it -- the cursor then re-froze every eight
-                            # frames and stuttered instead of moving.
-                        else:
-                            target_x, target_y = sem_pin
-                    elif (len(motion_history) == MOTION_BASELINE_FRAMES
-                            and _moved_sq < _MOTION_REST_SQ):
-                        # Still across the whole window: safe to mark
-                        # this as where the hand is resting, and the
-                        # moment a lock-out is allowed to end.
-                        still_anchor = (target_x, target_y)
-                        motion_frames = 0
-                        motion_locked_out = False
-                    elif _moved_sq >= _MOTION_TRIGGER_SQ:
-                        motion_frames += 1
-                        if (_armed_since is not None
-                                and not motion_locked_out
-                                and motion_frames >= MOTION_CONFIRM_FRAMES):
-                            # Pin to the last position the hand was
-                            # RESTING at, not to where it has already
-                            # travelled -- that is what makes the drift
-                            # zero rather than merely smaller.
-                            sem_freeze_started = now_ts
-                            sem_pin = still_anchor or _base
-                            target_x, target_y = sem_pin
-                    else:
-                        motion_frames = 0
+                    if CURSOR_DEBUG:
+                        self._log(
+                            "[cursor-debug] raw=(%.0f,%.0f) "
+                            "screen=(%.1f,%.1f) held=(%.1f,%.1f) "
+                            "frozen=%s freeze_reason=%s armed=%s "
+                            "geometry_state=%s semantic_state=%s "
+                            "moved=%.1fpx"
+                            % (raw_x, raw_y, _pre_x, _pre_y,
+                               target_x, target_y, stabiliser.frozen,
+                               stabiliser.reason,
+                               "-" if _armed_since is None
+                               else "%.3f" % _armed_since,
+                               gesture,
+                               (semantic_fsm.stable_gesture
+                                if semantic_fsm is not None else "-"),
+                               math.hypot(_pre_x - target_x,
+                                          _pre_y - target_y)))
 
                     smooth_x = oef_x(target_x, timestamp=now_ts)
                     smooth_y = oef_y(target_y, timestamp=now_ts)
@@ -4646,8 +5033,7 @@ class HandTrackerEngine:
                                            mp_hands.HAND_CONNECTIONS)
 
                     cx, cy = int(raw_x), int(raw_y)
-                    _frozen = (frozen_target is not None
-                               and now_ts < freeze_until)
+                    _frozen = stabiliser.frozen
                     _anchor_col = (0, 165, 255) if _frozen else (0, 255, 0)
                     cv2.circle(bgr_buf, (cx, cy), 11, _anchor_col, cv2.FILLED)
                     cv2.circle(bgr_buf, (cx, cy), 15, _anchor_col, 2)
@@ -4703,14 +5089,7 @@ class HandTrackerEngine:
                     gesture = "idle"
                     fingers_ext = (False, False, False, False)
                     thumb_out = False
-                    frozen_target = None
-                    freeze_until = 0.0
-                    motion_history.clear()
-                    still_anchor = None
-                    motion_frames = 0
-                    sem_freeze_started = None
-                    sem_pin = None
-                    motion_locked_out = False
+                    stabiliser.reset()
 
                 # ── YOLO output drain (non-blocking) ────────────────────
                 if yolo_worker is not None:
@@ -4955,8 +5334,46 @@ class HandTrackerEngine:
                             # change to what dispatch actually does.
                             _clicks_before = actions.click_count
                             _drags_before = actions.drag_count
+
+                            # ── [transition-debug] ─────────────────────
+                            # Printed BEFORE dispatch, deliberately: the
+                            # question it answers is "which rule was
+                            # about to be run and why", and a line
+                            # printed afterwards cannot be trusted to
+                            # have preceded the click it describes.
+                            #
+                            # The engine cannot know the raw label, the
+                            # labelled pose or the confidence, so those
+                            # are merged in here alongside the action the
+                            # dispatcher is actually being handed.
+                            # Emitted whenever a rule was TARGETING the
+                            # pose just entered, including when nothing
+                            # was selected — "candidates existed and none
+                            # won" is the case worth seeing.
+                            if SEMANTIC_TRANSITION_DEBUG \
+                                    and format_transition_report is not None:
+                                _report = getattr(
+                                    semantic_fsm,
+                                    "last_transition_report", None)
+                                if _report is not None:
+                                    print(format_transition_report(
+                                        _report,
+                                        raw=_raw or "-",
+                                        labelled=_labelled or "-",
+                                        confidence=("%.2f" % _ys
+                                                    if _ys is not None
+                                                    else "-"),
+                                        fed_pose=_sem_pose or "-",
+                                        fsm_state_before=_before or "-",
+                                        fsm_state_after=(
+                                            semantic_fsm._current or "-"),
+                                        dispatch=(str(_sem) if _sem
+                                                  else "NONE")))
+
                             if _sem is not None:
                                 actions.dispatch(_sem, now_ts)
+                                if not actions.dragging:
+                                    stabiliser.note_action(now_ts)
 
                             if _probe is not None:
                                 _probe.record({
@@ -5043,8 +5460,7 @@ class HandTrackerEngine:
                     "gesture_changes": gesture_changes,
                     "held_frames": held_frames,
                     "rejected_landmarks": self._validator.rejected,
-                    "frozen": frozen_target is not None
-                    and now_ts < freeze_until,
+                    "frozen": stabiliser.frozen,
                     "last_action": actions.last_action,
                 })
 

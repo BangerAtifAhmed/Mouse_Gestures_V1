@@ -8,17 +8,61 @@
   },
   "geometry_bindings": [
     {
-      "id": "r677645cd",
+      "id": "r382d69fe",
       "trigger": "transition",
       "action": "LEFT_CLICK",
       "enabled": true,
-      "cooldown_sec": 0.35,
+      "cooldown_sec": 0.16,
       "from_state": "one",
       "to_state": "fist",
-      "max_time_sec": 2.0,
+      "adaptive_timing": true,
+      "promote_double": true,
+      "name": "Left_Click",
       "source": "any",
       "hand": "any"
     },
+    {
+      "id": "rfbed639c",
+      "trigger": "transition",
+      "action": "RIGHT_CLICK",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "two_up",
+      "to_state": "fist",
+      "adaptive_timing": true,
+      "name": "right_click",
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r5bd629f9",
+      "trigger": "transition",
+      "action": "DRAG_START",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "grabbing",
+      "to_state": "fist",
+      "adaptive_timing": true,
+      "name": "drag_start",
+      "source": "any",
+      "hand": "any"
+    },
+    {
+      "id": "r660a06fb",
+      "trigger": "transition",
+      "action": "DRAG_STOP",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "fist",
+      "to_state": "grabbing",
+      "adaptive_timing": true,
+      "name": "Drag_Stop",
+      "source": "any",
+      "hand": "any"
+    }
+  ],
+  "yolo_bindings": [],
+  "deleted_bindings": [
     {
       "id": "r675aa362",
       "trigger": "transition",
@@ -29,9 +73,52 @@
       "to_state": "fist",
       "adaptive_timing": true,
       "source": "any",
-      "hand": "any"
+      "hand": "any",
+      "_origin_index": 1,
+      "_deleted_at": 1788862598.2576473
+    },
+    {
+      "id": "r677645cd",
+      "trigger": "transition",
+      "action": "LEFT_CLICK",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "one",
+      "to_state": "fist",
+      "max_time_sec": 2.0,
+      "source": "any",
+      "hand": "any",
+      "_origin_index": 0,
+      "_deleted_at": 1788862601.5109537
+    },
+    {
+      "id": "r7cb46d31",
+      "trigger": "transition",
+      "action": "RIGHT_CLICK",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "two_up",
+      "to_state": "fist",
+      "adaptive_timing": true,
+      "name": "Right_Click",
+      "source": "any",
+      "hand": "any",
+      "_origin_index": 1,
+      "_deleted_at": 1788863403.1278877
+    },
+    {
+      "id": "rfa63064d",
+      "trigger": "transition",
+      "action": "DRAG_STOP",
+      "enabled": true,
+      "cooldown_sec": 0.35,
+      "from_state": "fist",
+      "to_state": "palm",
+      "adaptive_timing": true,
+      "source": "any",
+      "hand": "any",
+      "_origin_index": 3,
+      "_deleted_at": 1788870476.5019863
     }
-  ],
-  "yolo_bindings": [],
-  "deleted_bindings": []
+  ]
 }
